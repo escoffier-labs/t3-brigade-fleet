@@ -1,0 +1,336 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.invalid/t3-fleet/result.schema.json",
+  "title": "T3 Fleet Result",
+  "description": "Redacted controller result for a request, doctor check, or capacity check.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "enum": [
+        "t3-fleet.result.v1",
+        "t3-fleet.error.v1"
+      ]
+    },
+    "action": {
+      "type": "string"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "host": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string"
+    },
+    "thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "needs_attention": {
+      "type": "boolean"
+    },
+    "updated_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sequence": {
+      "type": "integer"
+    },
+    "output": {
+      "type": "string"
+    },
+    "global_limit": {
+      "type": "integer"
+    },
+    "hosts": {
+      "type": "array"
+    },
+    "error": {
+      "$ref": "#/$defs/error_detail"
+    }
+  },
+  "$defs": {
+    "legacy_request_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{7,63}$"
+    },
+    "peer_request_id": {
+      "type": "string",
+      "maxLength": 166,
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}-[a-z0-9][a-z0-9-]{0,63}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "request_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/legacy_request_id"
+        },
+        {
+          "$ref": "#/$defs/peer_request_id"
+        }
+      ]
+    },
+    "error_detail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "invalid_config",
+            "invalid_request",
+            "host_unavailable",
+            "idempotency_conflict",
+            "unknown_state",
+            "t3_auth_failed",
+            "t3_http_failed",
+            "internal_error"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "title": "Per-request result",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "request_id",
+        "host",
+        "state",
+        "thread_id",
+        "needs_attention"
+      ],
+      "properties": {
+        "schema": {
+          "const": "t3-fleet.result.v1"
+        },
+        "request_id": {
+          "$ref": "#/$defs/request_id"
+        },
+        "host": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "queued",
+            "preflight",
+            "dispatching",
+            "running",
+            "needs_attention",
+            "succeeded",
+            "failed",
+            "interrupted",
+            "blocked_offline",
+            "unknown"
+          ]
+        },
+        "thread_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "needs_attention": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output": {
+          "type": "string",
+          "maxLength": 16384
+        }
+      }
+    },
+    {
+      "title": "Doctor aggregate result",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "action",
+        "state",
+        "hosts"
+      ],
+      "properties": {
+        "schema": {
+          "const": "t3-fleet.result.v1"
+        },
+        "action": {
+          "const": "doctor"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "eligible",
+            "blocked_offline"
+          ]
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "host",
+              "state"
+            ],
+            "properties": {
+              "host": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "eligible",
+                  "disabled",
+                  "blocked_offline",
+                  "incompatible",
+                  "at_capacity"
+                ]
+              },
+              "server_version": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 128
+              },
+              "project_registered": {
+                "type": "boolean"
+              },
+              "active": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "Capacity aggregate result",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "action",
+        "state",
+        "global_limit",
+        "hosts"
+      ],
+      "properties": {
+        "schema": {
+          "const": "t3-fleet.result.v1"
+        },
+        "action": {
+          "const": "capacity"
+        },
+        "state": {
+          "const": "eligible"
+        },
+        "global_limit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "host",
+              "state",
+              "active",
+              "limit",
+              "circuit_open"
+            ],
+            "properties": {
+              "host": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "eligible",
+                  "disabled",
+                  "blocked_offline"
+                ]
+              },
+              "active": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "circuit_open": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "Error result",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "error"
+      ],
+      "properties": {
+        "schema": {
+          "const": "t3-fleet.error.v1"
+        },
+        "error": {
+          "$ref": "#/$defs/error_detail"
+        },
+        "request_id": {
+          "$ref": "#/$defs/request_id"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,145 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "action"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "enum": [
+        "t3-fleet.request.v1"
+      ]
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "doctor",
+        "capacity",
+        "submit",
+        "status",
+        "wait",
+        "followup",
+        "interrupt",
+        "approve",
+        "answer",
+        "recover"
+      ]
+    },
+    "request_id": {
+      "$ref": "#/$defs/request_id"
+    },
+    "host": {
+      "type": "string"
+    },
+    "target": {
+      "type": "string"
+    },
+    "repository": {
+      "type": "string"
+    },
+    "source_revision": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "prompt_file": {
+      "type": "string"
+    },
+    "model_selection": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "runtime_mode": {
+      "type": "string",
+      "enum": [
+        "approval-required",
+        "auto-accept-edits",
+        "auto",
+        "full-access"
+      ]
+    },
+    "interaction_mode": {
+      "type": "string",
+      "enum": [
+        "default",
+        "plan"
+      ]
+    },
+    "run_setup_script": {
+      "type": "boolean"
+    },
+    "allow_queue": {
+      "type": "boolean"
+    },
+    "include_output": {
+      "type": "boolean"
+    },
+    "timeout": {
+      "type": "number"
+    },
+    "approval_id": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "accept",
+        "acceptForSession",
+        "decline",
+        "cancel"
+      ]
+    },
+    "input_id": {
+      "type": "string"
+    },
+    "answers": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "legacy_request_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{7,63}$"
+    },
+    "peer_request_id": {
+      "type": "string",
+      "maxLength": 166,
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}-[a-z0-9][a-z0-9-]{0,63}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "request_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/legacy_request_id"
+        },
+        {
+          "$ref": "#/$defs/peer_request_id"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "not": {
+              "const": "recover"
+            }
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "target": false
+        }
+      }
+    }
+  ]
+}

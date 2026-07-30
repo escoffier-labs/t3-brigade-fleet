@@ -1,0 +1,40 @@
+schema = "t3-fleet.config.v1"
+controller_host = "node-a"
+controller_id = "node-a"
+coordination_mode = "target-authoritative"
+global_active_limit = 3
+
+[hosts.node-a]
+enabled = true
+platform = "linux"
+transport = "local"
+agent_command = ["/home/operator/.local/bin/t3-fleet-agent"]
+active_limit = 1
+expected_hostname = "node-a"
+
+[hosts.node-b]
+enabled = true
+platform = "linux"
+transport = "ssh"
+ssh_alias = "node-b"
+agent_command = ["/home/operator/.local/bin/t3-fleet-agent"]
+active_limit = 1
+expected_hostname = "node-b"
+
+[hosts.node-c]
+enabled = true
+platform = "linux"
+transport = "ssh"
+ssh_alias = "node-c"
+agent_command = ["/home/operator/.local/bin/t3-fleet-agent"]
+active_limit = 1
+expected_hostname = "node-c"
+
+[repositories.example-repo]
+default_branch = "main"
+branch_prefix = "codex/"
+
+[repositories.example-repo.paths]
+node-a = "/srv/repos/example"
+node-b = "/srv/repos/example"
+node-c = "/srv/repos/example"

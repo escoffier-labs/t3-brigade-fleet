@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "enum": [
+        "t3-fleet.result.v1",
+        "t3-fleet.error.v1"
+      ]
+    }
+  }
+}
