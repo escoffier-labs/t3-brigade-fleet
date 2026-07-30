@@ -49,9 +49,9 @@ t3-fleet doctor
 t3-fleet capacity
 ```
 
-`doctor` returns one entry per allowlisted host. A host is `eligible` when the agent is reachable and the project is registered. A host is `blocked_offline` when the agent is unreachable. For a local-only config with no agent running, `blocked_offline` is the expected result and confirms the config parsed and the host was selected.
+The shipped local example contains a placeholder agent command. With no live agent, both commands fail closed with a `host_unavailable` JSON error and exit code `3`. That expected outcome confirms the config parsed and the allowlisted host was selected. It does not confirm target reachability.
 
-`capacity` returns `active`, `limit`, and `circuit_open` per host plus the global limit. With no sessions running, `active` is `0`.
+With a reachable agent, `doctor` returns one entry per allowlisted host. A host is `eligible` when the agent is reachable and the project is registered. `capacity` returns `active`, `limit`, and `circuit_open` per host plus the global limit.
 
 ## 4. Submit a session
 

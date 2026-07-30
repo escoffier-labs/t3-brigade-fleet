@@ -49,7 +49,7 @@ t3-fleet doctor
 t3-fleet capacity
 ```
 
-`doctor` reports per-host reachability. `capacity` reports active and limit per host plus the global limit. Both default to all enabled hosts. See `docs/quickstart.md` for the full walkthrough, `examples/local.example.toml` for the safe no-live-fleet shape, and `examples/fleet.example.toml` for a three-host target-authoritative example.
+The shipped local example contains a placeholder agent command. Without a live agent, `doctor` and `capacity` fail closed with `host_unavailable` and exit code `3` after the config is parsed and the allowlisted host is selected. With a reachable agent, `doctor` reports per-host reachability and `capacity` reports active and limit per host plus the global limit. See `docs/quickstart.md` for the full walkthrough, `examples/local.example.toml` for the safe no-live-fleet shape, and `examples/fleet.example.toml` for a three-host target-authoritative example.
 
 ## Public commands
 
