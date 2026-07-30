@@ -4,9 +4,9 @@ This document covers the `recover` command and how `t3-fleet` handles unknown ou
 
 ## When an outcome is unknown
 
-A request normally reaches one of these terminal states: `completed`, `interrupted`, or `error`. A request that the controller cannot confirm reaches `unknown`.
+A request normally reaches one of these terminal states: `succeeded`, `failed`, or `interrupted`. A request that the controller cannot confirm reaches `unknown`.
 
-`unknown` is not a success state. It means the controller lost contact with the target mid-mutation and cannot prove the session ended. The slot stays reserved until `recover` reconciles the request.
+`unknown` is non-terminal. It means the controller lost contact with the target mid-mutation and cannot prove the session ended. The slot stays reserved until `recover` reconciles the request.
 
 Common causes:
 
@@ -20,7 +20,7 @@ Common causes:
 
 The controller asks the agent for the recorded outcome of the request. The agent returns one of:
 
-- A terminal receipt: `completed`, `interrupted`, or `error`. The controller records the receipt and releases the slot.
+- A terminal receipt: `succeeded`, `failed`, or `interrupted`. The controller records the receipt and releases the slot.
 - No receipt: the controller marks the request as not started and releases the slot.
 - An indeterminate state: the controller leaves the slot reserved and returns `unknown`. Retry `recover` after the target is reachable.
 
@@ -34,7 +34,7 @@ Run `recover` when:
 - A controller process was killed mid-request.
 - A target host was unreachable during a request and is now reachable.
 
-Do not run `recover` for a request that already returned `completed`, `interrupted`, or `error`. It is a no-op in those cases and adds load to the target.
+Do not run `recover` for a request that already returned `succeeded`, `failed`, or `interrupted`. It is a no-op in those cases and adds load to the target.
 
 ## How to call recover
 
@@ -62,13 +62,13 @@ t3-fleet recover --request-id <request-id> --include-output
 
 In `target-authoritative` mode more than one controller may dispatch to the same fleet. Each controller writes its own request id. The target store records the controller id with each receipt.
 
-When `controller-a` loses contact with a request, `controller-b` can run `recover` against the same target store. The target store returns the receipt that `controller-a` recorded, or the agent's record if the controller receipt is missing. This is why the target store is the source of truth in this mode.
+When `controller-a` loses contact with a request, a second controller may run `recover` against the same target store. The target store returns the receipt that `controller-a` recorded, or the agent's record if the controller receipt is missing. This is why the target store is the source of truth in this mode.
 
 In `single-controller` mode there is one controller. `recover` still reconciles against the target store, but the controller-side store is the primary record.
 
 ## Recovery is not a retry
 
-`recover` does not resubmit a failed request. If a session ended in `error`, fix the cause and submit a new request with a new `request_id`. If a session ended in `interrupted`, that was a deliberate stop. Submit a new request only if you want to restart the work.
+`recover` does not resubmit a failed request. If a session ended in `failed`, fix the cause and submit a new request with a new `request_id`. If a session ended in `interrupted`, that was a deliberate stop. Submit a new request only if you want to restart the work.
 
 ## Limits
 

@@ -72,7 +72,7 @@ class ConfigTests(unittest.TestCase):
     def test_peer_example_uses_derived_three_host_capacity(self) -> None:
         config = self._load_example_config()
         self.assertEqual(config.coordination_mode, "target-authoritative")
-        self.assertEqual(config.controller_id, "node-a")
+        self.assertEqual(config.controller_id, "controller-a")
         self.assertEqual(config.global_active_limit, 3)
         enabled = [host for host in config.hosts.values() if host.enabled]
         self.assertEqual(len(enabled), 3)

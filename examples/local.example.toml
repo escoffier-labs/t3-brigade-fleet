@@ -1,0 +1,19 @@
+schema = "t3-fleet.config.v1"
+controller_host = "controller-a"
+coordination_mode = "single-controller"
+global_active_limit = 1
+
+[hosts.controller-a]
+enabled = true
+platform = "linux"
+transport = "local"
+agent_command = ["/home/operator/.local/bin/t3-fleet-agent"]
+active_limit = 1
+expected_hostname = "controller-a"
+
+[repositories.example-repo]
+default_branch = "main"
+branch_prefix = "codex/"
+
+[repositories.example-repo.paths]
+controller-a = "/srv/repos/example"

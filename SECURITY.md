@@ -10,7 +10,7 @@ Pin a specific version in production and track the changelog for breaking change
 
 Report security issues privately. Do not open a public issue for a vulnerability.
 
-1. Email the maintainers through the GitHub security advisory tab at `https://github.com/escoffier-labs/t3-brigade-fleet/security/advisories/new`.
+1. Use GitHub's private vulnerability reporting on the repository Security tab: open `https://github.com/escoffier-labs/t3-brigade-fleet/security` and choose "Report a vulnerability". This submits a private advisory through GitHub's reporter form. It is not email and does not post a public issue.
 2. Include a description, a minimal reproduction, and the affected version.
 3. Wait for a response before publishing any details.
 

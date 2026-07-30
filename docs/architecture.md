@@ -16,12 +16,12 @@ controller CLI                    agent
   |- controller
 ```
 
-- **Config** (`t3_fleet.config.py`) loads and validates the allowlisted fleet config. It rejects unknown keys, embedded credential fields, IP literals in `ssh_alias`, and config files that are not mode `0600` on Unix.
-- **Store** (`t3_fleet.store.py`) is the controller-side state. It tracks in-flight requests, capacity counters, and circuit breakers per host.
-- **Transport** (`t3_fleet.transport.py`) carries a request from the controller to a target. It supports `local` and `ssh`. It does not carry prompt text in Brigade tool calls.
-- **Controller** (`t3_fleet.controller.py`) is the policy layer. It decides which host a request may run on, enforces capacity, records outcomes, and exposes the public commands.
+- **Config** (`src/t3_fleet/config.py`) loads and validates the allowlisted fleet config. It rejects unknown keys, embedded credential fields, IP literals in `ssh_alias`, and config files that are not mode `0600` on Unix.
+- **Store** (`src/t3_fleet/store.py`) is the controller-side state. It tracks in-flight requests, capacity counters, and circuit breakers per host.
+- **Transport** (`src/t3_fleet/transport.py`) carries a request from the controller to a target. It supports `local` and `ssh`. It does not carry prompt text in Brigade tool calls.
+- **Controller** (`src/t3_fleet/controller.py`) is the policy layer. It decides which host a request may run on, enforces capacity, records outcomes, and exposes the public commands.
 
-The agent (`t3_fleet.agent.py`) runs on each target. It receives a request from the transport, talks to the local T3 Code instance, and writes a target-side receipt. The target store (`t3_fleet.target_store.py`) holds those receipts so the controller can reconcile later.
+The agent (`src/t3_fleet/agent.py`) runs on each target. It receives a request from the transport, talks to the local T3 Code instance, and writes a target-side receipt. The target store (`src/t3_fleet/target_store.py`) holds those receipts so the controller can reconcile later.
 
 ## Process model
 
@@ -37,7 +37,7 @@ The controller never opens a direct connection to T3 Code on a remote host. It a
 4. `followup`, `interrupt`, `approve`, and `answer` drive a live session.
 5. `recover` reconciles a request whose outcome is unknown. See `docs/recovery.md`.
 
-A request reaches one of these terminal states: `completed`, `interrupted`, `error`, or `unknown`. `unknown` is not a success state. It means the controller cannot confirm the outcome and `recover` is required.
+A request reaches one of these terminal states: `succeeded`, `failed`, or `interrupted`. A request that the controller cannot confirm reaches `unknown`. `unknown` is non-terminal: the slot stays reserved and `recover` is required to reconcile it.
 
 ## Coordination modes
 
@@ -55,7 +55,7 @@ The wire contract is JSON. Two schemas are published.
 - `schemas/request.schema.json` defines `t3-fleet.request.v1`, the request envelope.
 - `schemas/result.schema.json` defines `t3-fleet.result.v1`, the result envelope, and `t3-fleet.error.v1`, the error envelope.
 
-The CLI accepts either flags or a single JSON object on standard input. The JSON form is required for Brigade tool calls. Prompt text is accepted only through `prompt` in JSON or through `prompt_file`. The CLI rejects inline prompts in Brigade tool calls.
+The CLI accepts either flags or a single JSON object on standard input for most commands. `answer` is JSON-stdin-only: it has no flags and reads a single JSON object with `request_id`, `input_id`, and `answers`. The JSON form is required for Brigade tool calls. Prompt text is accepted only through `prompt` in JSON or through `prompt_file`. The CLI rejects inline prompts in Brigade tool calls.
 
 ## Error codes
 

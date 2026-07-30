@@ -1,6 +1,6 @@
 # t3-fleet
 
-`t3-fleet` is a command-line dispatcher for running [T3 Code](https://github.com/escoffier-labs/t3-brigade-fleet) sessions across an allowlisted fleet of hosts. It routes prompts to a reviewed set of targets, tracks each request to a terminal state, and exposes a closed recovery surface for unknown outcomes.
+`t3-fleet` is a command-line dispatcher for running [T3 Code](https://github.com/pingdotgg/t3code) sessions across an allowlisted fleet of hosts. It routes prompts to a reviewed set of targets, tracks each request to a terminal state, and exposes a closed recovery surface for unknown outcomes.
 
 This project is pre-1.0 and experimental. APIs, schemas, and config formats may change between minor versions before 1.0. Pin a version in production until 1.0 lands.
 
@@ -33,15 +33,15 @@ This provides two console entry points:
 
 ## Quick start
 
-The basic doctor and config validation path runs from a fresh clone without a live fleet. You need a config file with mode `0600` and an allowlisted host entry.
+The basic doctor and config validation path runs from a fresh clone without a live fleet. Use the single local-host example so doctor never probes an arbitrary SSH alias.
 
 ```bash
 git clone https://github.com/escoffier-labs/t3-brigade-fleet
 cd t3-brigade-fleet
 pipx install .
 
-# Point t3-fleet at a config you control.
-export T3_FLEET_CONFIG="$PWD/examples/fleet.example.toml"
+# Point t3-fleet at the safe single local-host example.
+export T3_FLEET_CONFIG="$PWD/examples/local.example.toml"
 chmod 600 "$T3_FLEET_CONFIG"
 
 # Validate config and probe the allowlisted hosts.
@@ -49,7 +49,7 @@ t3-fleet doctor
 t3-fleet capacity
 ```
 
-`doctor` reports per-host reachability. `capacity` reports active and limit per host plus the global limit. Both default to all enabled hosts. See `docs/quickstart.md` for the full walkthrough and `examples/fleet.example.toml` for the config shape.
+`doctor` reports per-host reachability. `capacity` reports active and limit per host plus the global limit. Both default to all enabled hosts. See `docs/quickstart.md` for the full walkthrough, `examples/local.example.toml` for the safe no-live-fleet shape, and `examples/fleet.example.toml` for a three-host target-authoritative example.
 
 ## Public commands
 
@@ -66,7 +66,7 @@ All mutating commands default to `approval-required`. The controller never selec
 - `t3-fleet answer` returns answers for a pending input request on a session.
 - `t3-fleet recover` reconciles a request whose outcome is unknown.
 
-Each command accepts flags or a single JSON object on standard input. The JSON contract is documented in `schemas/request.schema.json` and `schemas/result.schema.json`.
+Most commands accept flags or a single JSON object on standard input. `answer` is JSON-stdin-only: it has no flags and reads a single JSON object with `request_id`, `input_id`, and `answers`. The JSON contract is documented in `schemas/request.schema.json` and `schemas/result.schema.json`.
 
 ## Runtime modes
 

@@ -7,8 +7,8 @@ This walkthrough runs the basic doctor and config validation path from a fresh c
 This document uses generic roles only. Replace them with your reviewed aliases.
 
 - `controller-a` is the workstation where you run `t3-fleet`.
-- `controller-b` is a second workstation, used only in the multi-controller section.
 - `target-a` is an allowlisted target host that runs `t3-fleet-agent` and T3 Code.
+- `target-b` is a second allowlisted target host, used in the multi-host examples.
 
 ## 1. Clone and install
 
@@ -30,15 +30,15 @@ t3-fleet --help
 
 `t3-fleet` reads a TOML config. The schema is `t3-fleet.config.v1`. The file must be mode `0600` on Unix.
 
-Copy the example and tighten it to one local host so doctor can run without a live fleet:
+Use the single local-host example so doctor can run without a live fleet and never probes an arbitrary SSH alias:
 
 ```bash
-cp examples/fleet.example.toml .fleet.toml
+cp examples/local.example.toml .fleet.toml
 chmod 600 .fleet.toml
 export T3_FLEET_CONFIG="$PWD/.fleet.toml"
 ```
 
-Open `.fleet.toml` and reduce the `[hosts.*]` table to a single `local` host you control. Keep `controller_host` set to that host. Keep `global_active_limit` at the sum of enabled host limits if you use `target-authoritative` mode.
+`examples/local.example.toml` defines one `local` host named `controller-a` and keeps `controller_host` set to that host. It is the safe doctor and config-validation path. To run real sessions, copy `examples/fleet.example.toml` instead and edit it to your reviewed `controller-a`, `target-a`, and `target-b` hosts. Keep `global_active_limit` at the sum of enabled host limits if you use `target-authoritative` mode.
 
 ## 3. Validate config and probe hosts
 

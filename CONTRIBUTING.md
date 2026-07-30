@@ -23,7 +23,7 @@ Out of scope without prior discussion:
 
 1. Open an issue describing the change. Link the issue from your branch.
 2. Confirm the change fits the boundaries in `README.md` and `docs/security-model.md`.
-3. Use generic roles in examples: `controller-a`, `controller-b`, `target-a`. Do not add real hosts, paths, ports, or identifiers.
+3. Use generic roles in examples: `controller-a`, `target-a`, `target-b`. Do not add real hosts, paths, ports, or identifiers.
 
 ## Development setup
 
@@ -55,7 +55,7 @@ python -m pytest -q
 ## Commit and pull request
 
 - Use conventional commit messages (`feat:`, `fix:`, `docs:`, `test:`, `chore:`).
-- Do not add `Co-Authored-By` trailers or mention AI tools in commit messages.
+- Add a `Co-Authored-By` trailer only when a tool did substantial work on the change. Verify the trailer before adding it: a real, correct name and email for the tool that authored the substantial portion. Do not add unverified or decorative trailers. Do not mention AI tools in commit messages outside of a verified `Co-Authored-By` trailer.
 - Keep pull requests small and reviewable. One concern per request.
 - Do not commit secrets, real hostnames, credentials, or private infrastructure details.
 
