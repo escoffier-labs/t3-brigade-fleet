@@ -1,0 +1,21 @@
+{
+  "id": "t3-fleet-dispatch",
+  "title": "T3 Fleet Dispatch",
+  "version": "0.1.0",
+  "description": "Dispatch and manage allowlisted T3 Code tasks across enrolled machines.",
+  "license": "Apache-2.0",
+  "required_mcp_servers": [],
+  "required_tools": [
+    "t3-fleet"
+  ],
+  "supported_harnesses": [
+    "codex",
+    "claude",
+    "cursor",
+    "openclaw"
+  ],
+  "tests": [
+    "bash ../../../tests/lint-skills.sh t3-fleet-dispatch"
+  ],
+  "trust_level": "public"
+}

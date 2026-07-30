@@ -1,0 +1,3 @@
+display_name: "T3 Fleet Dispatch"
+short_description: "Dispatch T3 Code sessions across an allowlisted fleet."
+default_prompt: "Use $t3-fleet-dispatch to dispatch and manage T3 Code sessions across an allowlisted fleet."

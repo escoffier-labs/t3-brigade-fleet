@@ -195,5 +195,126 @@ class SkillPackageTests(unittest.TestCase):
         self.assertNotIn("ssh_alias", host, "local host must not set ssh_alias")
 
 
+SKILL_DIR = REPO_ROOT / "skills" / "t3-fleet-dispatch"
+SKILL_JSON = SKILL_DIR / "skill.json"
+SKILL_MD = SKILL_DIR / "SKILL.md"
+OPENAI_AGENT = SKILL_DIR / "agents" / "openai.yaml"
+GENERIC_ROLES = {"controller-a", "target-a", "target-b"}
+MUTATING_COMMANDS = (
+    "submit",
+    "followup",
+    "interrupt",
+    "approve",
+    "answer",
+    "recover",
+)
+PRIVATE_PATH_PREFIXES = ("/home/", "/Users/", "/mnt/", "/root/", "C:\\", "C:/")
+
+
+def _skill_package_files() -> list[Path]:
+    if not SKILL_DIR.is_dir():
+        return []
+    return sorted(path for path in SKILL_DIR.rglob("*") if path.is_file())
+
+
+def _skill_package_text() -> str:
+    return "\n".join(_read(path) for path in _skill_package_files())
+
+
+class T3FleetDispatchSkillTests(unittest.TestCase):
+    def test_skill_json_metadata_values(self) -> None:
+        import json
+
+        self.assertTrue(SKILL_JSON.is_file(), "skill.json must exist")
+        data = json.loads(_read(SKILL_JSON))
+        self.assertEqual(data.get("id"), "t3-fleet-dispatch")
+        self.assertEqual(data.get("version"), "0.1.0")
+        self.assertEqual(data.get("license"), "Apache-2.0")
+        self.assertEqual(data.get("trust_level"), "public")
+        self.assertEqual(data.get("required_tools"), ["t3-fleet"])
+        self.assertEqual(
+            set(data.get("supported_harnesses", [])),
+            {"codex", "claude", "cursor", "openclaw"},
+        )
+        self.assertTrue(data.get("tests"), "skill.json tests must not be empty")
+
+    def test_openai_agent_metadata(self) -> None:
+        self.assertTrue(OPENAI_AGENT.is_file(), "agents/openai.yaml must exist")
+        text = _read(OPENAI_AGENT)
+        display = re.search(r'^display_name:\s*"([^"]+)"\s*$', text, re.MULTILINE)
+        short = re.search(
+            r'^short_description:\s*"([^"]+)"\s*$', text, re.MULTILINE
+        )
+        prompt_match = re.search(
+            r'^default_prompt:\s*"([^"]+)"\s*$', text, re.MULTILINE
+        )
+        self.assertIsNotNone(display, "display_name must be quoted")
+        self.assertIsNotNone(short, "short_description must be quoted")
+        self.assertIsNotNone(prompt_match, "default_prompt must be quoted")
+        self.assertTrue(25 <= len(short.group(1)) <= 64)
+        prompt = prompt_match.group(1)
+        self.assertIn("$t3-fleet-dispatch", prompt)
+        self.assertEqual(prompt.count("."), 1)
+        self.assertNotRegex(prompt, r"[?!]")
+
+    def test_skill_md_command_set_matches_public_ten(self) -> None:
+        self.assertTrue(SKILL_MD.is_file(), "SKILL.md must exist")
+        found = set(
+            re.findall(r"\bt3-fleet\s+([a-z][a-z-]*)\b", _read(SKILL_MD))
+        )
+        self.assertEqual(found, set(PUBLIC_COMMANDS))
+
+    def test_mutating_commands_require_operator_approval(self) -> None:
+        text = _read(SKILL_MD)
+        for command in MUTATING_COMMANDS:
+            self.assertTrue(
+                self._command_co_occurs_with(text, command, "approval"),
+                f"{command} must be gated by operator approval",
+            )
+
+    def test_approval_required_defaults_are_literal(self) -> None:
+        text = _read(SKILL_MD)
+        for command in ("submit", "followup"):
+            self.assertTrue(
+                self._command_co_occurs_with(text, command, "approval-required"),
+                f"{command} must document approval-required",
+            )
+
+    def _command_co_occurs_with(self, text: str, command: str, needle: str) -> bool:
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            if re.search(rf"\b{re.escape(command)}\b", line):
+                window = lines[max(0, index - 2) : index + 3]
+                if any(needle.lower() in candidate.lower() for candidate in window):
+                    return True
+        return False
+
+    def test_skill_package_has_no_private_guidance(self) -> None:
+        text = _skill_package_text()
+        self.assertNotIn("full-access", text)
+        for prefix in PRIVATE_PATH_PREFIXES:
+            self.assertNotIn(prefix, text, f"skill package includes {prefix}")
+        for projection in PROJECTION_PATHS:
+            self.assertNotIn(projection, text)
+
+    def test_skill_package_examples_use_generic_hosts(self) -> None:
+        text = _skill_package_text()
+        hosts = set(re.findall(r"--host[= ]+([^\s\\\"']+)", text))
+        self.assertTrue(
+            hosts <= GENERIC_ROLES,
+            f"skill package names non-generic hosts: {sorted(hosts - GENERIC_ROLES)}",
+        )
+        self.assertNotRegex(
+            text,
+            r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
+            "skill package must not contain IP addresses",
+        )
+
+    def test_skill_package_has_no_inline_prompt_payload(self) -> None:
+        text = _skill_package_text()
+        self.assertNotRegex(text, r"(?m)^\s*prompt\s*:\s*[\"']")
+        self.assertNotRegex(text, r"(?m)^```prompt\s*$")
+
+
 if __name__ == "__main__":
     unittest.main()
