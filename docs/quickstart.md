@@ -94,11 +94,13 @@ t3-fleet approve \
   --decision accept
 ```
 
-The approval id comes from the session status. Run `status` to read pending approvals:
+Run `status` to read pending approvals:
 
 ```bash
 t3-fleet status --request-id <request-id>
 ```
+
+Public status may omit the approval id that headless `approve` needs. If it is absent, stop and report the limitation. Do not guess an id or inspect private state to find one.
 
 ## 6. Interrupt or follow up
 

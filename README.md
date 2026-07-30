@@ -10,7 +10,7 @@ Three systems share responsibility. Knowing the line between them prevents the m
 
 - **T3 Code** owns each coding session. It runs the model, manages the working tree, and produces the turn stream. `t3-fleet` never interprets session contents.
 - **t3-fleet** owns the allowlisted cross-machine transport, target authority, and recovery. It decides which hosts may receive work, which request is allowed to run on which target, and how an unknown outcome is reconciled.
-- **Brigade** owns dispatch and verification receipts. When `t3-fleet` is invoked through Brigade, Brigade records the tool call, the approval contract, and the signed outcome. `t3-fleet` does not grade its own work.
+- **Brigade** owns dispatch and verification receipts. When `t3-fleet` is invoked through Brigade, Brigade records the dispatch and its captured verification result. `t3-fleet` does not grade its own work.
 
 `t3-fleet` is not a job runner for arbitrary commands. It only dispatches T3 Code sessions to hosts you have reviewed and listed in config.
 
