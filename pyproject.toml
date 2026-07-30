@@ -6,12 +6,37 @@ build-backend = "setuptools.build_meta"
 name = "t3-fleet"
 version = "0.1.0"
 description = "Dispatch and manage T3 Code sessions across an allowlisted fleet"
+readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Escoffier Labs" },
+]
+keywords = ["t3", "t3-code", "fleet", "dispatch", "allowlist", "cli"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Build Tools",
+  "Typing :: Typed",
+]
 dependencies = []
 
 [project.scripts]
 t3-fleet = "t3_fleet.cli:main"
 t3-fleet-agent = "t3_fleet.agent:main"
+
+[project.urls]
+Homepage = "https://github.com/escoffier-labs/t3-brigade-fleet"
+Repository = "https://github.com/escoffier-labs/t3-brigade-fleet"
+Issues = "https://github.com/escoffier-labs/t3-brigade-fleet/issues"
+Changelog = "https://github.com/escoffier-labs/t3-brigade-fleet/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
