@@ -132,3 +132,5 @@ finally {
         $env:T3_FLEET_PYTHON = $OriginalPython
     }
 }
+
+exit 0
