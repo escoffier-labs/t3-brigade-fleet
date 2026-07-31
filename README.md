@@ -1,96 +1,157 @@
-# t3-fleet
+<p align="center">
+  <img src="docs/assets/t3-brigade-fleet-social-preview.jpg" alt="T3 Brigade Fleet banner" width="900">
+</p>
 
-`t3-fleet` is a command-line dispatcher for running [T3 Code](https://github.com/pingdotgg/t3code) sessions across an allowlisted fleet of hosts. It routes prompts to a reviewed set of targets, tracks each request to a terminal state, and exposes a closed recovery surface for unknown outcomes.
+<h1 align="center">T3 Brigade Fleet</h1>
 
-This project is pre-1.0 and experimental. APIs, schemas, and config formats may change between minor versions before 1.0. Pin a version in production until 1.0 lands.
+<p align="center">
+  <strong>Dispatch T3 Code sessions across an allowlisted fleet, with Brigade receipts for operators running agents on more than one machine.</strong>
+</p>
 
-## Scope and boundaries
+<p align="center">
+  <a href="https://brigade.tools">Brigade</a> &middot;
+  <a href="docs/architecture.md">Architecture</a> &middot;
+  <a href="#try-it-in-60-seconds">Quickstart</a> &middot;
+  <a href="docs/security-model.md">Security</a>
+</p>
 
-Three systems share responsibility. Knowing the line between them prevents the most common mistakes.
+<p align="center">
+  <img src="https://shieldcn.dev/github/ci/escoffier-labs/t3-brigade-fleet.svg?workflow=ci.yml&branch=main&label=ci&size=xs" alt="CI status">
+  <img src="https://shieldcn.dev/badge/python-3.11+-3776AB.svg?logo=python&logoColor=white&size=xs" alt="Python 3.11+">
+  <img src="https://shieldcn.dev/badge/license-Apache--2.0-4e7247.svg?size=xs" alt="Apache-2.0 license">
+</p>
 
-- **T3 Code** owns each coding session. It runs the model, manages the working tree, and produces the turn stream. `t3-fleet` never interprets session contents.
-- **t3-fleet** owns the allowlisted cross-machine transport, target authority, and recovery. It decides which hosts may receive work, which request is allowed to run on which target, and how an unknown outcome is reconciled.
-- **Brigade** owns dispatch and verification receipts. When `t3-fleet` is invoked through Brigade, Brigade records the dispatch and its captured verification result. `t3-fleet` does not grade its own work.
+One controller, reviewed targets, stable request IDs, and a closed recovery path when a connection drops during dispatch.
 
-`t3-fleet` is not a job runner for arbitrary commands. It only dispatches T3 Code sessions to hosts you have reviewed and listed in config.
+<p align="center">
+  <img src="docs/assets/t3-brigade-fleet-dispatch.svg" alt="Recording: t3-fleet submits a T3 Code session to an allowlisted host and waits for a successful terminal result" width="900">
+</p>
 
-## Requirements
+<p align="center"><em><code>t3-fleet submit</code> starts an allowlisted session and <code>wait</code> reports its terminal result.</em></p>
 
-- Python 3.11 or newer.
-- T3 Code installed and reachable on each target host.
-- An SSH config (or local transport) for every host you list.
+## What it does
+
+`t3-fleet` sends a prompt to T3 Code on an allowlisted target, reserves that repository, and tracks the request until it succeeds, fails, pauses, or enters an unknown state. It gives operators with several machines one controller surface without giving that controller arbitrary remote-command access. T3 Code still owns the coding session, while Brigade can wrap each dispatch and verification in a receipt.
+
+The project is experimental and pre-1.0. Pin the commit you deploy until the public interfaces settle.
 
 ## Install
 
+Python 3.11 or newer is required.
+
 ```bash
-pipx install .
+pipx install git+https://github.com/escoffier-labs/t3-brigade-fleet.git
 ```
 
-This provides two console entry points:
+This installs two commands:
 
-- `t3-fleet` is the controller CLI you run from your workstation.
-- `t3-fleet-agent` is the per-target agent invoked by the controller over the configured transport.
+- `t3-fleet` is the controller you run from your workstation.
+- `t3-fleet-agent` is the per-target agent invoked through the configured transport.
 
-## Quick start
+## Try it in 60 seconds
 
-The basic doctor and config validation path runs from a fresh clone without a live fleet. Use the single local-host example so doctor never probes an arbitrary SSH alias.
+The shipped local example validates the controller without contacting an arbitrary SSH alias:
 
 ```bash
-git clone https://github.com/escoffier-labs/t3-brigade-fleet
+git clone https://github.com/escoffier-labs/t3-brigade-fleet.git
 cd t3-brigade-fleet
 pipx install .
 
-# Point t3-fleet at the safe single local-host example.
 export T3_FLEET_CONFIG="$PWD/examples/local.example.toml"
 chmod 600 "$T3_FLEET_CONFIG"
-
-# Validate config and probe the allowlisted hosts.
 t3-fleet doctor
-t3-fleet capacity
 ```
 
-The shipped local example contains a placeholder agent command. Without a live agent, `doctor` and `capacity` fail closed with `host_unavailable` and exit code `3` after the config is parsed and the allowlisted host is selected. With a reachable agent, `doctor` reports per-host reachability and `capacity` reports active and limit per host plus the global limit. See `docs/quickstart.md` for the full walkthrough, `examples/local.example.toml` for the safe no-live-fleet shape, and `examples/fleet.example.toml` for a three-host target-authoritative example.
+The placeholder agent is deliberately unavailable, so the safe offline check fails closed after parsing the config and selecting the allowlisted target:
+
+```json
+{"error":{"code":"host_unavailable","message":"fleet host is unavailable"},"schema":"t3-fleet.error.v1"}
+```
+
+The command exits `3`. Replace the placeholder agent with a reviewed target before submitting work. The full path from config through `submit` and `wait` is in [the quickstart](docs/quickstart.md).
+
+## Dispatch a session
+
+Submit accepts flags for interactive use or one JSON object on standard input for Brigade and other callers. Prompt text stays out of the process arguments.
+
+```bash
+t3-fleet submit \
+  --host target-a \
+  --repository example-repo \
+  --source-revision 0123456789abcdef0123456789abcdef01234567 \
+  --title "Verify the public API" \
+  --runtime-mode approval-required \
+  < prompt.txt
+```
+
+The result includes a stable `request_id` and the T3 Code `thread_id`. Use that request ID for every later action:
+
+```bash
+t3-fleet wait --request-id <request-id> --timeout 600 --include-output
+```
+
+## Who owns what
+
+| System | Responsibility |
+|---|---|
+| [T3 Code](https://github.com/pingdotgg/t3code) | Runs the model, owns the working tree, manages approvals, and emits the turn stream |
+| `t3-fleet` | Enforces the target allowlist, transports requests, reserves repositories, and reconciles unknown outcomes |
+| [Brigade](https://brigade.tools) | Dispatches work through reviewed lanes and records verification receipts |
+
+The controller never connects directly to a remote T3 Code server. It talks to the target agent, and that agent talks to its local T3 Code instance.
 
 ## Public commands
 
-All mutating commands default to `approval-required`. The controller never selects `full-access` for you. See `docs/security-model.md` before changing runtime mode.
+- `t3-fleet doctor` checks whether each allowlisted target is reachable and registered.
+- `t3-fleet capacity` reports active sessions and limits per target.
+- `t3-fleet submit` starts a T3 Code session on a selected target and repository.
+- `t3-fleet status` reads a request without waiting.
+- `t3-fleet wait` polls until the request is terminal or needs attention.
+- `t3-fleet followup` sends another prompt to an existing session.
+- `t3-fleet approve` returns a decision for a pending approval.
+- `t3-fleet answer` answers a pending structured input request.
+- `t3-fleet interrupt` requests a graceful stop.
+- `t3-fleet recover` reconciles a request whose dispatch outcome is unknown.
 
-- `t3-fleet doctor` reports whether each allowlisted host is reachable and registered.
-- `t3-fleet capacity` reports active sessions and limits per host plus the global limit.
-- `t3-fleet submit` queues a new session on a chosen host and repository.
-- `t3-fleet status` reads the current state of a request without waiting.
-- `t3-fleet wait` blocks until a request reaches a terminal state or the timeout elapses.
-- `t3-fleet followup` sends a follow-up prompt to a running or paused session.
-- `t3-fleet interrupt` requests a graceful interrupt of a running session.
-- `t3-fleet approve` returns a decision for a pending approval on a session.
-- `t3-fleet answer` returns answers for a pending input request on a session.
-- `t3-fleet recover` reconciles a request whose outcome is unknown.
+Most commands accept flags or a single JSON object on standard input. `answer` is JSON-stdin-only. The request and result contracts live in [`schemas/`](schemas/).
 
-Most commands accept flags or a single JSON object on standard input. `answer` is JSON-stdin-only: it has no flags and reads a single JSON object with `request_id`, `input_id`, and `answers`. The JSON contract is documented in `schemas/request.schema.json` and `schemas/result.schema.json`.
+## Approval modes
 
-## Runtime modes
+Every mutating command defaults to `approval-required`. The controller never selects `full-access` on your behalf.
 
-`t3-fleet` supports four runtime modes. Public guidance only recommends `approval-required`.
+- `approval-required` pauses before an action touches the working tree.
+- `auto-accept-edits` accepts edit approvals but still pauses for other questions.
+- `auto` runs without approval pauses and should stay limited to reviewed prompts.
+- `full-access` removes the remaining T3 Code guardrails and is intended only for sealed reference environments.
 
-- `approval-required` is the default. Every action that touches the working tree pauses for a human decision.
-- `auto-accept-edits` accepts edit approvals automatically. Useful for trusted, reviewed prompts. Still pauses for non-edit questions.
-- `auto` runs without pausing for approvals. Treat as a high-trust, scoped mode.
-- `full-access` removes the remaining guardrails. This is a high-risk mode that public guidance does not recommend. It exists for sealed reference environments, not for everyday work.
+Read the [security model](docs/security-model.md) before changing the default.
 
-## Windows service scripts
+## Windows targets
 
-The PowerShell scripts under `scripts/` are reference examples for running a headless T3 Code service on Windows. They are not installed by `pipx install .` and are not required for Linux or macOS targets. Treat them as starting points and review them before use. See `scripts/install-windows-t3-service.ps1` and `scripts/t3-fleet-agent.ps1`.
+The PowerShell files under [`scripts/`](scripts/) are reference launchers for a headless T3 Code service and `t3-fleet-agent` on Windows. They are not installed by `pipx` and should be reviewed before use.
 
-## Documentation
+## Why not manual SSH or a generic queue?
 
-- `docs/architecture.md` covers the controller, agent, transport, and store layers.
-- `docs/quickstart.md` walks through config, doctor, submit, and wait.
-- `docs/security-model.md` covers allowlisting, approvals, and runtime modes.
-- `docs/recovery.md` covers the `recover` command and unknown-outcome handling.
-- `SECURITY.md` covers reporting and supported versions.
-- `CONTRIBUTING.md` covers the contribution path.
-- `CHANGELOG.md` covers released changes.
+Manual SSH and one T3 Code window per machine are reasonable when one operator has one or two targets. They do not provide a shared request identity, repository leases, target-side receipts, or a recovery command for a connection that drops after the remote session starts.
+
+A generic queue can distribute jobs across machines. It does not know T3 Code thread, approval, follow-up, and input semantics. `t3-fleet` exposes those operations and refuses arbitrary shell execution.
+
+If one T3 Code server already covers every machine you use, start with T3 Code alone. Add this dispatcher when you need an allowlisted controller across separate T3 Code targets or want Brigade receipts around that work.
+
+## What T3 Brigade Fleet is not
+
+T3 Brigade Fleet is not a hosted control plane, a model provider, or a replacement for T3 Code or Brigade. It does not synchronize private memory stores, copy credentials between devices, inspect prompt contents, or accept arbitrary remote commands. Fleet configuration, authentication, and target approval remain operator-owned.
+
+## Docs
+
+- [Architecture](docs/architecture.md)
+- [Quickstart](docs/quickstart.md)
+- [Security model](docs/security-model.md)
+- [Recovery](docs/recovery.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
 
 ## License
 
-Apache-2.0. See `LICENSE`.
+Apache-2.0. See [LICENSE](LICENSE). An [Escoffier Labs](https://github.com/escoffier-labs) project for operators using [Brigade](https://brigade.tools) and T3 Code. The public command is `t3-fleet`.
