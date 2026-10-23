@@ -15,8 +15,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "skills" / "t3-fleet-dispatch" / "SKILL.md"
@@ -85,15 +88,26 @@ def render() -> dict[str, str]:
             skill_body,
             approvals.rstrip(),
             runtime_policy.rstrip(),
-            "The Brigade catalog entry stays at `approval_mode = \"always\"`. See\n"
+            "These projections require this repository checkout for local reference links.\n"
+            'The Brigade catalog entry stays at `approval_mode = "always"`. See\n'
             "`tools/t3-fleet-dispatch.md` for the full tool projection and\n"
             "`skills/t3-fleet-dispatch/references/contract.md` for the request contract.",
         )
     )
-    return {
-        path: f"{header}\n{BANNER}\n\n{projection}\n"
-        for path, header in TARGETS.items()
-    }
+    rendered = {}
+    for path, header in TARGETS.items():
+
+        def relocate(match: re.Match[str]) -> str:
+            link = urlsplit(match[2])
+            if link.scheme or link.netloc or not link.path or link.path.startswith("/"):
+                return match[0]
+            canonical = SKILL.parent / link.path
+            relative = Path(os.path.relpath(canonical, (ROOT / path).parent)).as_posix()
+            return match[1] + urlunsplit(link._replace(path=relative)) + ")"
+
+        body = re.sub(r"(\[[^\]]*\]\()([^)]+)\)", relocate, projection)
+        rendered[path] = f"{header}\n{BANNER}\n\n{body}\n"
+    return rendered
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -101,8 +115,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
 
+    projections = render()
+    if not args.check:
+        for relative in projections:
+            destination = ROOT / relative
+            if destination.is_symlink() or (
+                destination.exists()
+                and BANNER not in destination.read_text(encoding="utf-8")
+            ):
+                print(f"refusing to overwrite user file: {relative}", file=sys.stderr)
+                return 1
     stale: list[str] = []
-    for relative, content in render().items():
+    for relative, content in projections.items():
         destination = ROOT / relative
         current = (
             destination.read_text(encoding="utf-8") if destination.exists() else None

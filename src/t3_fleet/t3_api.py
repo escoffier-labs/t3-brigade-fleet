@@ -168,7 +168,13 @@ class T3Client:
         except ValueError:
             raise T3HttpError("invalid T3 origin") from None
         self._issuer = issuer
-        self._opener = opener if opener is not None else urllib.request.build_opener(_NoRedirect()).open
+        self._opener = (
+            opener
+            if opener is not None
+            else urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), _NoRedirect()
+            ).open
+        )
         self._protocol: int | None = None
 
     def _request(

@@ -192,8 +192,7 @@
           "host",
           "repository",
           "source_revision",
-          "title",
-          "seat"
+          "title"
         ],
         "oneOf": [
           {

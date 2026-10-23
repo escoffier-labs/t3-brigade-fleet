@@ -171,6 +171,7 @@ def report_event(event: dict[str, Any]) -> str:
                 probe = ["brigade", "fleet", "events", "report", "--help"]
                 help_reply = _bounded_run(
                     subprocess.list2cmdline(probe) if os.name == "nt" else probe,
+                    input=None,
                     timeout=REPORT_TIMEOUT,
                 )
                 if help_reply.returncode in {0, 2}:

@@ -144,6 +144,28 @@ def property_names(value: Any):
 
 
 class SchemaTests(unittest.TestCase):
+    def test_submit_schema_accepts_automatic_and_explicit_seats(self):
+        try:
+            from jsonschema import Draft202012Validator
+        except ImportError:
+            self.skipTest("optional JSON Schema tooling is not installed")
+
+        validator = Draft202012Validator(load_schema(REQUEST_SCHEMA))
+        automatic = {
+            "action": "submit",
+            "host": "auto",
+            "repository": "example-repo",
+            "source_revision": "a" * 40,
+            "title": "Repair",
+            "prompt": "work",
+        }
+        self.assertEqual(list(validator.iter_errors(automatic)), [])
+        explicit = dict(automatic, host="linux-worker", seat="coder")
+        self.assertEqual(list(validator.iter_errors(explicit)), [])
+        for seat in (None, "", 42):
+            with self.subTest(seat=seat):
+                self.assertTrue(list(validator.iter_errors(dict(automatic, seat=seat))))
+
     def test_schema_documents_parse_and_are_closed(self) -> None:
         for path in (REQUEST_SCHEMA, RESULT_SCHEMA):
             with self.subTest(path=path.name):
@@ -504,7 +526,7 @@ class SchemaTests(unittest.TestCase):
             if rule["if"]["properties"]["action"].get("const") == "submit"
         )
         self.assertNotIn("request_id", submit_rule["then"]["required"])
-        self.assertIn("seat", submit_rule["then"]["required"])
+        self.assertNotIn("seat", submit_rule["then"]["required"])
         self.assertTrue(
             {"model_selection", "model_instance", "model"}.isdisjoint(
                 set(schema["properties"])
@@ -573,7 +595,7 @@ class WorkloadAndDelegationSchemaTests(unittest.TestCase):
         )
         self.assertEqual(
             set(ordinary["then"]["required"]),
-            {"host", "repository", "source_revision", "title", "seat"},
+            {"host", "repository", "source_revision", "title"},
         )
 
     def test_an_adopted_submit_derives_its_envelope_from_the_receipt(self) -> None:

@@ -146,6 +146,13 @@ class AgentSettleTests(unittest.TestCase):
                 self.assertEqual((result["outcome"], result["reason"]), ("skipped", "not_terminal"))
         self.assertEqual(self.server.commands, [])
 
+    def test_contradictory_detail_cannot_free_capacity_before_settle(self):
+        self.server.projection["thread"]["activeRunId"] = "next"
+        result = self.handle()
+        self.assertEqual(result["outcome"], "skipped")
+        self.assertEqual(self.agent._target_store().active_count(), 1)
+        self.assertEqual(self.server.commands, [])
+
     def test_a_followup_in_flight_is_left_alone(self) -> None:
         with self.agent._request_lock("req-12345678"):
             result = self.handle()

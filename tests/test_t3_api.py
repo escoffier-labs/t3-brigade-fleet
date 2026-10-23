@@ -134,6 +134,66 @@ class T3ApiTests(unittest.TestCase):
             for worker in workers:
                 worker.join(2)
 
+    def test_production_opener_connects_directly_despite_proxy_environment(self):
+        import os
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from threading import Thread
+        from unittest.mock import patch
+
+        destination_seen, proxy_seen = [], []
+
+        class Destination(BaseHTTPRequestHandler):
+            def do_GET(self):
+                destination_seen.append((self.path, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+
+            def log_message(self, *args):
+                pass
+
+        class Proxy(Destination):
+            def do_GET(self):
+                proxy_seen.append((self.path, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+
+        destination = ThreadingHTTPServer(("127.0.0.1", 0), Destination)
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+        servers = (destination, proxy)
+        workers = [
+            Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+            )
+            for server in servers
+        ]
+        for worker in workers:
+            worker.start()
+        try:
+            proxy_url = f"http://127.0.0.1:{proxy.server_port}"
+            with patch.dict(
+                os.environ,
+                {
+                    "http_proxy": proxy_url,
+                    "https_proxy": proxy_url,
+                    "all_proxy": proxy_url,
+                },
+                clear=True,
+            ):
+                client = T3Client(
+                    f"http://127.0.0.1:{destination.server_port}", self.issuer
+                )
+                self.assertEqual(client.get_json("/data"), {"ok": True})
+            self.assertEqual(proxy_seen, [])
+            self.assertEqual(destination_seen, [("/data", "Bearer secret-token")])
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+            for worker in workers:
+                worker.join(2)
+
     def test_session_is_revoked_after_success(self) -> None:
         with self.issuer.session() as token:
             self.assertEqual(token, "secret-token")

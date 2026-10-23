@@ -244,6 +244,7 @@ class ProtocolV2Tests(unittest.TestCase):
 
     def test_v2_status_observes_terminal_output_for_current_run(self):
         self.server.shell["threads"] = [thread("completed")]
+        self.server.projection["thread"].update(thread("completed"))
         self.server.projection["runs"][0]["status"] = "completed"
         self.server.projection["messages"] = [
             {"role": "assistant", "runId": "old-run", "text": "stale", "streaming": False},
@@ -256,6 +257,7 @@ class ProtocolV2Tests(unittest.TestCase):
     def test_v2_thread_projection_over_one_mib_stays_controllable(self):
         # A long thread's projection outgrows the general 1 MiB response cap.
         self.server.shell["threads"] = [thread("completed")]
+        self.server.projection["thread"].update(thread("completed"))
         self.server.projection["runs"][0]["status"] = "completed"
         history = [
             {"role": "assistant", "runId": "old-run", "text": "y" * 65_536, "streaming": False}
@@ -455,6 +457,152 @@ class ProtocolV2Tests(unittest.TestCase):
         with self.assertRaises(T3HttpError):
             self.agent.handle(request)
 
+    def test_terminal_confirmation_is_independent_of_output_and_holds_capacity(self):
+        base = copy.deepcopy(self.server.projection)
+        base["thread"] = dict(base["thread"], **thread("completed"))
+        base["runs"] = [{"id": "run-1", "threadId": "thread-1", "status": "completed"}]
+        base["messages"] = [
+            {"role": "assistant", "runId": "run-1", "text": "done", "streaming": False}
+        ]
+        cases = {
+            "different run": {
+                "runs": [{"id": "other", "threadId": "thread-1", "status": "completed"}]
+            },
+            "status mismatch": {
+                "runs": [{"id": "run-1", "threadId": "thread-1", "status": "running"}]
+            },
+            "absent run": {"runs": []},
+            "queued run": {
+                "runs": base["runs"]
+                + [{"id": "next", "threadId": "thread-1", "status": "queued"}]
+            },
+            "approval": {
+                "runtimeRequests": [
+                    {
+                        "id": "approval-2",
+                        "kind": "command",
+                        "status": "pending",
+                        "responseCapability": {
+                            "type": "live",
+                            "providerSessionId": "s",
+                        },
+                    }
+                ]
+            },
+            "input": {
+                "runtimeRequests": [
+                    {
+                        "id": "input-2",
+                        "kind": "user_input",
+                        "status": "pending",
+                        "responseCapability": {
+                            "type": "live",
+                            "providerSessionId": "s",
+                        },
+                    }
+                ]
+            },
+            "provider background": {
+                "providerThreads": [
+                    {
+                        "id": "pt",
+                        "appThreadId": "thread-1",
+                        "pendingBackgroundTasks": [{"taskId": "bg"}],
+                    }
+                ]
+            },
+            "node": {"nodes": [{"id": "node", "status": "running"}]},
+            "subagent": {"subagents": [{"id": "sub", "status": "waiting"}]},
+        }
+        for key, value in (
+            ("latestRunId", "other"),
+            ("activeRunId", "next"),
+            ("activityRunStatus", "running"),
+            (
+                "pendingRuntimeRequest",
+                {
+                    "id": "input",
+                    "kind": "user_input",
+                    "createdAt": "2026-10-03T15:00:00Z",
+                },
+            ),
+            ("pendingBackgroundTasks", [{"taskId": "bg"}]),
+            ("status", "running"),
+        ):
+            cases[key] = {"thread": dict(base["thread"], **{key: value})}
+        for name, changes in cases.items():
+            for include_output in (False, True):
+                with self.subTest(evidence=name, include_output=include_output):
+                    fixture = ProtocolV2Tests("runTest")
+                    fixture.setUp()
+                    self.addCleanup(fixture.doCleanups)
+                    fixture.fixture._seed_admitted_request()
+                    fixture.server.shell["threads"] = [thread("completed")]
+                    fixture.server.projection = dict(
+                        copy.deepcopy(base), **copy.deepcopy(changes)
+                    )
+                    result = fixture.agent.handle(
+                        {
+                            "action": "reconcile",
+                            "request_id": "req-12345678",
+                            "include_output": include_output,
+                        }
+                    )
+                    self.assertNotIn(
+                        result["state"], {"succeeded", "failed", "interrupted"}
+                    )
+                    self.assertEqual(fixture.agent._target_store().active_count(), 1)
+                    self.assertNotIn("output", result)
+        # Matching terminal detail, including excluded plan nodes, frees capacity.
+        for include_output in (False, True):
+            fixture = ProtocolV2Tests("runTest")
+            fixture.setUp()
+            self.addCleanup(fixture.doCleanups)
+            fixture.fixture._seed_admitted_request()
+            fixture.server.shell["threads"] = [thread("completed")]
+            fixture.server.projection = copy.deepcopy(base)
+            fixture.server.projection["nodes"] = [
+                {"id": "plan", "status": "running", "countsForRun": False}
+            ]
+            result = fixture.agent.handle(
+                {
+                    "action": "reconcile",
+                    "request_id": "req-12345678",
+                    "include_output": include_output,
+                }
+            )
+            self.assertEqual(result["state"], "succeeded")
+            self.assertEqual(fixture.agent._target_store().active_count(), 0)
+            self.assertEqual(result.get("output"), "done" if include_output else None)
+
+    def test_terminal_unreadable_detail_never_releases_capacity(self):
+        self.fixture._seed_admitted_request()
+        self.server.shell["threads"] = [thread("completed")]
+        for include_output in (False, True):
+            for failure in (
+                T3HttpError("unavailable"),
+                ValidationError("malformed projection"),
+            ):
+                with (
+                    self.subTest(output=include_output, failure=type(failure).__name__),
+                    patch.object(self.client, "thread_snapshot", side_effect=failure),
+                ):
+                    with self.assertRaises(type(failure)):
+                        self.agent.handle(
+                            {
+                                "action": "reconcile",
+                                "request_id": "req-12345678",
+                                "include_output": include_output,
+                            }
+                        )
+                    self.assertEqual(self.agent._target_store().active_count(), 1)
+
+    def test_running_without_output_does_not_fetch_detail(self):
+        self.agent.handle({"action": "status", "thread_id": "thread-1"})
+        self.assertFalse(
+            any("/threads/" in request.full_url for request in self.server.requests)
+        )
+
     def test_terminal_detail_cannot_supply_stale_output_or_terminal_success(self):
         self.server.shell["threads"] = [thread("completed")]
         self.server.projection["runs"][0]["status"] = "running"
@@ -532,6 +680,7 @@ class ProtocolV2Tests(unittest.TestCase):
         # completes and marks it countsForRun=false. Observed on a protocol-2 target:
         # it hid every final report from `status --include-output`.
         self.server.shell["threads"] = [thread("completed")]
+        self.server.projection["thread"].update(thread("completed"))
         self.server.projection["runs"] = [{"id": "run-1", "threadId": "thread-1", "status": "completed"}]
         self.server.projection["runtimeRequests"] = []
         self.server.projection["providerThreads"] = []

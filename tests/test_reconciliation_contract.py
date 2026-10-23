@@ -562,7 +562,7 @@ class ControllerDiagnosticTests(unittest.TestCase):
                    "prompt_sha256": "a" * 64,
                    "created_at": "2026-07-28T01:00:00Z", "updated_at": "2026-07-28T02:00:00Z"}
         transport = Mock()
-        transport.call.side_effect = lambda host, req: receipt if req["action"] == "lookup" else {"state": "eligible", "active": 0}
+        transport.call.side_effect = lambda host, req: receipt if req["action"] == "lookup" else {"schema": "t3-fleet.agent-result.v1", "host": host.host_id, "state": "eligible", "active": 0}
         self.controller.transport = transport
         app = _Application(self.controller.config, self.store, transport, self.controller)
         self.assertEqual(app.doctor({"host": "linux-worker"})["state"], "eligible")

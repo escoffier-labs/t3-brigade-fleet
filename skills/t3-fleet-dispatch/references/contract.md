@@ -468,8 +468,11 @@ controller's local outbox and the submit answers:
 }
 ```
 
-`pending_autotick` is deliberately not a dispatch state. Nothing started, no
-capacity was reserved, and only a later `t3-fleet tick` will move it.
+`pending_autotick` is deliberately not a dispatch state. Nothing started, but a
+saved routing reservation may still count against capacity. A later
+`t3-fleet tick` reconciles that execution before advancing the job.
+Configured prompt, intent, and record limits apply before immediate dispatch.
+Successful attempts keep closed metadata with the live payload removed.
 
 Rules, all of which are refusals rather than preferences:
 
@@ -500,10 +503,10 @@ never enters this queue at all.
    "busy"` rather than racing it.
 2. applies retention, then drains a bounded number of ready jobs, each under a
    per-job lease generation that fences every write it makes.
-3. revalidates each job from scratch through the ordinary dispatch path, so live
-   policy, the live roster, privacy, seat, consumer, and live capacity are all
-   re-checked, and a retry re-routes rather than replaying the machine a failed
-   route picked.
+3. reconciles each saved execution and reservation before routing, reusing a
+   valid live reservation. A new route requires proof the earlier attempt never
+   started and its reservation was released or expired. Live policy, roster,
+   privacy, seat, consumer, and capacity checks still apply.
 4. renews the reservations this machine holds **as the target that runs them**,
    so long work no longer depends on an origin CLI staying in `wait`. A source
    never renews another target's reservation, `tick` only ever renews, and an

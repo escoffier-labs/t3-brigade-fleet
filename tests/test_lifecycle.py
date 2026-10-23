@@ -38,7 +38,9 @@ class ReportingTests(unittest.TestCase):
         invalid = subprocess.CompletedProcess([], 2, stdout="", stderr="private detail")
         supported = subprocess.CompletedProcess([], 0, stdout="report help")
         with patch(
-            "t3_fleet.reporting._bounded_run", side_effect=[invalid, supported]
+            "t3_fleet.reporting._bounded_run",
+            autospec=True,
+            side_effect=[invalid, supported],
         ) as run:
             with self.assertLogs("t3_fleet.reporting", level="WARNING") as logs:
                 self.assertEqual(report_event(self.event()), "rejected")
@@ -76,6 +78,7 @@ class ReportingTests(unittest.TestCase):
 
         with patch(
             "t3_fleet.reporting._bounded_run",
+            autospec=True,
             return_value=subprocess.CompletedProcess([], 2, stdout=""),
         ) as run:
             self.assertEqual(report_event(self.event()), "unavailable")
@@ -1077,6 +1080,18 @@ class V2LifecycleTests(unittest.TestCase):
         reporter.start()
         self.addCleanup(reporter.stop)
 
+    def test_observer_holds_capacity_when_detail_still_has_work(self):
+        from tests.test_protocol_v2 import thread
+
+        self.server.shell["threads"] = [thread("completed")]
+        self.agent.handle({"action": "observe", "max": 1})
+        self.assertEqual(self.agent._target_store().active_count(), 1)
+        self.assertNotEqual(self.events[-1]["state"], "run.completed")
+        self.assertNotIn(
+            self.agent._target_store().lookup("req-12345678").state,
+            {"succeeded", "failed", "interrupted"},
+        )
+
     def test_background_runtime_attention_and_terminal_mappings(self):
         t = self.server.shell["threads"][0]
         t.update(
@@ -1096,6 +1111,8 @@ class V2LifecycleTests(unittest.TestCase):
         t.update(
             pendingBackgroundTasks=[], pendingRuntimeRequest=None, status="cancelled"
         )
+        self.server.projection["thread"].update(t)
+        self.server.projection["runs"][0]["status"] = "cancelled"
         self.agent.handle({"action": "observe", "max": 1})
         self.assertEqual(self.events[-1]["state"], "external.canceled")
         self.assertEqual(self.agent._target_store().active_count(), 0)

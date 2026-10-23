@@ -1033,34 +1033,47 @@ class T3Agent:
             result["_terminal_projection"] = True
             if not thread["latestRunId"]:
                 result["state"] = "unknown"
-        if include_output:
+        if include_output or result.get("_terminal_projection"):
             detail = self._thread_detail(self.t3.thread_snapshot(thread_id))
             if detail is None or detail.get("id") != thread_id:
                 raise ValidationError("T3 returned a mismatched thread projection")
             runs = [r for r in detail.get("runs", []) if r.get("id") == thread["latestRunId"]]
-            if state in _TARGET_TERMINAL_STATES and (len(runs) != 1 or runs[0].get("status") != status):
+            if state in _TARGET_TERMINAL_STATES and (
+                len(runs) != 1
+                or runs[0].get("status") != status
+                or detail.get("latestRunId") != thread["latestRunId"]
+                or detail.get("status") != status
+            ):
                 result["state"] = "unknown"
             live_runs = [r for r in detail.get("runs", []) if r.get("status") in _V2_ACTIVE]
             live_requests = [r for r in detail.get("runtimeRequests", []) if r.get("status") == "pending"]
-            live_background = [task for provider in detail.get("providerThreads", [])
-                               for task in provider.get("pendingBackgroundTasks", [])]
-            # T3 leaves a finished run's todo_list plan node "running" and marks
-            # it countsForRun=false, so only nodes that count for a run are work.
-            live_nodes = [n for key in ("nodes", "subagents") for n in detail.get(key, [])
-                          if n.get("status") in {"pending", "running", "waiting"}
-                          and n.get("countsForRun") is not False]
-            # Detail is fetched after shell. A settled old run cannot settle a
-            # reservation while this newer observation contains any live work.
-            if live_runs or live_requests or live_background or live_nodes:
-                result["state"] = "needs_attention" if live_requests else ("unknown" if result["state"] == "unknown" else "running")
-                result["needs_attention"] = bool(live_requests)
+            live_pending = detail.get("pendingRuntimeRequest") or (
+                live_requests[0] if live_requests else pending
+            )
+            live_background = list(detail.get("pendingBackgroundTasks") or []) + [
+                task
+                for provider in detail.get("providerThreads", [])
+                for task in provider.get("pendingBackgroundTasks", [])
+            ]
+            # Detail is fetched after shell. All current work, including work
+            # absent from the run list, holds capacity. The shared predicate
+            # excludes stale plan nodes explicitly marked countsForRun=false.
+            if self._detail_has_live_work(detail):
+                result["state"] = (
+                    "needs_attention"
+                    if live_pending
+                    else ("unknown" if result["state"] == "unknown" else "running")
+                )
+                result["needs_attention"] = bool(live_pending)
                 result["detail_active_run_ids"] = [r["id"] for r in live_runs]
-                if live_requests:
-                    result["pending_runtime_request"] = {k: live_requests[0].get(k) for k in ("id", "kind", "createdAt")}
+                if live_pending:
+                    result["pending_runtime_request"] = {
+                        k: live_pending.get(k) for k in ("id", "kind", "createdAt")
+                    }
                 if live_background:
                     result["pending_background_tasks"] = live_background
                 return result
-            if result["state"] == "unknown":
+            if result["state"] == "unknown" or not include_output:
                 return result
             messages = [m["text"] for m in detail.get("messages", [])
                         if isinstance(m, dict) and m.get("role") == "assistant"

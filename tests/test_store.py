@@ -192,6 +192,106 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(record.state, "running")
         self.assertEqual(record.thread_id, "thread-1")
 
+    def test_import_preserves_plan_on_discovery_and_update_and_rejects_conflicts(self):
+        plan = dict(
+            _admission(),
+            state="planned",
+            launch_model="gpt-5.6-terra",
+            launch_model_explicit=False,
+        )
+        receipt = {
+            "request_id": "req-12345678",
+            "target_id": "linux-worker",
+            "repository": "example-repo",
+            "request_digest": "a" * 64,
+            "state": "running",
+            "thread_id": "thread-1",
+            "prompt_bytes": 12,
+            "model_plan": plan,
+            "model_admission": _admission(),
+            "created_at": "2026-07-28T01:00:00Z",
+            "updated_at": "2026-07-28T01:01:00Z",
+        }
+        self.assertEqual(self.store.import_receipt(receipt).plan, plan)
+        self.assertEqual(
+            self.store.import_receipt(dict(receipt, state="succeeded")).plan, plan
+        )
+        before = self.store.get("req-12345678")
+        for changes in (
+            {"model_plan": {"state": "planned"}},
+            {
+                "model_plan": dict(
+                    plan, launch_model="other", launch_model_explicit=True
+                )
+            },
+            {"model_plan": dict(plan, seat="other")},
+            {"model_admission": _admission(model="other")},
+        ):
+            with (
+                self.subTest(changes=changes),
+                self.assertRaises((ValidationError, PolicyRejected)),
+            ):
+                self.store.import_receipt(dict(receipt, **changes))
+            self.assertEqual(self.store.get("req-12345678"), before)
+        fresh = FleetStore(Path(self.directory.name) / "fresh.db")
+        for changes in (
+            {"model_plan": []},
+            {"model_plan": dict(plan, seat="other")},
+            {"model_admission": None},
+        ):
+            with (
+                self.subTest(fresh=changes),
+                self.assertRaises((ValidationError, PolicyRejected)),
+            ):
+                fresh.import_receipt(dict(receipt, **changes))
+        # Discovery can also upgrade a journal which predates plan persistence.
+        other = FleetStore(Path(self.directory.name) / "old.db")
+        other.import_receipt({k: v for k, v in receipt.items() if k != "model_plan"})
+        self.assertEqual(other.import_receipt(receipt).plan, plan)
+
+    def test_second_controller_discovers_enrolled_plan_for_every_continuation(self):
+        from t3_fleet.controller import FleetController
+        from tests.test_controller import config
+        from tests.test_agent import TargetLaunchLifecycleTests, PEER_REQUEST_ID, PLAN
+
+        fixture = TargetLaunchLifecycleTests("runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        from dataclasses import replace
+
+        calls = []
+
+        class DirectTarget:
+            def call(self, host, request):
+                calls.append(request)
+                return fixture.agent.handle(request)
+
+        controller = FleetController(
+            replace(config(), coordination_mode="target-authoritative"),
+            self.store,
+            DirectTarget(),
+        )
+        wire = fixture.agent.handle({"action": "lookup", "request_id": PEER_REQUEST_ID})
+        record = controller.store.import_receipt(wire)
+        self.assertEqual(
+            controller._model_credential(record), {"model_plan": dict(PLAN)}
+        )
+        actions = (
+            lambda: controller.approve(PEER_REQUEST_ID, "approval-1", "accept"),
+            lambda: controller.answer(PEER_REQUEST_ID, "input-1", {"q": "yes"}),
+            lambda: controller.followup(
+                PEER_REQUEST_ID, prompt="continue", runtime_mode="full-access"
+            ),
+        )
+        for name, action in zip(("approve", "answer", "followup"), actions):
+            with self.subTest(action=name):
+                before = len(fixture.fake_t3.dispatched)
+                action()
+                self.assertEqual(calls[-1]["action"], name)
+                self.assertEqual(calls[-1]["model_plan"], dict(PLAN))
+                self.assertNotIn("model_admission", calls[-1])
+                self.assertGreater(len(fixture.fake_t3.dispatched), before)
+
     def test_import_prelaunch_failure_preserves_plan_without_authorizing_launch(self) -> None:
         plan = dict(_admission(), state="planned", launch_model="gpt-5.6-terra",
                     launch_model_explicit=False)

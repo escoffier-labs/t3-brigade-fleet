@@ -220,7 +220,9 @@ parent's act.
 a submit that meets a **pre-launch** capacity or offline block is stored locally
 instead of failing, and answers `"state": "pending_autotick"` with a `job_id`, a
 `queue_disposition`, and a `queue_reason`. `pending_autotick` is not a dispatch
-state: nothing started and nothing was reserved.
+state: nothing started, but a saved routing reservation may still count against
+capacity. Configured prompt, intent, and record limits apply before immediate
+dispatch. Successful attempts keep closed metadata with the live payload removed.
 
 `allow_queue` is opt-in per call. Absent, a block fails the call as before.
 `false` is an explicit refusal and is honoured as one. A controller without the
@@ -232,8 +234,10 @@ and is never queued for a second run.
 `tick` drains a bounded slice of that queue under a single-owner lease, and
 renews the reservations this machine holds as the target that runs them. Each
 job is revalidated against live policy, roster, privacy, and capacity through
-the ordinary dispatch path, and a retry re-routes rather than replaying the
-machine a failed route picked. Its result reports `dispatched`, `blocked`,
+the ordinary dispatch path. A retry first reconciles its saved execution and
+reservation, reusing a valid live reservation. A new route requires proof the
+earlier attempt never started and its reservation was released or expired.
+Its result reports `dispatched`, `blocked`,
 `held`, and `expired` as arrays of redacted records, plus `examined`,
 `truncated`, `reservations`, `counts`, and `last_tick_at`, which is what
 separates a queue pending an autotick from one a tick has drained.

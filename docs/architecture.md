@@ -102,9 +102,9 @@ Unknown outcomes retain capacity and must satisfy target reconciliation rules.
 
 `outbox.py` owns an optional bounded controller-local queue. Explicitly opted-in
 pre-launch blocks can defer the original intent. Tick revalidates authority
-before each attempt and holds unknown acceptance. Retention limits stored
-payload duration, never execution duration. Tick also renews reservations this
-node owns as a target, so long runs need no originating CLI polling loop.
+before each attempt and holds unknown acceptance. Retention limits payload
+duration in live records, never execution duration. Tick also renews reservations
+this node owns as a target, so long runs need no originating CLI polling loop.
 
 The optional operator-only settlement sweep handles fleet threads terminal past
 a grace period. It does not contain live work. `timer.py` renders or installs

@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from t3_fleet.cli import _POLICY_REASON_MESSAGES
+from t3_fleet.controller import FleetController
 from t3_fleet.errors import (
     POLICY_REASONS,
     HostUnavailable,
@@ -17,6 +18,12 @@ from t3_fleet.errors import (
 
 
 FULL_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def diagnostic_controller(config, transport):
+    controller = FleetController(config, Mock(), transport)
+    controller.refresh_submit_health = Mock()
+    return controller
 
 
 class CliTests(unittest.TestCase):
@@ -697,6 +704,52 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         application.doctor.assert_called_once_with({})
 
+    def test_diagnostics_validate_identity_on_the_real_cli_path(self):
+        from t3_fleet import cli
+        from t3_fleet.controller import FleetController
+        from t3_fleet.store import FleetStore
+        from tests.test_controller import config
+
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config()
+            store = FleetStore(Path(directory) / "fleet.db")
+            transport = Mock()
+            controller = FleetController(cfg, store, transport)
+            application = cli._Application(cfg, store, transport, controller)
+            valid = {
+                "schema": "t3-fleet.agent-result.v1",
+                "host": "linux-worker",
+                "state": "eligible",
+                "active": 1,
+                "limit": 2,
+            }
+            for action in ("doctor", "capacity"):
+                for changes in (
+                    {"schema": "wrong"},
+                    {"host": "other-worker"},
+                    {"target_id": "other-worker"},
+                    {},
+                ):
+                    with self.subTest(action=action, changes=changes):
+                        transport.call.return_value = dict(valid, **changes)
+                        code, stdout, stderr = self.invoke(
+                            [action, "--host", "linux-worker"], application=application
+                        )
+                        result = json.loads(stdout)
+                        self.assertEqual(code, 0)
+                        self.assertEqual(stderr, "")
+                        self.assertEqual(
+                            result["state"],
+                            "blocked_offline" if changes else "eligible",
+                        )
+                        if changes:
+                            self.assertNotEqual(result["hosts"][0].get("active"), 1)
+                        else:
+                            self.assertEqual(result["hosts"][0]["active"], 1)
+                        self.assertEqual(
+                            transport.call.call_args.args[1]["host"], "linux-worker"
+                        )
+
     def test_doctor_propagates_target_active_count_and_limit(self) -> None:
         from t3_fleet import cli
 
@@ -707,6 +760,8 @@ class CliTests(unittest.TestCase):
         )
         transport = Mock()
         transport.call.return_value = {
+            "schema": "t3-fleet.agent-result.v1",
+            "host": "linux-worker",
             "state": "eligible",
             "server_version": "0.0.30",
             "project_registered": True,
@@ -736,7 +791,7 @@ class CliTests(unittest.TestCase):
             config=config,
             store=Mock(),
             transport=transport,
-            controller=Mock(),
+            controller=diagnostic_controller(config, transport),
         )
 
         result = application.doctor(
@@ -765,15 +820,23 @@ class CliTests(unittest.TestCase):
 
         def call(host, _request):
             if host.host_id == "worker-a":
-                return {"state": "eligible"}
-            return {"state": "at_capacity"}
+                return {
+                    "schema": "t3-fleet.agent-result.v1",
+                    "host": host.host_id,
+                    "state": "eligible",
+                }
+            return {
+                "schema": "t3-fleet.agent-result.v1",
+                "host": host.host_id,
+                "state": "at_capacity",
+            }
 
         transport.call.side_effect = call
         application = cli._Application(
             config=config,
             store=Mock(),
             transport=transport,
-            controller=Mock(),
+            controller=diagnostic_controller(config, transport),
         )
 
         result = application.doctor({})
@@ -796,6 +859,8 @@ class CliTests(unittest.TestCase):
         transport.call.side_effect = [
             HostUnavailable("private transport detail"),
             {
+                "schema": "t3-fleet.agent-result.v1",
+                "host": "worker-b",
                 "state": "eligible",
                 "server_version": "0.0.34",
                 "active": 0,
@@ -806,7 +871,7 @@ class CliTests(unittest.TestCase):
             config=config,
             store=Mock(),
             transport=transport,
-            controller=Mock(),
+            controller=diagnostic_controller(config, transport),
         )
 
         result = application.doctor({})
@@ -849,13 +914,18 @@ class CliTests(unittest.TestCase):
         transport = Mock()
         transport.call.side_effect = [
             HostUnavailable("private transport detail"),
-            {"state": "eligible", "active": 0},
+            {
+                "schema": "t3-fleet.agent-result.v1",
+                "host": "worker-b",
+                "state": "eligible",
+                "active": 0,
+            },
         ]
         application = cli._Application(
             config=config,
             store=store,
             transport=transport,
-            controller=Mock(),
+            controller=diagnostic_controller(config, transport),
         )
 
         result = application.capacity({})

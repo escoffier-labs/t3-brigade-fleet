@@ -142,7 +142,7 @@ class _Application:
                 **({"repository": repository} if repository is not None else {}),
             }
             try:
-                response = self.transport.call(host, transport_request)
+                response = self.controller._call(host, transport_request)
             except HostUnavailable:
                 results.append(
                     {
@@ -225,7 +225,7 @@ class _Application:
                 })
                 continue
             try:
-                response = self.transport.call(host, {"action": "capacity"})
+                response = self.controller._call(host, {"action": "capacity"})
             except HostUnavailable:
                 results.append(
                     {

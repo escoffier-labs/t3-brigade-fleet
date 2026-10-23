@@ -474,6 +474,15 @@ class FleetStore:
             if admission_value is not None
             else None
         )
+        plan_value = receipt.get("model_plan")
+        plan = normalize_model_plan(plan_value) if plan_value is not None else None
+        if plan is not None and (
+            (admission is None and state != "failed")
+            or (admission is not None and not admission_matches_plan(admission, plan))
+        ):
+            raise PolicyRejected(
+                "target receipt model admission does not match its model plan"
+            )
         legacy = receipt.get("legacy") is True
         if thread_id is not None and not isinstance(thread_id, str):
             raise ValidationError("target receipt contains invalid thread_id")
@@ -518,6 +527,12 @@ class FleetStore:
                 # what comes back has to be a real admission for exactly the
                 # seat identity that was planned.
                 existing_plan = normalize_model_plan(json.loads(existing["plan_json"]))
+                if plan is not None and plan_identity(plan) != plan_identity(
+                    existing_plan
+                ):
+                    raise PolicyRejected(
+                        "target receipt model plan does not match controller model plan"
+                    )
                 if admission is None:
                     # A target can fail after allocating a thread but before
                     # launch admission. Reconcile that failure without turning
@@ -526,7 +541,7 @@ class FleetStore:
                         raise PolicyRejected(
                             "target receipt does not match the controller request binding"
                         )
-                    incoming_plan = receipt.get("model_plan")
+                    incoming_plan = plan
                     if (
                         state != "failed"
                         or incoming_plan is None
@@ -539,13 +554,14 @@ class FleetStore:
                     raise PolicyRejected(
                         "target receipt model admission does not match the controller model plan"
                     )
+                plan = existing_plan if plan is None else plan
             connection.execute(
                 """
                 INSERT INTO requests (
                     request_id, digest, host, repository, state, prompt_bytes,
                     thread_id, created_at, updated_at, source_revision,
-                    prompt_sha256, legacy, admission_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    prompt_sha256, legacy, admission_json, plan_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(request_id) DO UPDATE SET
                     digest = excluded.digest,
                     host = excluded.host,
@@ -557,14 +573,28 @@ class FleetStore:
                     source_revision = excluded.source_revision,
                     prompt_sha256 = excluded.prompt_sha256,
                     legacy = excluded.legacy,
-                    admission_json = excluded.admission_json
+                    admission_json = excluded.admission_json,
+                    plan_json = excluded.plan_json
                 """,
                 (
-                    request_id, digest, host, repository, state, prompt_bytes,
-                    thread_id, created_at, updated_at, source_revision,
-                    prompt_sha256, int(legacy),
+                    request_id,
+                    digest,
+                    host,
+                    repository,
+                    state,
+                    prompt_bytes,
+                    thread_id,
+                    created_at,
+                    updated_at,
+                    source_revision,
+                    prompt_sha256,
+                    int(legacy),
                     json.dumps(admission, sort_keys=True, separators=(",", ":"))
-                    if admission is not None else None,
+                    if admission is not None
+                    else None,
+                    json.dumps(plan, sort_keys=True, separators=(",", ":"))
+                    if plan is not None
+                    else None,
                 ),
             )
         return self.get(request_id)

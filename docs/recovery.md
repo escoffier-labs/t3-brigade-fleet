@@ -50,15 +50,19 @@ Do not submit replacement work to guess whether the earlier request ran.
 
 The optional local outbox admits only explicit `--allow-queue` submissions on a
 controller with `[outbox] enabled = true`. Known pre-launch capacity or offline
-blocks can yield `pending_autotick` with a `job_id`. No execution has started.
+blocks can yield `pending_autotick` with a `job_id`. No execution has started,
+but a saved routing reservation may still count against capacity.
+Configured prompt, intent, and record limits apply before immediate dispatch.
+Successful attempts keep closed metadata with the live payload removed.
 Queueing cannot adopt a parent `--delegation-id`.
 
 `t3-fleet tick` drains a bounded slice under a single-owner lease and renews
 reservations this local node owns as a target. Overlapping ticks return `busy`.
 Every attempt uses live policy, roster, privacy, and capacity checks. A retry
-routes the caller's original intent again rather than replaying a failed
-machine selection. The original submission's authorization covers only that
-same deferred work. A tick is never authority to create new work.
+first reconciles its saved execution and reservation. A valid live reservation
+is reused. A new route requires proof that the earlier attempt never started
+and that its reservation was released or expired. The original submission's
+authorization covers only that same deferred work. A tick is never authority to create new work.
 
 Inspect `last_tick_at`, `queue_disposition`, and `queue_reason` in results.
 `held-acceptance-unknown` means the target may already have accepted the work.

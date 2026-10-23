@@ -324,6 +324,73 @@ class T3FleetDispatchSkillTests(unittest.TestCase):
         self.assertIn('approval_mode = "always"', tool)
         self.assertIn('command = "t3-fleet brigade-invoke"', tool)
 
+    def test_projected_reference_links_resolve_in_every_layout(self):
+        from urllib.parse import urlsplit
+
+        generator = runpy.run_path(str(REPO_ROOT / "scripts" / "project-skill.py"))
+        for relative, content in generator["render"]().items():
+            links = re.findall(r"\[[^\]]*\]\(([^)]+)\)", content)
+            local = [urlsplit(link) for link in links if not urlsplit(link).scheme]
+            self.assertGreaterEqual(len(local), 4)
+            for link in local:
+                with self.subTest(surface=relative, link=link.geturl()):
+                    target = (REPO_ROOT / relative).parent / link.path
+                    self.assertTrue(target.resolve().is_file(), str(target))
+                    if "references/" in link.path:
+                        self.assertEqual(
+                            target.resolve().parent,
+                            REPO_ROOT / "skills/t3-fleet-dispatch/references",
+                        )
+
+    def test_projection_relocation_preserves_fragments_and_external_links(self):
+        from unittest.mock import patch
+
+        generator = runpy.run_path(str(REPO_ROOT / "scripts/project-skill.py"))
+        render = generator["render"]
+        with tempfile.TemporaryDirectory() as directory:
+            skill = Path(directory) / "skills/t3-fleet-dispatch/SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(
+                "[contract](references/contract.md#queue)\n"
+                "[external](https://example.invalid/reference#section)\n"
+            )
+            with patch.dict(
+                render.__globals__, {"SKILL": skill, "ROOT": Path(directory)}
+            ):
+                for relative, content in render().items():
+                    with self.subTest(surface=relative):
+                        self.assertIn("contract.md#queue)", content)
+                        self.assertIn(
+                            "[external](https://example.invalid/reference#section)",
+                            content,
+                        )
+                        link = re.search(r"\[contract\]\(([^#]+)#queue\)", content)[1]
+                        self.assertEqual(
+                            ((Path(directory) / relative).parent / link).resolve(),
+                            skill.parent / "references/contract.md",
+                        )
+
+    def test_generator_refuses_to_overwrite_user_projection(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        generator = runpy.run_path(str(REPO_ROOT / "scripts/project-skill.py"))
+        main = generator["main"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_file = root / ".claude/commands/t3-fleet.md"
+            user_file.parent.mkdir(parents=True)
+            user_file.write_text("user command\n")
+            with (
+                patch.dict(main.__globals__, {"ROOT": root}),
+                contextlib.redirect_stderr(io.StringIO()),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(main([]), 1)
+            self.assertEqual(user_file.read_text(), "user command\n")
+            self.assertFalse((root / ".codex/skills/t3-fleet/SKILL.md").exists())
+
     def test_generated_projections_keep_public_approval_and_prompt_guards(self) -> None:
         generated = runpy.run_path(str(REPO_ROOT / "scripts" / "project-skill.py"))["render"]()
         self.assertEqual(len(generated), 4)
