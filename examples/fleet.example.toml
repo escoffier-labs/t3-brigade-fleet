@@ -11,6 +11,11 @@ transport = "local"
 agent_command = ["/home/operator/.local/bin/t3-fleet-agent"]
 active_limit = 1
 expected_hostname = "controller-a"
+# Optional. Per-repository cap on this host. 0 or unset uses active_limit.
+# Each request runs in an isolated worktree. Set 1 for one request per repository.
+# max_concurrent_per_repository = 0
+# Optional. Seconds a stuck request may hold a repository slot (default 21600).
+# repository_lease_ttl_seconds = 21600
 
 [hosts.target-a]
 enabled = true

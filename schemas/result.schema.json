@@ -17,12 +17,21 @@
       "type": "string"
     },
     "request_id": {
-      "type": "string"
+      "description": "The union bound only. A queued outbox result reports null here because no execution identity and no machine exist yet; every branch that names a real request carries the stricter constraint itself.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "host": {
-      "type": "string"
+      "description": "The union bound only. A queued outbox result reports null here because no execution identity and no machine exist yet; every branch that names a real request carries the stricter constraint itself.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "state": {
+      "description": "`pending_autotick` is deliberately not a dispatch state: the work was accepted into the local outbox, nothing was reserved for it, and only a later `tick` will move it.",
       "type": "string"
     },
     "thread_id": {
@@ -46,6 +55,15 @@
     "output": {
       "type": "string"
     },
+    "pending_request": {
+      "$ref": "#/$defs/pending_request"
+    },
+    "admission": {
+      "$ref": "#/$defs/admission"
+    },
+    "model_plan": {
+      "$ref": "#/$defs/model_plan"
+    },
     "global_limit": {
       "type": "integer"
     },
@@ -54,9 +72,289 @@
     },
     "error": {
       "$ref": "#/$defs/error_detail"
+    },
+    "disposition": {
+      "description": "An additional statement about a terminal delegated execution whose target worktree was retained. `state` remains the real execution state; this never replaces it and never claims work was applied anywhere else.",
+      "const": "pending-handoff"
+    },
+    "handoff": {
+      "$ref": "#/$defs/handoff"
+    },
+    "job_id": {
+      "$ref": "#/$defs/outbox_record/properties/job_id"
+    },
+    "job_state": {
+      "$ref": "#/$defs/outbox_record/properties/job_state"
+    },
+    "queue_disposition": {
+      "$ref": "#/$defs/queue_disposition"
+    },
+    "queue_reason": {
+      "$ref": "#/$defs/queue_reason"
+    },
+    "execution_state": {
+      "$ref": "#/$defs/execution_state"
+    },
+    "attempts": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "parent_request_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "repository": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "payload_purged": {
+      "type": "boolean"
+    },
+    "examined": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "truncated": {
+      "description": "The tick hit its own duration or job bound before the queue was empty. Whatever is left stays queued for the next one.",
+      "type": "boolean"
+    },
+    "dispatched": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/outbox_record"
+      }
+    },
+    "blocked": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/outbox_record"
+      }
+    },
+    "held": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/outbox_record"
+      }
+    },
+    "expired": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/outbox_record"
+      }
+    },
+    "reservations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/reservation_record"
+      }
+    },
+    "last_tick_at": {
+      "description": "When a tick last finished, so a reader can tell a queue that is pending an autotick from one a tick has actually drained.",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "last_failure_at": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "last_failure_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "counts": {
+      "description": "How many outbox records sit in each state. The states are fixed, so this is a closed object rather than an open map.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dispatched": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expired": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "held": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "queued": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "resolution": {
+      "$ref": "#/$defs/resolution"
+    },
+    "target_error": {
+      "$ref": "#/$defs/target_error"
     }
   },
   "$defs": {
+    "model_plan": {
+      "description": "What a launch would use, as the Fleet Hub planned it. Planning is never launch authorization: `state` stays `planned`, planning is Hub-only, and a real launch admission is still taken by the target immediately before the turn starts. `model` is the canonical model identity; `launch_model` is the native model the provider is launched on, which differs only when the roster binding named one explicitly.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "roster_revision",
+        "roster_digest",
+        "seat",
+        "provider",
+        "model",
+        "reasoning",
+        "provider_instance_id",
+        "launch_model",
+        "launch_model_explicit",
+        "source",
+        "expires_at"
+      ],
+      "properties": {
+        "state": {
+          "const": "planned"
+        },
+        "roster_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "roster_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "seat": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "reasoning": {
+          "type": "string"
+        },
+        "provider_instance_id": {
+          "type": "string"
+        },
+        "service_tier": {
+          "type": "string"
+        },
+        "launch_model": {
+          "type": "string"
+        },
+        "launch_model_explicit": {
+          "type": "boolean"
+        },
+        "source": {
+          "const": "hub"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "admission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "roster_revision",
+        "roster_digest",
+        "seat",
+        "provider",
+        "model",
+        "reasoning",
+        "provider_instance_id",
+        "source",
+        "expires_at"
+      ],
+      "properties": {
+        "roster_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "roster_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "seat": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "reasoning": {
+          "type": "string"
+        },
+        "provider_instance_id": {
+          "type": "string"
+        },
+        "service_tier": {
+          "type": "string"
+        },
+        "launch_model": {
+          "description": "The explicit native model the roster binding named, which the provider is launched on. `model` stays the canonical identity. Absent means the canonical model is launched verbatim.",
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "enum": [
+            "hub",
+            "lkg"
+          ]
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "observed_model_selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "instanceId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "reasoningEffort": {
+              "type": "string",
+              "minLength": 1
+            },
+            "serviceTier": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
     "legacy_request_id": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9-]{7,63}$"
@@ -91,6 +389,8 @@
             "invalid_request",
             "host_unavailable",
             "idempotency_conflict",
+            "policy_rejected",
+            "policy_revision_conflict",
             "unknown_state",
             "t3_auth_failed",
             "t3_http_failed",
@@ -98,6 +398,415 @@
           ]
         },
         "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "reason": {
+          "description": "Which policy denial this was. Every fleet policy denial shares the policy_rejected code, so this fixed vocabulary is what an operator acts on. Absent when the denial is not one of these.",
+          "type": "string",
+          "enum": [
+            "continuation-admission-required",
+            "policy-repository-mismatch",
+            "policy-machine-mismatch",
+            "policy-seat-mismatch",
+            "policy-decision-superseded",
+            "policy-digest-stale",
+            "model-admission-denied",
+            "model-admission-expired",
+            "policy-selection-mismatch",
+            "policy-plan-mismatch",
+            "delegation-not-enrolled",
+            "delegation-invalid",
+            "delegation-conflict",
+            "delegation-repository-unmatched"
+          ]
+        }
+      }
+    },
+    "handoff": {
+      "description": "Work this target still holds for a finished adoption. The field set is frozen with the T3 coordinator. `worktree_ref` is an opaque target-owned request reference, not a resolvable path; nothing was copied, no patch was applied, and no source checkout is claimed to have changed.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_machine",
+        "repository",
+        "branch",
+        "source_revision",
+        "request_id",
+        "worktree_ref"
+      ],
+      "properties": {
+        "target_machine": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "source_revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "request_id": {
+          "$ref": "#/$defs/request_id"
+        },
+        "worktree_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "queue_disposition": {
+      "description": "Why one local outbox job is where it is. An allowlist rather than free text, so a helper message, a checkout path, or a prompt can never ride out on this field.",
+      "type": "string",
+      "enum": [
+        "queued-blocked",
+        "queued-retry",
+        "dispatched",
+        "held-acceptance-unknown",
+        "failed-policy",
+        "failed-invalid",
+        "failed-conflict",
+        "failed-attempts",
+        "expired-retention"
+      ]
+    },
+    "execution_state": {
+      "description": "What is known about the execution behind an outbox record, kept apart from the record's own state. `never-dispatched` says only that no drain attempt reached a target; a retention expiry or a payload purge is never proof that a run stopped, and such a record reports `unknown` instead.",
+      "type": "string",
+      "enum": [
+        "never-dispatched",
+        "dispatched",
+        "unknown"
+      ]
+    },
+    "queue_reason": {
+      "description": "The allowlisted block or policy slug behind a queued or refused job, or null when there is none to report.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "capacity-exhausted",
+        "host-ineligible",
+        "host-offline",
+        "host-circuit-open",
+        "repository-busy",
+        "hub-unreachable",
+        "continuation-admission-required",
+        "policy-repository-mismatch",
+        "policy-machine-mismatch",
+        "policy-seat-mismatch",
+        "policy-decision-superseded",
+        "policy-digest-stale",
+        "model-admission-denied",
+        "model-admission-expired",
+        "policy-selection-mismatch",
+        "policy-plan-mismatch",
+        "delegation-not-enrolled",
+        "delegation-invalid",
+        "delegation-conflict",
+        "delegation-repository-unmatched",
+        null
+      ]
+    },
+    "outbox_record": {
+      "description": "One redacted local outbox job. Identities, states, and counts only: it carries no prompt, no title, and no checkout path.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id",
+        "job_state",
+        "queue_disposition",
+        "execution_state"
+      ],
+      "properties": {
+        "job_id": {
+          "description": "This controller's own work identity for the queued job. It is minted before any machine is chosen, so it is never the target-qualified execution id and never a parent request id.",
+          "type": "string",
+          "pattern": "^job-[0-9a-f]{32}$"
+        },
+        "job_state": {
+          "type": "string",
+          "enum": [
+            "queued",
+            "dispatched",
+            "held",
+            "failed",
+            "expired"
+          ]
+        },
+        "queue_disposition": {
+          "$ref": "#/$defs/queue_disposition"
+        },
+        "queue_reason": {
+          "$ref": "#/$defs/queue_reason"
+        },
+        "execution_state": {
+          "$ref": "#/$defs/execution_state"
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload_purged": {
+          "type": "boolean"
+        }
+      }
+    },
+    "reservation_record": {
+      "description": "One reservation this machine holds as the target that runs the work. `tick` only ever renews; it never releases and never revives one that was already handed back.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "state",
+        "reservation_state",
+        "renewed"
+      ],
+      "properties": {
+        "request_id": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "reservation_state": {
+          "type": "string",
+          "enum": [
+            "active",
+            "released"
+          ]
+        },
+        "renewed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "pending_request": {
+      "description": "Present only when state is needs_attention. Names the T3 request the task is waiting on: pass `id` as `input_id` to `t3-fleet answer` when respond_with is `answer`, or as `approval_id` to `t3-fleet approve` when it is `approve`. Every string is bounded and unknown fields are dropped.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "created_at": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "respond_with": {
+          "enum": [
+            "answer",
+            "approve"
+          ]
+        },
+        "questions": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "options"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "header": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "question": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              },
+              "multi_select": {
+                "type": "boolean"
+              },
+              "options": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "label"
+                  ],
+                  "properties": {
+                    "label": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 200
+                    },
+                    "description": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 500
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "questions_truncated": {
+          "const": true
+        },
+        "approval": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "request_kind": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "summary": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000
+            },
+            "app_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "options": {
+              "type": "array",
+              "maxItems": 10,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "decision",
+                  "label"
+                ],
+                "properties": {
+                  "decision": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "label": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "warning": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason"
+      ],
+      "properties": {
+        "reason": {
+          "enum": [
+            "terminal-unconfirmed",
+            "submit-unresolved",
+            "host-circuit-open"
+          ]
+        },
+        "deadline": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 40
+        },
+        "blocking": {
+          "type": "boolean"
+        }
+      }
+    },
+    "target_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "detail"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_config",
+            "invalid_request",
+            "host_unavailable",
+            "t3_auth_failed",
+            "t3_http_failed",
+            "internal_error",
+            "policy_rejected",
+            "policy_revision_conflict"
+          ]
+        },
+        "detail": {
           "type": "string",
           "minLength": 1,
           "maxLength": 512
@@ -169,7 +878,34 @@
         "output": {
           "type": "string",
           "maxLength": 16384
+        },
+        "admission": {
+          "$ref": "#/$defs/admission"
+        },
+        "model_plan": {
+          "$ref": "#/$defs/model_plan"
+        },
+        "disposition": {
+          "description": "An additional statement about a terminal delegated execution whose target worktree was retained. `state` remains the real execution state; this never replaces it and never claims work was applied anywhere else.",
+          "const": "pending-handoff"
+        },
+        "handoff": {
+          "$ref": "#/$defs/handoff"
+        },
+        "resolution": {
+          "$ref": "#/$defs/resolution"
+        },
+        "target_error": {
+          "$ref": "#/$defs/target_error"
         }
+      },
+      "dependentRequired": {
+        "disposition": [
+          "handoff"
+        ],
+        "handoff": [
+          "disposition"
+        ]
       }
     },
     {
@@ -237,6 +973,54 @@
               "limit": {
                 "type": "integer",
                 "minimum": 1
+              },
+              "repository_limit": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "observed_project_default": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/observed_model_selection"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "approved_model_admission": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/admission"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "admission_source": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "hub",
+                  "lkg",
+                  null
+                ]
+              },
+              "admission_cache_age_seconds": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "project_default_drift": {
+                "type": "boolean"
+              },
+              "resolution": {
+                "$ref": "#/$defs/resolution"
               }
             }
           }
@@ -304,8 +1088,15 @@
                 "type": "integer",
                 "minimum": 1
               },
+              "repository_limit": {
+                "type": "integer",
+                "minimum": 1
+              },
               "circuit_open": {
                 "type": "boolean"
+              },
+              "resolution": {
+                "$ref": "#/$defs/resolution"
               }
             }
           }
@@ -329,6 +1120,187 @@
         },
         "request_id": {
           "$ref": "#/$defs/request_id"
+        }
+      }
+    },
+    {
+      "title": "Tick result",
+      "description": "One bounded local drain of this controller's own outbox. It reports what the queue did and which reservations this machine renewed as the target; it never reports a target's view of an execution and never carries a prompt.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "action",
+        "state",
+        "examined",
+        "dispatched",
+        "blocked",
+        "held",
+        "expired",
+        "reservations",
+        "truncated",
+        "counts",
+        "last_tick_at",
+        "last_failure_at",
+        "last_failure_reason"
+      ],
+      "properties": {
+        "schema": {
+          "const": "t3-fleet.result.v1"
+        },
+        "action": {
+          "const": "tick"
+        },
+        "state": {
+          "description": "`busy` means another tick already holds the single owner lease, so nothing was examined and nothing was moved. It is not a queue state and says nothing about any execution.",
+          "type": "string",
+          "enum": [
+            "eligible",
+            "busy"
+          ]
+        },
+        "examined": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dispatched": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/outbox_record"
+          }
+        },
+        "blocked": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/outbox_record"
+          }
+        },
+        "held": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/outbox_record"
+          }
+        },
+        "expired": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/outbox_record"
+          }
+        },
+        "reservations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reservation_record"
+          }
+        },
+        "truncated": {
+          "description": "The tick hit its own duration or job bound before the queue was empty. Whatever is left stays queued for the next one.",
+          "type": "boolean"
+        },
+        "counts": {
+          "$ref": "#/properties/counts"
+        },
+        "last_tick_at": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "last_failure_at": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "last_failure_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "title": "Queued submit result",
+      "description": "Work accepted into this controller's local outbox and not launched. `pending_autotick` is deliberately not one of the dispatch states: nothing was reserved, no target holds the work, and only a later `tick` will move it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "action",
+        "state",
+        "needs_attention",
+        "queue_reason",
+        "job_id",
+        "job_state",
+        "queue_disposition",
+        "execution_state",
+        "attempts",
+        "request_id",
+        "parent_request_id",
+        "host",
+        "repository",
+        "payload_purged"
+      ],
+      "properties": {
+        "schema": {
+          "const": "t3-fleet.result.v1"
+        },
+        "action": {
+          "const": "submit"
+        },
+        "state": {
+          "const": "pending_autotick"
+        },
+        "needs_attention": {
+          "description": "A job that has not started needs nothing from an operator. It is fixed false so a queued result can never be read as a request waiting on an answer.",
+          "const": false
+        },
+        "queue_reason": {
+          "$ref": "#/$defs/queue_reason"
+        },
+        "job_id": {
+          "$ref": "#/$defs/outbox_record/properties/job_id"
+        },
+        "job_state": {
+          "$ref": "#/$defs/outbox_record/properties/job_state"
+        },
+        "queue_disposition": {
+          "$ref": "#/$defs/queue_disposition"
+        },
+        "execution_state": {
+          "$ref": "#/$defs/execution_state"
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload_purged": {
+          "type": "boolean"
         }
       }
     }

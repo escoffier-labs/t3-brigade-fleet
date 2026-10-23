@@ -7,7 +7,7 @@ import unittest
 import urllib.error
 
 from t3_fleet.errors import T3HttpError
-from t3_fleet.t3_api import T3Client, T3SessionIssuer
+from t3_fleet.t3_api import MAX_RESPONSE_BYTES, MAX_SHELL_RESPONSE_BYTES, T3Client, T3SessionIssuer
 
 
 class FakeRunner:
@@ -101,6 +101,35 @@ class T3ApiTests(unittest.TestCase):
         client = T3Client("http://127.0.0.1:3773", self.issuer, opener=opener)
         self.assertEqual(client.descriptor(), {"ok": True})
         self.assertEqual(self.runner.calls, [])
+
+    def test_shell_snapshot_may_exceed_default_response_limit(self) -> None:
+        payload = {"threads": [], "padding": "x" * (MAX_RESPONSE_BYTES + 1)}
+        opener = lambda request, timeout: FakeResponse(payload)
+        client = T3Client("http://127.0.0.1:3773", self.issuer, opener=opener)
+        self.assertEqual(client.get_json("/api/orchestration/shell"), payload)
+
+    def test_shell_snapshot_has_its_own_upper_limit(self) -> None:
+        payload = {"padding": "x" * (MAX_SHELL_RESPONSE_BYTES + 1)}
+        opener = lambda request, timeout: FakeResponse(payload)
+        client = T3Client("http://127.0.0.1:3773", self.issuer, opener=opener)
+        with self.assertRaises(T3HttpError):
+            client.get_json("/api/orchestration/shell")
+
+    def test_thread_projection_may_exceed_default_response_limit(self) -> None:
+        payload = {"padding": "x" * (MAX_RESPONSE_BYTES + 1)}
+        opener = lambda request, timeout: FakeResponse(payload)
+        client = T3Client("http://127.0.0.1:3773", self.issuer, opener=opener)
+        self.assertEqual(client.get_json("/api/orchestration/threads/thread-1"), payload)
+        # Only the single-thread projection path, not anything nested below it.
+        with self.assertRaises(T3HttpError):
+            client.get_json("/api/orchestration/threads/thread-1/extra")
+
+    def test_other_paths_keep_default_response_limit(self) -> None:
+        payload = {"padding": "x" * (MAX_RESPONSE_BYTES + 1)}
+        opener = lambda request, timeout: FakeResponse(payload)
+        client = T3Client("http://127.0.0.1:3773", self.issuer, opener=opener)
+        with self.assertRaises(T3HttpError):
+            client.get_json("/api/orchestration/snapshot")
 
 
 if __name__ == "__main__":
