@@ -31,13 +31,15 @@ One controller, reviewed targets, stable request IDs, and a closed recovery path
 
 ## What it does
 
-`t3-fleet` sends a prompt to T3 Code on an allowlisted target, reserves that repository, and tracks the request until it succeeds, fails, pauses, or enters an unknown state. It gives operators with several machines one controller surface without giving that controller arbitrary remote-command access. T3 Code still owns the coding session, while Brigade can wrap each dispatch and verification in a receipt.
+`t3-fleet` sends a prompt to T3 Code on an allowlisted target, reserves that repository, and tracks the request until it succeeds, fails, pauses, or enters an unknown state. It gives operators with several machines one controller surface without giving that controller arbitrary remote-command access. T3 Code still owns the coding session, while Brigade admits the selected model and records fleet policy and verification evidence.
 
 The project is experimental and pre-1.0. Pin the commit you deploy until the public interfaces settle.
 
 ## Install
 
-Python 3.11 or newer is required.
+Python 3.11 or newer is required. The Python runtime has no third-party dependencies.
+Real dispatch also requires a compatible, separately installed Brigade CLI and
+operator-configured model admission on the controller and every target.
 
 ```bash
 pipx install git+https://github.com/escoffier-labs/t3-brigade-fleet.git
@@ -62,22 +64,46 @@ chmod 600 "$T3_FLEET_CONFIG"
 t3-fleet doctor
 ```
 
-The placeholder agent is deliberately unavailable, so the safe offline check fails closed after parsing the config and selecting the allowlisted target:
+The placeholder agent is deliberately unavailable. After parsing the config,
+doctor reports the allowlisted target as blocked without network discovery:
 
 ```json
-{"error":{"code":"host_unavailable","message":"fleet host is unavailable"},"schema":"t3-fleet.error.v1"}
+{"schema":"t3-fleet.result.v1","action":"doctor","state":"blocked_offline","hosts":[{"host":"controller-a","state":"blocked_offline","server_version":null}]}
 ```
 
-The command exits `3`. Replace the placeholder agent with a reviewed target before submitting work. The full path from config through `submit` and `wait` is in [the quickstart](docs/quickstart.md).
+The diagnostic exits `0` because it completed the check. `blocked_offline` means
+no target is ready and no work can launch. Invalid config still exits `2`.
+Replace the placeholder only after reviewing a real target and completing the
+[deployment prerequisites](docs/deployment.md). The full path from config through `submit` and `wait` is in [the quickstart](docs/quickstart.md).
+
+## Required admission setup
+
+Before real dispatch, the operator must configure Brigade on the controller and
+all targets, enroll each node through its approved credential route, and make a
+logical seat available in the current roster for the `t3-fleet` consumer. Check
+`brigade fleet models --help` for the installed helper contract and confirm the
+seat's provider binding with the operator. The package ships no credentials,
+roster, or standalone provider fallback.
+
+With `[policy] enrollment = "off"`, submit requires an explicit logical `seat`
+and still obtains Brigade model admission. With `enrollment = "required"`,
+configure canonical repository identities and the Hub policy first. Prefer
+`--host auto` without a seat override. Explicit hosts or seats then require
+`--override-reason`. Missing or denied admission fails closed. See
+[deployment](docs/deployment.md) for target setup and upgrade limits.
 
 ## Dispatch a session
 
-Submit accepts flags for interactive use or one JSON object on standard input for Brigade and other callers. Prompt text stays out of the process arguments.
+This example uses policy enrollment off and a placeholder seat. Replace the
+seat and revision with reviewed values. Submit accepts flags or one JSON object
+on standard input. The Brigade catalog path requires a protected prompt file
+and rejects inline prompt text. Prompt text stays out of process arguments.
 
 ```bash
 t3-fleet submit \
   --host target-a \
   --repository example-repo \
+  --seat example-seat \
   --source-revision 0123456789abcdef0123456789abcdef01234567 \
   --title "Verify the public API" \
   --runtime-mode approval-required \
@@ -96,7 +122,7 @@ t3-fleet wait --request-id <request-id> --timeout 600 --include-output
 |---|---|
 | [T3 Code](https://github.com/pingdotgg/t3code) | Runs the model, owns the working tree, manages approvals, and emits the turn stream |
 | `t3-fleet` | Enforces the target allowlist, transports requests, reserves repositories, and reconciles unknown outcomes |
-| [Brigade](https://brigade.tools) | Dispatches work through reviewed lanes and records verification receipts |
+| [Brigade](https://brigade.tools) | Admits models, routes enrolled work, manages reservations, and records verification receipts |
 
 The controller never connects directly to a remote T3 Code server. It talks to the target agent, and that agent talks to its local T3 Code instance.
 
@@ -112,19 +138,45 @@ The controller never connects directly to a remote T3 Code server. It talks to t
 - `t3-fleet answer` answers a pending structured input request.
 - `t3-fleet interrupt` requests a graceful stop.
 - `t3-fleet recover` reconciles a request whose dispatch outcome is unknown.
+- `t3-fleet tick` drains previously authorized queued work and renews local target reservations.
 
 Most commands accept flags or a single JSON object on standard input. `answer` is JSON-stdin-only. The request and result contracts live in [`schemas/`](schemas/).
 
+## Operator and integration commands
+
+`settle-sweep` and `install-settle-timer` are operator-only commands. JSON
+`invoke` rejects them. Settlement is disabled by default and requires an
+operator to configure it. Do not install a timer as part of model-driven work.
+`invoke` reads request JSON for integrations, while `brigade-invoke` reads only
+the authorized Brigade tool-call journal. Neither bypasses admission or approval.
+
 ## Approval modes
 
-Every mutating command defaults to `approval-required`. The controller never selects `full-access` on your behalf.
+`submit` and `followup` default to `approval-required`. Operator authorization
+is also required for mutating actions, independently of runtime mode and model
+admission. Reuse authorization only for its exact action and scope.
 
-- `approval-required` pauses before an action touches the working tree.
-- `auto-accept-edits` accepts edit approvals but still pauses for other questions.
-- `auto` runs without approval pauses and should stay limited to reviewed prompts.
-- `full-access` removes the remaining T3 Code guardrails and is intended only for sealed reference environments.
+Use `approval-required` for public examples and ordinary dispatch. It preserves
+T3 permission prompts. Other runtime modes require separate operator review.
+A runtime mode never grants model admission or approves an unrelated action.
 
 Read the [security model](docs/security-model.md) before changing the default.
+
+## Queue and attention
+
+A controller may opt into `[outbox] enabled = true`. Only submits with
+`--allow-queue` may defer a known pre-launch capacity or offline block. A
+`pending_autotick` result has a `job_id`, not evidence of a running session.
+`t3-fleet tick` drains a bounded slice under the original approval, revalidating
+policy and capacity. It also renews reservations owned by this local target.
+An ambiguous acceptance stays held and is never retried. Inspect
+`last_tick_at`, `queue_disposition`, and `queue_reason` in queue results.
+`--allow-queue` cannot be combined with `--delegation-id`.
+
+`needs_attention` results carry a bounded `pending_request`. Use its unchanged
+`id` and `respond_with` to send an authorized approval or answer. Terminal
+reservations cannot be resumed without new admission. See
+[recovery](docs/recovery.md) for unknown results and retention limits.
 
 ## Windows targets
 
@@ -148,6 +200,7 @@ T3 Brigade Fleet is not a hosted control plane, a model provider, or a replaceme
 - [Quickstart](docs/quickstart.md)
 - [Security model](docs/security-model.md)
 - [Recovery](docs/recovery.md)
+- [Deployment and upgrades](docs/deployment.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)

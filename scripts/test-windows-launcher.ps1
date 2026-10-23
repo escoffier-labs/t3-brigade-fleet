@@ -10,6 +10,13 @@ $OriginalPython = $env:T3_FLEET_PYTHON
 $ConflictChild = Join-Path ([System.IO.Path]::GetTempPath()) (
     "t3-fleet-conflict-{0}.cmd" -f [guid]::NewGuid().ToString("N")
 )
+$BusyChild = Join-Path ([System.IO.Path]::GetTempPath()) (
+    "t3-fleet-busy-{0}.cmd" -f [guid]::NewGuid().ToString("N")
+)
+
+$PreflightChild = Join-Path ([System.IO.Path]::GetTempPath()) (
+    "t3-fleet-preflight-{0}.cmd" -f [guid]::NewGuid().ToString("N")
+)
 
 function Invoke-LauncherCase {
     param(
@@ -21,7 +28,8 @@ function Invoke-LauncherCase {
         [Parameter(Mandatory = $true)]
         [int]$ExpectedExit,
         [Parameter(Mandatory = $true)]
-        [string]$ExpectedCode
+        [string]$ExpectedCode,
+        [string]$ExpectedDetail = ""
     )
 
     $StdoutFile = [System.IO.Path]::GetTempFileName()
@@ -64,6 +72,12 @@ function Invoke-LauncherCase {
         if ($Payload.error.code -ne $ExpectedCode) {
             throw "$Name emitted error code $($Payload.error.code)"
         }
+        if ($ExpectedDetail -and $Payload.error.target_error.detail -ne $ExpectedDetail) {
+            throw "$Name lost its typed preflight detail"
+        }
+        if ($Stderr.Length -gt 512) {
+            throw "$Name emitted unbounded stderr"
+        }
         if (
             $Stderr -match [regex]::Escape($env:USERPROFILE) -or
             $Stderr -match "T3_FLEET_PYTHON="
@@ -92,8 +106,25 @@ try {
 echo {"schema":"t3-fleet.agent-error.v1","error":{"code":"idempotency_conflict","message":"target request conflicts with an existing request"}}
 exit /b 4
 '@ | Set-Content -LiteralPath $ConflictChild -Encoding ascii
+    @'
+@echo off
+echo {"schema":"t3-fleet.agent-error.v1","error":{"code":"target_busy","message":"target is busy and started nothing; retry later","reason":"repository-busy"}}
+exit /b 3
+'@ | Set-Content -LiteralPath $BusyChild -Encoding ascii
 
+    @'
+@echo off
+echo private token and path %USERPROFILE% 1>&2
+echo {"schema":"t3-fleet.agent-error.v1","error":{"code":"invalid_request","message":"target request is invalid","target_error":{"code":"invalid_request","detail":"project default is unavailable"}}}
+exit /b 2
+'@ | Set-Content -LiteralPath $PreflightChild -Encoding ascii
     $Cases = @(
+        Invoke-LauncherCase `
+            -Name "target-preflight" `
+            -ConfiguredPython $PreflightChild `
+            -ExpectedExit 2 `
+            -ExpectedCode "invalid_request" `
+            -ExpectedDetail "project default is unavailable"
         Invoke-LauncherCase `
             -Name "missing-env" `
             -ConfiguredPython $null `
@@ -120,11 +151,18 @@ exit /b 4
             -ConfiguredPython $ConflictChild `
             -ExpectedExit 4 `
             -ExpectedCode "idempotency_conflict"
+        Invoke-LauncherCase `
+            -Name "target-busy" `
+            -ConfiguredPython $BusyChild `
+            -ExpectedExit 3 `
+            -ExpectedCode "target_busy"
     )
     $Cases | ConvertTo-Json -Compress
 }
 finally {
     Remove-Item -LiteralPath $ConflictChild -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $BusyChild -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PreflightChild -Force -ErrorAction SilentlyContinue
     if ($null -eq $OriginalPython) {
         Remove-Item Env:T3_FLEET_PYTHON -ErrorAction SilentlyContinue
     }

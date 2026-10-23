@@ -1,3 +1,3 @@
 display_name: "T3 Fleet Dispatch"
-short_description: "Dispatch T3 Code sessions across an allowlisted fleet."
-default_prompt: "Use $t3-fleet-dispatch to dispatch and manage T3 Code sessions across an allowlisted fleet."
+short_description: "Orchestrate T3 children, sessions, and fleet tasks"
+default_prompt: "Use $t3-fleet-dispatch to route and supervise this T3 task on the appropriate orchestration surface."

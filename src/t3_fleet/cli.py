@@ -12,8 +12,12 @@ from typing import Any, Mapping, TextIO
 
 from .config import FleetConfig, load_config
 from .controller import FleetController
-from .errors import ConfigError, FleetError, ValidationError
+from .errors import bounded_resolution, ConfigError, FleetError, HostUnavailable, ValidationError
+from .outbox import OutboxLimits, OutboxStore
+from .reporting import launch_context
 from .store import FleetStore
+from .target_store import TargetStore
+from .timer import install_settle_timer, user_unit_dir
 from .transport import FleetTransport
 
 _MAX_INPUT_BYTES = 1024 * 1024
@@ -23,16 +27,66 @@ _BRIGADE_ID = re.compile(r"^(?:call|run)-[a-z0-9]{16,64}$")
 _APPROVAL_DECISIONS = ("accept", "acceptForSession", "decline", "cancel")
 _RUNTIME_MODES = ("approval-required", "auto-accept-edits", "auto", "full-access")
 _INTERACTION_MODES = ("default", "plan")
+# Operator and timer commands. A JSON `invoke` is the model-facing route, so it
+# never reaches these: no model decides when threads settle or installs a timer.
+_OPERATOR_COMMANDS = frozenset({"settle-sweep", "install-settle-timer"})
 
 _PUBLIC_ERROR_MESSAGES = {
     "invalid_config": "fleet configuration is invalid",
     "invalid_request": "fleet request is invalid",
     "host_unavailable": "fleet host is unavailable",
     "idempotency_conflict": "fleet request conflicts with an existing request",
+    "policy_rejected": "fleet model admission was denied",
+    "policy_revision_conflict": "fleet model policy revision changed; retry resolution",
     "unknown_state": "fleet request outcome is unknown; run recover",
     "t3_auth_failed": "target authentication failed",
     "t3_http_failed": "target T3 request failed",
     "internal_error": "internal fleet error",
+}
+
+
+# One public sentence per allowlisted policy reason. Written here rather than
+# forwarded, so the operator-facing text is never something a target chose.
+_POLICY_REASON_MESSAGES = {
+    "continuation-admission-required": (
+        "fleet admission for this request has lapsed; it needs a new reservation "
+        "before it can resume"
+    ),
+    "policy-repository-mismatch": (
+        "fleet policy identity does not match the repository configured on the target"
+    ),
+    "policy-machine-mismatch": "fleet policy routed this request to another machine",
+    "policy-seat-mismatch": "fleet policy routed this request to another seat",
+    "policy-decision-superseded": "fleet policy replaced this routing decision",
+    "policy-digest-stale": "fleet policy decision is no longer current; re-resolve it",
+    "model-admission-denied": "fleet model admission was denied",
+    "model-admission-expired": (
+        "fleet model admission expired before it could be re-confirmed; nothing "
+        "was sent to T3, so the same call can be retried"
+    ),
+    "policy-selection-mismatch": (
+        "fleet policy prepared a provider, model, instance, or reasoning effort "
+        "other than the one this request planned"
+    ),
+    "policy-plan-mismatch": (
+        "fleet model admission granted a seat or model other than the one this "
+        "request planned"
+    ),
+    "delegation-not-enrolled": (
+        "adopting a fleet delegation requires fleet policy enrollment on this "
+        "controller and its target"
+    ),
+    "delegation-invalid": (
+        "the fleet delegation is unknown, expired, released, or not this "
+        "caller's to adopt"
+    ),
+    "delegation-conflict": (
+        "the supplied request context conflicts with the delegation it names"
+    ),
+    "delegation-repository-unmatched": (
+        "no single configured repository matches the delegated canonical "
+        "repository identity"
+    ),
 }
 
 
@@ -47,6 +101,8 @@ class _Application:
     store: FleetStore
     transport: FleetTransport
     controller: FleetController
+    config_path: Path | None = None
+    state_path: Path | None = None
 
     def close(self) -> None:
         return None
@@ -60,6 +116,13 @@ class _Application:
             return [host]
         return [host for host in self.config.hosts.values() if host.enabled]
 
+    @staticmethod
+    def _aggregate_state(results: list[dict[str, Any]]) -> str:
+        online_states = {"eligible", "at_capacity"}
+        if results and all(item["state"] in online_states for item in results):
+            return "eligible"
+        return "blocked_offline"
+
     def doctor(self, request: dict[str, Any]) -> dict[str, Any]:
         repository = request.get("repository")
         if repository is not None and repository not in self.config.repositories:
@@ -69,17 +132,32 @@ class _Application:
             if not host.enabled:
                 results.append({"host": host.host_id, "state": "disabled"})
                 continue
-            response = self.transport.call(
-                host,
-                {
-                    "action": "doctor",
-                    **({"repository": repository} if repository is not None else {}),
-                },
-            )
+            self.controller.refresh_submit_health(host.host_id)
+            resolution = self.store.blocking_resolution(host.host_id)
+            if isinstance(resolution, dict):
+                results.append({"host": host.host_id, "state": "blocked_offline", "resolution": resolution})
+                continue
+            transport_request = {
+                "action": "doctor",
+                **({"repository": repository} if repository is not None else {}),
+            }
+            try:
+                response = self.controller._call(host, transport_request)
+            except HostUnavailable:
+                results.append(
+                    {
+                        "host": host.host_id,
+                        "state": "blocked_offline",
+                        "server_version": None,
+                    }
+                )
+                continue
             results.append(
                 {
                     "host": host.host_id,
                     "state": response.get("state", "blocked_offline"),
+                    **({"resolution": bounded_resolution(response.get("resolution"))}
+                       if bounded_resolution(response.get("resolution")) else {}),
                     "server_version": response.get("server_version"),
                     **(
                         {"project_registered": response["project_registered"]}
@@ -96,18 +174,28 @@ class _Application:
                         if "limit" in response
                         else {}
                     ),
+                    **(
+                        {"repository_limit": response["repository_limit"]}
+                        if "repository_limit" in response
+                        else {}
+                    ),
+                    **{
+                        key: response[key]
+                        for key in (
+                            "observed_project_default",
+                            "approved_model_admission",
+                            "admission_source",
+                            "admission_cache_age_seconds",
+                            "project_default_drift",
+                        )
+                        if key in response
+                    },
                 }
             )
-        online_states = {"eligible", "at_capacity"}
-        overall = (
-            "eligible"
-            if results and all(item["state"] in online_states for item in results)
-            else "blocked_offline"
-        )
         return {
             "schema": "t3-fleet.result.v1",
             "action": "doctor",
-            "state": overall,
+            "state": self._aggregate_state(results),
             "hosts": results,
         }
 
@@ -121,24 +209,51 @@ class _Application:
                         "state": "disabled",
                         "active": 0,
                         "limit": host.active_limit,
+                        "repository_limit": host.repository_limit,
                         "circuit_open": self.store.circuit_is_open(host.host_id),
                     }
                 )
                 continue
-            response = self.transport.call(host, {"action": "capacity"})
+            self.controller.refresh_submit_health(host.host_id)
+            resolution = self.store.blocking_resolution(host.host_id)
+            if isinstance(resolution, dict):
+                results.append({
+                    "host": host.host_id, "state": "blocked_offline", "resolution": resolution,
+                    "active": None, "limit": host.active_limit,
+                    "repository_limit": host.repository_limit,
+                    "circuit_open": self.store.circuit_is_open(host.host_id),
+                })
+                continue
+            try:
+                response = self.controller._call(host, {"action": "capacity"})
+            except HostUnavailable:
+                results.append(
+                    {
+                        "host": host.host_id,
+                        "state": "blocked_offline",
+                        "active": None,
+                        "limit": host.active_limit,
+                        "repository_limit": host.repository_limit,
+                        "circuit_open": self.store.circuit_is_open(host.host_id),
+                    }
+                )
+                continue
             results.append(
                 {
                     "host": host.host_id,
                     "state": response.get("state", "blocked_offline"),
+                    **({"resolution": bounded_resolution(response.get("resolution"))}
+                       if bounded_resolution(response.get("resolution")) else {}),
                     "active": response.get("active"),
                     "limit": host.active_limit,
+                    "repository_limit": host.repository_limit,
                     "circuit_open": self.store.circuit_is_open(host.host_id),
                 }
             )
         return {
             "schema": "t3-fleet.result.v1",
             "action": "capacity",
-            "state": "eligible",
+            "state": self._aggregate_state(results),
             "global_limit": self.config.global_active_limit,
             "hosts": results,
         }
@@ -211,8 +326,54 @@ def _build_application(
         config=config,
         store=store,
         transport=transport,
-        controller=FleetController(config, store, transport),
+        config_path=config_path,
+        state_path=state_path,
+        controller=FleetController(
+            config,
+            store,
+            transport,
+            outbox=_outbox_store(config, state_path),
+            target_store=_local_target_store(config),
+        ),
     )
+
+
+def _outbox_store(config: FleetConfig, state_path: Path) -> OutboxStore | None:
+    """Open the local queue, beside the request journal but in its own file.
+
+    The prompt lives here and nowhere else, so it is kept out of `fleet.db`
+    entirely: one owner-only directory holding one owner-only file, which is
+    also what makes purging a payload a single well-defined act.
+    """
+    if not config.outbox.enabled:
+        return None
+    limits = OutboxLimits(
+        max_records=config.outbox.max_records,
+        max_prompt_bytes=config.outbox.max_prompt_bytes,
+        max_intent_bytes=config.outbox.max_intent_bytes,
+        retention_seconds=float(config.outbox.retention_seconds),
+        max_attempts=config.outbox.max_attempts,
+        backoff_seconds=float(config.outbox.backoff_seconds),
+        max_backoff_seconds=float(config.outbox.max_backoff_seconds),
+        max_jobs_per_tick=config.outbox.max_jobs_per_tick,
+        max_tick_seconds=float(config.outbox.max_tick_seconds),
+        lease_seconds=float(config.outbox.lease_seconds),
+    )
+    return OutboxStore(state_path.parent / "outbox", limits=limits)
+
+
+def _local_target_store(config: FleetConfig) -> TargetStore | None:
+    """The target receipts this machine owns, when it is also a local target.
+
+    A reservation belongs to the machine running the work. This controller may
+    renew one only where the controller host is this machine and its agent
+    state is right here; an SSH target keeps its own receipts and renews them
+    from its own tick.
+    """
+    host = config.hosts.get(config.controller_host)
+    if host is None or host.transport != "local" or not host.agent_state_dir:
+        return None
+    return TargetStore(Path(host.agent_state_dir).expanduser() / "target.db")
 
 
 def _parser() -> _Parser:
@@ -258,6 +419,16 @@ def _parser() -> _Parser:
     approve.add_argument("--decision", choices=_APPROVAL_DECISIONS)
 
     commands.add_parser("answer")
+
+    commands.add_parser("tick")
+
+    commands.add_parser("settle-sweep")
+
+    timer = commands.add_parser("install-settle-timer")
+    timer.add_argument("--dir")
+    timer.add_argument("--interval-minutes", type=int, default=10)
+    timer.add_argument("--print", dest="print_only", action="store_true")
+    timer.add_argument("--enable", action="store_true")
 
     recover = commands.add_parser("recover")
     recover.add_argument("--request-id")
@@ -334,8 +505,18 @@ def _add_submit_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source-revision")
     parser.add_argument("--title")
     parser.add_argument("--prompt-file")
-    parser.add_argument("--model-instance")
-    parser.add_argument("--model")
+    parser.add_argument("--seat")
+    parser.add_argument(
+        "--initiator-kind", choices=("agent", "harness", "human", "unknown")
+    )
+    parser.add_argument("--initiator-label")
+    parser.add_argument("--issue-url")
+    parser.add_argument("--work-id")
+    parser.add_argument("--workload")
+    # The only flag that opens adoption. There is deliberately no consumer or
+    # adapter flag beside it: both come from the receipt the Fleet Hub authors.
+    parser.add_argument("--delegation-id")
+    parser.add_argument("--override-reason")
     parser.add_argument("--runtime-mode", choices=_RUNTIME_MODES)
     parser.add_argument("--interaction-mode", choices=_INTERACTION_MODES)
     parser.add_argument("--run-setup-script", action="store_true", default=None)
@@ -409,12 +590,18 @@ def _submit_request(args: argparse.Namespace, stdin: TextIO) -> tuple[dict[str, 
         "repository",
         "source_revision",
         "title",
-        "model_instance",
-        "model",
+        "seat",
+        "workload",
+        "delegation_id",
+        "override_reason",
         "runtime_mode",
         "interaction_mode",
         "run_setup_script",
         "allow_queue",
+        "initiator_kind",
+        "initiator_label",
+        "issue_url",
+        "work_id",
     )
     human = any(getattr(args, key) is not None for key in identity_fields)
     stdin_text = _read_stdin(stdin)
@@ -424,12 +611,6 @@ def _submit_request(args: argparse.Namespace, stdin: TextIO) -> tuple[dict[str, 
             for key in identity_fields
             if getattr(args, key) is not None
         }
-        if "model_instance" in request or "model" in request:
-            instance_id = request.pop("model_instance", None)
-            model = request.pop("model", None)
-            if not instance_id or not model:
-                raise ValidationError("--model-instance and --model must be used together")
-            request["model_selection"] = {"instanceId": instance_id, "model": model}
         if args.prompt_file is not None:
             request["prompt_file"] = args.prompt_file
     else:
@@ -449,14 +630,22 @@ def _submit_request(args: argparse.Namespace, stdin: TextIO) -> tuple[dict[str, 
             "title",
             "prompt",
             "prompt_file",
-            "model_selection",
+            "seat",
+            "workload",
+            "delegation_id",
+            "override_reason",
             "runtime_mode",
             "interaction_mode",
             "base_branch",
             "run_setup_script",
             "allow_queue",
+            "initiator_kind",
+            "initiator_label",
+            "issue_url",
+            "work_id",
         },
     )
+    launch_context(request, controller_id="", origin_node="")
     prompt = _read_prompt(request, stdin_text, human=human)
     return request, prompt
 
@@ -499,11 +688,29 @@ def _dispatch(
         action = request.get("action")
         if not isinstance(action, str) or not action or action == "invoke":
             raise ValidationError("JSON action is required")
+        if action in _OPERATOR_COMMANDS:
+            raise ValidationError("unsupported command")
         routed_args = _parser().parse_args([action])
         return _dispatch(application, routed_args, io.StringIO(stdin_text))
     if command == "submit":
         request, prompt = _submit_request(args, stdin)
         return application.controller.submit(request, prompt=prompt)
+    if command == "tick":
+        return application.controller.tick()
+    if command == "settle-sweep":
+        return application.controller.settle_sweep()
+    if command == "install-settle-timer":
+        if application.config_path is None or application.state_path is None:
+            raise ValidationError("config and state paths are required")
+        return install_settle_timer(
+            config_path=application.config_path,
+            state_path=application.state_path,
+            unit_dir=Path(args.dir).expanduser() if args.dir else user_unit_dir(os.environ),
+            interval_minutes=args.interval_minutes,
+            write=not args.print_only,
+            enable=args.enable,
+            settle_enabled=application.config.settle.enabled,
+        )
     if command == "followup":
         human = (
             args.request_id is not None
@@ -645,9 +852,18 @@ def _error_result(error: FleetError) -> dict[str, Any]:
             ),
         },
     }
+    reason = getattr(error, "reason", None)
+    if reason in _POLICY_REASON_MESSAGES:
+        # One code covers every policy denial, so the reason is what tells an
+        # operator which one to act on. It is a fixed slug plus a fixed message,
+        # both chosen here, so nothing from a target or a helper is echoed.
+        result["error"]["reason"] = reason
+        result["error"]["message"] = _POLICY_REASON_MESSAGES[reason]
     request_id = getattr(error, "request_id", None)
     if isinstance(request_id, str) and request_id:
         result["request_id"] = request_id
+    if error.detail is not None:
+        result["error"]["detail"] = error.detail
     return result
 
 

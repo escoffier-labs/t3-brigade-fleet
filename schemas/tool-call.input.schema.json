@@ -24,7 +24,8 @@
         "interrupt",
         "approve",
         "answer",
-        "recover"
+        "recover",
+        "tick"
       ]
     },
     "request_id": {
@@ -48,9 +49,9 @@
     "prompt_file": {
       "type": "string"
     },
-    "model_selection": {
-      "type": "object",
-      "additionalProperties": true
+    "seat": {
+      "type": "string",
+      "description": "Logical Fleet Hub roster key. Under an enrolled controller an explicit seat is an override that requires override_reason; omit it to let the central route select the seat."
     },
     "runtime_mode": {
       "type": "string",
@@ -72,7 +73,8 @@
       "type": "boolean"
     },
     "allow_queue": {
-      "type": "boolean"
+      "type": "boolean",
+      "description": "Explicitly allow this submission to be held in the controller's local outbox when a pre-launch capacity or offline block stops it, so a later `tick` can launch the same work without a second submit. Absent means the block fails the submit as before; `false` is an explicit refusal and is honoured as one. Never valid with `delegation_id`: an adopted delegation is one execution that already exists centrally."
     },
     "include_output": {
       "type": "boolean"
@@ -98,6 +100,24 @@
     "answers": {
       "type": "object",
       "additionalProperties": true
+    },
+    "override_reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "Operator justification required when an enrolled controller is given an explicit host or an explicit seat instead of central selection."
+    },
+    "workload": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+      "description": "What kind of work this request is, as input to central route eligibility. It is not a local machine-ranking override and needs no override_reason. Omitting it inherits the controller's configured workload."
+    },
+    "delegation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+      "description": "Adopt an existing parent delegation instead of routing a new request. Everything about the placement comes from the receipt the Fleet Hub authors; supplied options may only confirm it. There is deliberately no consumer or adapter flag."
     }
   },
   "$defs": {
@@ -137,6 +157,65 @@
       },
       "then": {
         "properties": {
+          "target": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "not": {
+              "const": "submit"
+            }
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "delegation_id": false,
+          "workload": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "tick"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "description": "`tick` carries no request fields. It drains work a caller already submitted and already authorized, so there is nothing here to name, narrow, or re-approve.",
+        "properties": {
+          "request_id": false,
+          "host": false,
+          "repository": false,
+          "source_revision": false,
+          "title": false,
+          "prompt": false,
+          "prompt_file": false,
+          "seat": false,
+          "workload": false,
+          "delegation_id": false,
+          "override_reason": false,
+          "runtime_mode": false,
+          "interaction_mode": false,
+          "run_setup_script": false,
+          "allow_queue": false,
+          "include_output": false,
+          "timeout": false,
+          "approval_id": false,
+          "decision": false,
+          "answers": false,
+          "input_id": false,
           "target": false
         }
       }

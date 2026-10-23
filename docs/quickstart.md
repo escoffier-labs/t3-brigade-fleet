@@ -1,16 +1,14 @@
 # Quick start
 
-This walkthrough runs the basic doctor and config validation path from a fresh clone. It does not require a live fleet. The submit and wait steps require a reachable T3 Code target.
+Validate an offline controller first. A real dispatch also needs a
+reachable T3 Code target and configured Brigade model admission.
 
-## Roles used in this document
+## Roles
 
-This document uses generic roles only. Replace them with your reviewed aliases.
+`controller-a` runs the local client. `target-a` and `target-b` are reviewed,
+allowlisted targets. Replace these generic roles only in operator config.
 
-- `controller-a` is the workstation where you run `t3-fleet`.
-- `target-a` is an allowlisted target host that runs `t3-fleet-agent` and T3 Code.
-- `target-b` is a second allowlisted target host, used in the multi-host examples.
-
-## 1. Clone and install
+## 1. Install
 
 ```bash
 git clone https://github.com/escoffier-labs/t3-brigade-fleet
@@ -18,119 +16,119 @@ cd t3-brigade-fleet
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-```
-
-Python 3.11 or newer is required. Verify the install:
-
-```bash
 t3-fleet --help
 ```
 
-## 2. Create a config
+Python 3.11 or newer is required. No third-party Python runtime dependencies
+are installed. Real dispatch requires a separately configured Brigade CLI.
 
-`t3-fleet` reads a TOML config. The schema is `t3-fleet.config.v1`. The file must be mode `0600` on Unix.
-
-Use the single local-host example so doctor can run without a live fleet and never probes an arbitrary SSH alias:
+## 2. Validate the offline config
 
 ```bash
 cp examples/local.example.toml .fleet.toml
 chmod 600 .fleet.toml
 export T3_FLEET_CONFIG="$PWD/.fleet.toml"
-```
-
-`examples/local.example.toml` defines one `local` host named `controller-a` and keeps `controller_host` set to that host. It is the safe doctor and config-validation path. To run real sessions, copy `examples/fleet.example.toml` instead and edit it to your reviewed `controller-a`, `target-a`, and `target-b` hosts. Keep `global_active_limit` at the sum of enabled host limits if you use `target-authoritative` mode.
-
-## 3. Validate config and probe hosts
-
-Run doctor and capacity. These do not start sessions.
-
-```bash
 t3-fleet doctor
 t3-fleet capacity
 ```
 
-The shipped local example contains a placeholder agent command. With no live agent, both commands fail closed with a `host_unavailable` JSON error and exit code `3`. That expected outcome confirms the config parsed and the allowlisted host was selected. It does not confirm target reachability.
+The config schema is `t3-fleet.config.v1`. The local example selects one local
+host and a deliberately unavailable placeholder agent. It performs no network
+discovery. Doctor returns `state: "blocked_offline"` with a blocked host entry.
+Capacity reports the same state and unknown active count. These diagnostics
+exit `0` when the check completes. Read the state before deciding a host is
+ready. Invalid configuration exits `2`. No model dispatch occurs.
 
-With a reachable agent, `doctor` returns one entry per allowlisted host. A host is `eligible` when the agent is reachable and the project is registered. `capacity` returns `active`, `limit`, and `circuit_open` per host plus the global limit.
+## 3. Configure real targets and admission
 
-## 4. Submit a session
+Complete [deployment prerequisites](deployment.md#before-a-real-dispatch) on
+the controller and each target. Copy `examples/fleet.example.toml` into a
+protected operator config and replace its executable paths, expected hostnames,
+and exact project/workspace mappings. In target-authoritative mode, keep
+`global_active_limit` equal to the sum of enabled host limits.
 
-This step requires a reachable T3 Code target. The example uses `approval-required`, the default.
+Configure the external Brigade CLI, node enrollment, and a logical seat from
+the operator's admitted roster. Policy enrollment off still requires model
+admission and an explicit seat. With policy enrollment required, configure each
+canonical repository identity first and prefer Hub routing with `--host auto`
+and no seat override. Neither doctor nor a T3 project default grants admission.
 
-Write a prompt to a file so it does not enter your shell history:
+Run scoped checks before dispatch:
 
 ```bash
-cat > .prompt.txt <<'EOF'
-Summarize the public commands in README.md.
-EOF
+t3-fleet doctor --host target-a --repository example-repo
+t3-fleet capacity --host target-a
 ```
 
-Submit:
+Check the selected host's eligibility and both host and repository capacity.
+An aggregate block may belong to another host.
+
+## 4. Submit authorized work
+
+This example uses policy enrollment off and `approval-required`. Replace the
+placeholder seat with a currently admitted one and resolve the revision to a
+real immutable 40-character lowercase commit before running it.
 
 ```bash
+umask 077
+cat > .prompt.txt <<'PROMPT'
+Summarize the public commands in README.md.
+PROMPT
+
 t3-fleet submit \
   --host target-a \
   --repository example-repo \
-  --source-revision 0000000000000000000000000000000000000000 \
+  --seat example-seat \
+  --source-revision 0123456789abcdef0123456789abcdef01234567 \
   --title "readme summary" \
   --prompt-file .prompt.txt \
   --runtime-mode approval-required
 ```
 
-The controller prints a JSON result with a `request_id`. Save it.
+Obtain operator approval for this work and scope first. Save the exact returned
+qualified `request_id`. In target-authoritative mode, omit a caller-chosen ID.
+A parent delegation instead uses `--delegation-id` with a title and protected
+prompt. Its receipt supplies placement, seat, repository, and revision.
 
-## 5. Wait for the result
+## 5. Inspect attention and completion
 
 ```bash
-t3-fleet wait --request-id <request-id> --timeout 600 --include-output
+t3-fleet wait --request-id <qualified-request-id> --timeout 600 --include-output
+t3-fleet status --request-id <qualified-request-id>
 ```
 
-`wait` blocks until the request reaches a terminal state or the timeout elapses. With `approval-required`, the session pauses for approvals. Use `approve` to return a decision:
+Wait returns on terminal state, attention, or timeout. A timeout does not stop
+work. A `needs_attention` result carries `pending_request`. Use its unchanged
+`id` and `respond_with` for the operator's response. Do not invent IDs or
+answers. For an authorized approval:
 
 ```bash
 t3-fleet approve \
-  --request-id <request-id> \
-  --approval-id <approval-id> \
+  --request-id <qualified-request-id> \
+  --approval-id <pending-request-id> \
   --decision accept
 ```
 
-Run `status` to read pending approvals:
+`answer` is JSON-stdin-only. Place the operator's reviewed response in a
+protected JSON file with `request_id`, `input_id`, and `answers`, then use
+`t3-fleet answer < "$ANSWER_JSON"`. Followup refuses an unanswered attention
+request. Enrolled continuations revalidate policy and reservation first.
+Claim completion only after fresh status for the same request says `succeeded`.
+
+## 6. Interrupt, follow up, or recover
+
+Use the operator's exact authorization for each action:
 
 ```bash
-t3-fleet status --request-id <request-id>
-```
-
-Public status may omit the approval id that headless `approve` needs. If it is absent, stop and report the limitation. Do not guess an id or inspect private state to find one.
-
-## 6. Interrupt or follow up
-
-To stop a running session:
-
-```bash
-t3-fleet interrupt --request-id <request-id>
-```
-
-To send a follow-up prompt to a live session:
-
-```bash
+t3-fleet interrupt --request-id <qualified-request-id>
 t3-fleet followup \
-  --request-id <request-id> \
+  --request-id <qualified-request-id> \
   --prompt-file .followup.txt \
   --runtime-mode approval-required
+t3-fleet recover --request-id <qualified-request-id>
 ```
 
-## 7. Recover an unknown outcome
-
-If a request ends in `unknown`, run `recover` to reconcile against the target store:
-
-```bash
-t3-fleet recover --request-id <request-id>
-```
-
-See `docs/recovery.md` for when to use `recover` and what it does.
-
-## Next steps
-
-- `docs/security-model.md` for allowlisting, approvals, and runtime modes.
-- `docs/architecture.md` for the layer model and schemas.
-- `SECURITY.md` for reporting a vulnerability.
+These are separate actions, not a sequence to run blindly. Recovery reconciles
+an unknown request and never resubmits it. A lapsed terminal reservation needs
+new admission before continuation. See [recovery](recovery.md) for queue and
+identity boundaries and [security](security-model.md) for approval scope.

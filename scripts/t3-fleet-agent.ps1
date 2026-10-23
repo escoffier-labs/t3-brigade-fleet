@@ -28,7 +28,19 @@ if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
 try {
     $SavedErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    $AgentOutput = @(& $PythonExecutable -m t3_fleet.agent 2>$null)
+    # Consume native stderr before projecting a typed public error. Keep only
+    # a fixed error code, never a path, traceback, environment, or raw message.
+    $NativeErrorCode = "internal_error"
+    $AgentOutput = @(& $PythonExecutable -m t3_fleet.agent 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) {
+            $Line = ([string]$_).Substring(0, [Math]::Min(([string]$_).Length, 512))
+            if ($Line -match '^t3-fleet-agent: (invalid_config|invalid_request|internal_error)$') {
+                $NativeErrorCode = $Matches[1]
+            }
+        } else {
+            $_
+        }
+    })
     $AgentExitCode = $LASTEXITCODE
     $ErrorActionPreference = $SavedErrorActionPreference
 } catch {
@@ -38,7 +50,7 @@ try {
 }
 
 if ($AgentOutput.Count -ne 1) {
-    Write-AgentError "internal_error"
+    Write-AgentError $NativeErrorCode
     exit 1
 }
 
@@ -63,7 +75,10 @@ if (
         "invalid_config",
         "invalid_request",
         "host_unavailable",
+        "target_busy",
         "idempotency_conflict",
+        "policy_rejected",
+        "policy_revision_conflict",
         "unknown_state",
         "t3_auth_failed",
         "t3_http_failed",

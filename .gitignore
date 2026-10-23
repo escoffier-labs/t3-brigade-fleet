@@ -111,3 +111,7 @@ scripts/*.md
 
 # Keep Brigade runtime and receipts local in the public repository.
 .brigade/
+
+# Local process diagnostics and optional harness projections.
+*.log
+.openclaw/commands/

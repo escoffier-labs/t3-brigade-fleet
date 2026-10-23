@@ -21,6 +21,23 @@ FULL_SHA = "0123456789abcdef0123456789abcdef01234567"
 PROMPT = "private integration prompt 4bbad3cf"
 FOLLOWUP_PROMPT = "private follow-up prompt 9120e8ca"
 TOKEN = "integration-secret-token-25b83f76"  # content-guard: allow api-key-assignment
+ADMISSION = {
+    "roster_revision": 42,
+    "roster_digest": "sha256:" + "a" * 64,
+    "seat": "coder",
+    "provider": "openai",
+    "model": "gpt-5.6-terra",
+    "reasoning": "high",
+    "provider_instance_id": "codex",
+    "service_tier": "priority",
+    "source": "hub",
+    "expires_at": "2026-08-30T14:00:00Z",
+}
+
+
+class StaticAdmission:
+    def admit(self, request: dict[str, Any]) -> dict[str, Any]:
+        return dict(ADMISSION)
 
 
 class FakeT3State:
@@ -121,6 +138,7 @@ class FakeT3Handler(BaseHTTPRequestHandler):
         if command_type == "thread.create":
             self.server.state.thread = {
                 "id": command["threadId"],
+                "modelSelection": command["modelSelection"],
                 "latestTurn": {"state": "ready"},
                 "session": {"status": "ready"},
                 "updatedAt": "2026-07-28T02:00:00Z",
@@ -133,7 +151,7 @@ class FakeT3Handler(BaseHTTPRequestHandler):
                 self.server.state.thread["worktreePath"] = command.get("worktreePath")
         elif command_type == "thread.turn.start":
             if self.server.state.thread is not None:
-                self.server.state.thread["latestTurn"] = {"state": "running"}
+                self.server.state.thread["latestTurn"] = {"state": "running", "turnId": command["commandId"]}
                 self.server.state.thread["session"] = {"status": "running"}
                 if not self.server.state.thread.get("activities"):
                     self.server.state.thread["activities"].append(
@@ -144,7 +162,9 @@ class FakeT3Handler(BaseHTTPRequestHandler):
                     )
         elif command_type == "thread.turn.interrupt":
             if self.server.state.thread is not None:
-                self.server.state.thread["latestTurn"] = {"state": "running"}
+                latest = self.server.state.thread["latestTurn"]
+                if command.get("turnId") and command["turnId"] == latest.get("turnId"):
+                    latest["state"] = "interrupted"
         elif command_type == "thread.session.stop":
             if self.server.state.thread is not None:
                 self.server.state.thread["session"] = {"status": "stopped"}
@@ -206,9 +226,11 @@ class FleetIntegrationTests(unittest.TestCase):
         self.fail_marker.touch()
         self.receipt_dir = self.root / "receipts"
         self.fake_t3_cli = self.root / "fake-t3"
+        self.fake_brigade = self.root / "brigade"
         self.adapter = self.root / "target-adapter.py"
         self.fake_ssh = self.root / "ssh"
         self._write_fake_t3_cli()
+        self._write_fake_brigade()
         self._write_adapter()
         self._write_fake_ssh()
 
@@ -242,7 +264,12 @@ class FleetIntegrationTests(unittest.TestCase):
         )
         self.db_path = self.root / "controller.db"
         self.store = FleetStore(self.db_path)
-        self.controller = FleetController(config, self.store, FleetTransport())
+        self.controller = FleetController(
+            config,
+            self.store,
+            FleetTransport(),
+            admission=StaticAdmission(),
+        )
         self.original_path = os.environ.get("PATH", "")
         os.environ["PATH"] = f"{self.root}{os.pathsep}{self.original_path}"
         self.addCleanup(self._restore_path)
@@ -268,6 +295,46 @@ if "issue" in sys.argv:
         "method": "bearer-access-token",
     }}))
 """,
+        )
+
+    def _write_fake_brigade(self) -> None:
+        _write_executable(
+            self.fake_brigade,
+            f'''#!{sys.executable}
+import json
+import sys
+
+argv = sys.argv[1:]
+if argv[:3] != ["fleet", "models", "admit"] or argv[-1] != "--json":
+    raise SystemExit(2)
+flags = {{}}
+index = 3
+while index < len(argv) - 1:
+    key = argv[index]
+    value = argv[index + 1]
+    if not key.startswith("--") or value.startswith("--"):
+        raise SystemExit(2)
+    flags[key] = value
+    index += 2
+if flags.get("--consumer") != "t3-fleet" or flags.get("--phase") not in {{"controller", "target"}}:
+    raise SystemExit(2)
+if not flags.get("--seat") or not flags.get("--request-id"):
+    raise SystemExit(2)
+digest = "sha256:" + "a" * 64
+print(json.dumps({{
+    "schema": "brigade.model_admission.v1",
+    "state": "authoritative",
+    "source": "hub",
+    "roster_revision": int(flags.get("--expect-revision", "42")),
+    "roster_digest": flags.get("--expect-digest", digest),
+    "seat": flags["--seat"],
+    "provider": "openai",
+    "model": "gpt-5.6-terra",
+    "reasoning": "high",
+    "binding": {{"instance_id": "codex", "service_tier": "priority"}},
+    "expires_at": "2026-08-30T14:00:00Z",
+}}, separators=(",", ":")))
+''',
         )
 
     def _write_adapter(self) -> None:
@@ -307,12 +374,20 @@ def fake_git_runner(argv, timeout):
     return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
 
+class StaticAdmission:
+    def admit(self, request):
+        return {ADMISSION!r}
+
+
+import t3_fleet.agent as agent_module
+agent_module.report_event = lambda event: "unavailable"
 agent = T3Agent(
     policy,
     client,
     hostname=lambda: "worker-one",
     platform=lambda: "linux",
     git_runner=fake_git_runner,
+    admission=StaticAdmission(),
 )
 result = agent.handle(request)
 sys.stdout.write(json.dumps(result, separators=(",", ":"), sort_keys=True) + "\\n")
@@ -365,6 +440,22 @@ raise SystemExit(completed.returncode)
             if line
         ]
 
+    def test_fake_interrupt_without_turn_id_remains_running(self) -> None:
+        import urllib.request
+        self.server.state.thread = {
+            "id": "thread-1", "latestTurn": {"turnId": "run-1", "state": "running"}
+        }
+        endpoint = "http://127.0.0.1:%d/api/orchestration/dispatch" % self.server.server_port
+        for turn_id, expected in ((None, "running"), ("other", "running"), ("run-1", "interrupted")):
+            command = {"type": "thread.turn.interrupt", "threadId": "thread-1"}
+            if turn_id is not None:
+                command["turnId"] = turn_id
+            request = urllib.request.Request(endpoint, data=json.dumps(command).encode(),
+                headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+            self.assertEqual(self.server.state.thread["latestTurn"]["state"], expected)
+
     def test_real_stack_recovers_unknown_submit_and_redacts_secrets(self) -> None:
         request = {
             "request_id": "req-12345678",
@@ -372,6 +463,7 @@ raise SystemExit(completed.returncode)
             "repository": "sample-repo",
             "source_revision": FULL_SHA,
             "title": "Integration canary",
+            "seat": "coder",
             "runtime_mode": "approval-required",
             "interaction_mode": "default",
         }
@@ -432,9 +524,7 @@ raise SystemExit(completed.returncode)
             ],
         )
 
-        # Interrupt after the user-input is resolved. Once the session is
-        # stopped, status normalizes to interrupted even if T3 leaves a stale
-        # pending marker, so the stored active request releases.
+        # A matching turn interrupt settles. Session stop alone is insufficient.
         interrupted_result = self.controller.interrupt("req-12345678")
         self.assertEqual(interrupted_result["state"], "running")
 
