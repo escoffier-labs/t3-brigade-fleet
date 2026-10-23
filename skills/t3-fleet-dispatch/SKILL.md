@@ -199,8 +199,9 @@ exact request or handling a non-terminal result.
   them, so long work does not depend on an origin CLI staying in `wait`.
 - One tick owns the drain at a time. An overlapping one reports `"state":
   "busy"` instead of racing it. Each job is revalidated against live policy,
-  roster, privacy, and capacity, and a retry re-routes rather than replaying the
-  machine that already could not run it.
+  roster, privacy, and capacity. A retry first reconciles its saved execution
+  and reservation, reusing a valid live reservation. A new route requires proof
+  the earlier attempt never started and its reservation was released or expired.
 - Read `last_tick_at` to tell a queue that is pending an autotick from one a
   tick has actually drained. Read `queue_disposition` for why a job is where it
   is. `held-acceptance-unknown` means a target may already have the work, so it
