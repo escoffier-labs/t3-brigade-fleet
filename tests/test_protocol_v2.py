@@ -666,6 +666,16 @@ class TransportBoundsTests(unittest.TestCase):
                 self.closed = True
         return Connection()
 
+    def test_invalid_origin_never_opens_websocket(self):
+        from test_t3_api import INVALID_ORIGINS
+        from t3_fleet.t3_rpc import websocket_rpc
+        for origin in INVALID_ORIGINS:
+            with self.subTest(origin=origin), patch("t3_fleet.t3_rpc.socket.create_connection") as connect:
+                with self.assertRaises(T3HttpError) as caught:
+                    websocket_rpc(origin, "secret-token", "method", {}, 1)
+                self.assertEqual(str(caught.exception), "invalid T3 origin")
+                connect.assert_not_called()
+
     def test_transport_rejects_failure_bad_ack_and_oversized_frames(self):
         import json
         import struct
@@ -677,7 +687,7 @@ class TransportBoundsTests(unittest.TestCase):
             connection = self.fake_socket(frames)
             with self.subTest(frames=frames[:2]), patch("t3_fleet.t3_rpc.socket.create_connection", return_value=connection):
                 with self.assertRaises(T3HttpError) as caught:
-                    websocket_rpc("http://localhost:3773", "secret-token", "method", {}, 1)
+                    websocket_rpc("http://127.0.0.1:3773", "secret-token", "method", {}, 1)
                 self.assertNotIn("secret-token", str(caught.exception))
                 self.assertTrue(connection.closed)
 
@@ -686,7 +696,7 @@ class TransportBoundsTests(unittest.TestCase):
             connection = self.fake_socket(**options)
             server = V2Server()
             runner = FakeRunner()
-            client = T3Client("http://localhost:3773", T3SessionIssuer(("t3",), runner=runner), opener=server)
+            client = T3Client("http://127.0.0.1:3773", T3SessionIssuer(("t3",), runner=runner), opener=server)
             with self.subTest(options=options), patch("t3_fleet.t3_rpc.socket.create_connection", return_value=connection):
                 with self.assertRaises(T3HttpError):
                     client.dispatch({"type": "thread.archive", "threadId": "thread-1", "commandId": "cmd"})
@@ -699,13 +709,13 @@ class TransportBoundsTests(unittest.TestCase):
         data = json.dumps({"_tag": "Exit", "requestId": "1", "exit": {"_tag": "Success", "value": {"sequence": 8}}}).encode()
         connection = self.fake_socket(bytes([129, len(data)]) + data, comma_connection=True)
         with patch("t3_fleet.t3_rpc.socket.create_connection", return_value=connection):
-            self.assertEqual(websocket_rpc("http://localhost", "token", "method", {}, 1), {"sequence": 8})
+            self.assertEqual(websocket_rpc("http://127.0.0.1", "token", "method", {}, 1), {"sequence": 8})
 
     def test_oversized_request_never_connects(self):
         from t3_fleet.t3_api import websocket_rpc
         with patch("t3_fleet.t3_rpc.socket.create_connection") as connect:
             with self.assertRaises(T3HttpError):
-                websocket_rpc("http://localhost", "secret-token", "method", {"text": "x"*(1024*1024)}, 1)
+                websocket_rpc("http://127.0.0.1", "secret-token", "method", {"text": "x"*(1024*1024)}, 1)
             connect.assert_not_called()
 
 

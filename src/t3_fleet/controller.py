@@ -313,7 +313,19 @@ class FleetController:
         host: HostConfig,
         request: dict[str, Any],
     ) -> dict[str, Any]:
-        return self.transport.call(host, request)
+        request = {**request, "host": host.host_id}
+        response = self.transport.call(host, request)
+        if (
+            not isinstance(response, dict)
+            or response.get("schema") != "t3-fleet.agent-result.v1"
+            or not any(key in response for key in ("host", "target_id"))
+            or any(response[key] != host.host_id for key in ("host", "target_id") if key in response)
+            or ("request_id" in request and response.get("request_id") != request["request_id"])
+        ):
+            # A reply cannot attest that this target accepted or rejected the
+            # mutation. Use the same recovery/capacity path as a lost reply.
+            raise HostUnavailable("target returned an invalid or mismatched response")
+        return response
 
     def _record_or_discover(
         self,

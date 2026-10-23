@@ -120,6 +120,14 @@ class FakeTransport:
         self.receipts: dict[str, dict[str, object]] = {}
 
     def call(self, host, request):
+        return {
+            "schema": "t3-fleet.agent-result.v1",
+            "host": host.host_id,
+            **({"request_id": request["request_id"]} if "request_id" in request else {}),
+            **self._reply(host, request),
+        }
+
+    def _reply(self, host, request):
         self.calls.append(request)
         if request["action"] == self.fail_on:
             if self.fail_exc is not None:
@@ -362,6 +370,7 @@ class PartialReceiptTransport(FakeTransport):
             }
             if self.prompt_bytes is not _MISSING_PROMPT_BYTES:
                 partial["prompt_bytes"] = self.prompt_bytes
+            partial["schema"] = "t3-fleet.agent-result.v1"
             return partial
         return super().call(host, request)
 
@@ -396,6 +405,107 @@ class ControllerTests(unittest.TestCase):
             "runtime_mode": "full-access",
             "interaction_mode": "default",
         }
+
+    def test_submit_invalid_reply_retains_unknown_capacity(self) -> None:
+        for override in ({"host": "other-worker"}, {"target_id": "other-worker"},
+                         {"schema": "wrong"}, {"request_id": "req-wrong123"}):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as directory:
+                store = FleetStore(Path(directory) / "fleet.db")
+                transport = FakeTransport()
+                transport.submit_response.update(override)
+                controller = FleetController(config(), store, transport, admission=self.admission)
+                with self.assertRaises(UnknownState):
+                    controller.submit(self.request, prompt="private prompt")
+                record = store.get(self.request["request_id"])
+                self.assertEqual(record.state, "unknown")
+                self.assertIn(record.request_id, store.blocking_requests(record.host))
+                self.assertFalse(store.acquire_lease(record.host, record.repository, "req-other123", ttl=60, limit=1))
+
+    def test_status_and_recover_reject_wrong_request_without_freeing_capacity(self) -> None:
+        self.controller.submit(self.request, prompt="private prompt")
+        self.transport.status_extra = {"request_id": "req-wrong123", "state": "succeeded"}
+        self.assertEqual(self.controller.status(self.request["request_id"])["state"], "unknown")
+        with self.assertRaises(HostUnavailable):
+            self.controller.recover(self.request["request_id"])
+        self.assertEqual(self.store.get(self.request["request_id"]).state, "unknown")
+        self.assertFalse(self.store.acquire_lease("linux-worker", "example-repo", "req-other123", ttl=60, limit=1))
+
+    def test_followup_wrong_host_becomes_unknown(self) -> None:
+        self.controller.submit(self.request, prompt="private prompt")
+        original = self.transport.call
+        def wrong(host, request):
+            return {**original(host, request), "host": "other-worker"}
+        self.transport.call = wrong
+        with self.assertRaises(UnknownState):
+            self.controller.followup(self.request["request_id"], prompt="continue")
+        self.assertEqual(self.store.get(self.request["request_id"]).state, "unknown")
+
+    def test_common_boundary_requires_attestation_and_binds_not_found(self) -> None:
+        host = self.controller.config.hosts["linux-worker"]
+        for reply in ({"schema": "t3-fleet.agent-result.v1", "state": "not_found", "request_id": "req-12345678"},
+                      {"schema": "t3-fleet.agent-result.v1", "host": host.host_id, "state": "not_found"},
+                      {"schema": "wrong", "host": host.host_id, "request_id": "req-12345678"},
+                      {"schema": "t3-fleet.agent-result.v1", "host": "other-worker", "request_id": "req-12345678"},
+                      []):
+            with self.subTest(reply=reply):
+                self.transport.call = lambda host, request: reply
+                with self.assertRaises(HostUnavailable):
+                    self.controller._call(host, {"action": "lookup", "request_id": "req-12345678"})
+
+    def test_controller_sends_selected_host_on_all_exchanges(self) -> None:
+        self.controller.submit(self.request, prompt="private prompt")
+        self.controller.status(self.request["request_id"])
+        self.controller.followup(self.request["request_id"], prompt="continue")
+        self.controller.recover(self.request["request_id"])
+        self.assertTrue(self.transport.calls)
+        for call in self.transport.calls:
+            self.assertEqual(call.get("host"), "linux-worker")
+
+    def test_peer_claim_invalid_reply_retains_reservation(self) -> None:
+        request_id = "linux-worker-controller-a-12345678-1234-1234-1234-123456789abc"
+        for override in ({"target_id": "other-worker"}, {"schema": "wrong"}, {"request_id": "req-wrong123"}):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as directory:
+                store = FleetStore(Path(directory) / "fleet.db")
+                transport = FakeTransport()
+                original = transport.call
+                def corrupt(host, request):
+                    reply = original(host, request)
+                    return {**reply, **override} if request["action"] == "claim" else reply
+                transport.call = corrupt
+                controller = FleetController(peer_config(), store, transport, admission=self.admission)
+                with self.assertRaises(UnknownState):
+                    controller.submit({**self.request, "request_id": request_id}, prompt="private prompt")
+                self.assertEqual(store.get(request_id).state, "unknown")
+                self.assertIn(request_id, store.blocking_requests("linux-worker"))
+                self.assertEqual(transport.calls[-1].get("host"), "linux-worker")
+
+    def test_discovery_does_not_treat_wrong_not_found_as_absence(self) -> None:
+        controller = FleetController(peer_config(), self.store, self.transport, admission=self.admission)
+        self.transport.call = lambda host, request: {
+            "schema": "t3-fleet.agent-result.v1", "host": "other-worker",
+            "request_id": request["request_id"], "state": "not_found",
+        }
+        request_id = "linux-worker-controller-a-12345678-1234-1234-1234-123456789abc"
+        with self.assertRaises(HostUnavailable):
+            controller.status(request_id)
+        with self.assertRaisesRegex(ValidationError, "unknown request id"):
+            self.store.get(request_id)
+
+    def test_peer_followup_reservation_wrong_reply_requires_recovery(self) -> None:
+        controller = FleetController(peer_config(), self.store, self.transport, admission=self.admission)
+        request_id = "linux-worker-controller-a-12345678-1234-1234-1234-123456789abc"
+        controller.submit({**self.request, "request_id": request_id}, prompt="private prompt")
+        self.transport.receipts[request_id]["state"] = "succeeded"
+        controller.status(request_id)
+        original = self.transport.call
+        def corrupt(host, request):
+            reply = original(host, request)
+            return {**reply, "target_id": "other-worker"} if request["action"] == "reserve_followup" else reply
+        self.transport.call = corrupt
+        with self.assertRaises(UnknownState):
+            controller.followup(request_id, prompt="continue")
+        self.assertEqual(self.store.get(request_id).state, "unknown")
+        self.assertEqual(self.transport.calls[-1]["action"], "reserve_followup")
 
     def test_submit_journals_before_transport_and_returns_thread(self) -> None:
         result = self.controller.submit(self.request, prompt="private prompt")

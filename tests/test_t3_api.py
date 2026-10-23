@@ -58,10 +58,81 @@ class RecordingOpener:
         return FakeResponse({"ok": True})
 
 
+INVALID_ORIGINS = (
+    None, 42, [], {}, "", "http://example.invalid:3773", "https://example.invalid",
+    "http://localhost:3773", "http://127.0.0.1.example.invalid", "ftp://127.0.0.1",
+    "http://user:private@127.0.0.1", "http://@127.0.0.1", "http://127.0.0.1/path",
+    "http://127.0.0.1?private", "http://127.0.0.1#private", "http://127.0.0.1?", "http://127.0.0.1#",
+    "http://127.0.0.1:bad", "http://127.0.0.1:65536", "http://127.0.0.1:0", "http://127.0.0.1:",
+    "http://[::1", "http://[::1%25lo]:3773", "http://127.1", "http://2130706433",
+    " http://127.0.0.1", "http://127.0.0.1\n", "http://127.0.0.1\t:3773",
+)
+VALID_ORIGINS = ("http://127.0.0.1:3773", "https://127.12.34.56/", "http://[::1]:3773/", "https://[::1]")
+
+
 class T3ApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = FakeRunner()
         self.issuer = T3SessionIssuer(("t3",), runner=self.runner)
+
+    def test_invalid_origin_never_issues_token_or_opens(self) -> None:
+        for origin in INVALID_ORIGINS:
+            with self.subTest(origin=origin):
+                opener = RecordingOpener()
+                with self.assertRaises(T3HttpError) as caught:
+                    T3Client(origin, self.issuer, opener=opener).get_json("/data")
+                self.assertEqual(str(caught.exception), "invalid T3 origin")
+                self.assertEqual(self.runner.calls, [])
+                self.assertEqual(opener.requests, [])
+
+    def test_literal_loopback_origins_are_supported(self) -> None:
+        for origin in VALID_ORIGINS:
+            with self.subTest(origin=origin):
+                opener = RecordingOpener()
+                client = T3Client(origin, self.issuer, opener=opener)
+                self.assertEqual(client.get_json("/data"), {"ok": True})
+                self.assertEqual(opener.requests[0][0].get_header("Authorization"), "Bearer secret-token")
+
+    def test_production_opener_does_not_forward_bearer_on_redirect(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from threading import Thread
+        received = []
+        class Destination(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{}')
+            def log_message(self, *args):
+                pass
+        destination = ThreadingHTTPServer(("127.0.0.1", 0), Destination)
+        class Redirect(Destination):
+            def do_GET(self):
+                self.server.authorization = self.headers.get("Authorization")
+                self.send_response(self.server.redirect_code)
+                self.send_header("Location", f"http://127.0.0.1:{destination.server_port}/data")
+                self.end_headers()
+        redirect = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        servers = (destination, redirect)
+        workers = [Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True) for server in servers]
+        for worker in workers:
+            worker.start()
+        try:
+            for code in (301, 302, 303, 307, 308):
+                with self.subTest(code=code):
+                    redirect.redirect_code = code
+                    client = T3Client(f"http://127.0.0.1:{redirect.server_port}", self.issuer)
+                    with self.assertRaises(T3HttpError):
+                        client.get_json("/data")
+                    self.assertEqual(redirect.authorization, "Bearer secret-token")
+                    self.assertEqual(received, [])
+                    self.assertEqual(self.runner.calls[-1][-2:], ["revoke", "session-1"])
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+            for worker in workers:
+                worker.join(2)
 
     def test_session_is_revoked_after_success(self) -> None:
         with self.issuer.session() as token:

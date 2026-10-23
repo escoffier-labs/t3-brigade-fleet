@@ -3792,6 +3792,17 @@ class T3Agent:
             yield
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
+        if "host" in request and request["host"] != self.policy.host_id:
+            raise ValidationError("selected host does not match agent policy")
+        result = self._dispatch_request(request)
+        # Attest all successful paths, including not-found and action replies.
+        result["schema"] = "t3-fleet.agent-result.v1"
+        result["host"] = self.policy.host_id
+        if "request_id" in request:
+            result.setdefault("request_id", request["request_id"])
+        return result
+
+    def _dispatch_request(self, request: dict[str, Any]) -> dict[str, Any]:
         request_id = request.get("request_id")
         if (
             request.get("action") in {"claim", "submit", "followup", "reserve_followup"}

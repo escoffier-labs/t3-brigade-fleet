@@ -527,10 +527,12 @@ Privacy and retention:
 - The prompt and the stored request live only in the controller's own outbox
   file, in an owner-only directory. They are never sent to the Fleet Hub and
   never appear in a status payload, a receipt, an error, or a tick result.
-- The payload is purged on a known acceptance, on any terminal disposition, and
-  on retention expiry. A held job keeps its payload, because that is the local
+- The payload is logically removed from live records on a known acceptance,
+  on any terminal disposition, and on retention expiry. `payload_purged` means
+  logical removal. Physical erasure from SQLite/WAL, snapshots, storage journals,
+  or backups is not guaranteed. A held job keeps its payload as the local
   record of what the identity was asked to do.
-- Retention bounds how long this client stores a prompt and says nothing else.
+- Retention bounds how long this client keeps a prompt in live records.
   An expired record reports `execution_state: never-dispatched` only when no
   drain attempt ever reached a target. A held record keeps `unknown`. **A
   retention expiry is never proof that an execution stopped.**

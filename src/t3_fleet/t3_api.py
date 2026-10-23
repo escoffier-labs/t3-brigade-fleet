@@ -12,6 +12,7 @@ from typing import Any
 
 from .errors import T3AuthError, T3HttpError
 from .t3_rpc import websocket_rpc
+from .t3_origin import validate_t3_origin
 
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_SHELL_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -149,17 +150,25 @@ class T3SessionIssuer:
                 pass
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class T3Client:
     def __init__(
         self,
         base_url: str,
         issuer: T3SessionIssuer,
         *,
-        opener: Opener = urllib.request.urlopen,
+        opener: Opener | None = None,
     ) -> None:
-        self._base_url = base_url.rstrip("/") + "/"
+        try:
+            self._base_url = validate_t3_origin(base_url).rstrip("/") + "/"
+        except ValueError:
+            raise T3HttpError("invalid T3 origin") from None
         self._issuer = issuer
-        self._opener = opener
+        self._opener = opener if opener is not None else urllib.request.build_opener(_NoRedirect()).open
         self._protocol: int | None = None
 
     def _request(

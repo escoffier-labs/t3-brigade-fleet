@@ -665,7 +665,7 @@ class LifecycleTests(unittest.TestCase):
         connection = TransportBoundsTests().fake_socket(bytes([129, len(payload)]) + payload)
         with patch("t3_fleet.t3_rpc.socket.create_connection", return_value=connection):
             with self.assertRaises(T3HttpError) as caught:
-                websocket_rpc("http://localhost", "test-token", "method", {}, 1)
+                websocket_rpc("http://127.0.0.1", "test-token", "method", {}, 1)
         with patch.object(self.t3, "dispatch", side_effect=caught.exception), self.assertRaises(T3HttpError):
             self.agent.handle(dict(self.request, action="followup", thread_id="thread-1", prompt="continue"))
         self.assertEqual(self.agent._target_store().lookup(self.request["request_id"]).state, "unknown")

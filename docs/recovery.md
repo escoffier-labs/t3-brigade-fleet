@@ -63,11 +63,12 @@ same deferred work. A tick is never authority to create new work.
 Inspect `last_tick_at`, `queue_disposition`, and `queue_reason` in results.
 `held-acceptance-unknown` means the target may already have accepted the work.
 Such jobs are held, never retried, and do not free capacity speculatively.
-Retention expiry only removes this client's stored prompt and request. It is
-never evidence that a run stopped. Known acceptance and terminal disposition
+Retention expiry logically removes the prompt and request from live queue
+records. It is never evidence that a run stopped. Known acceptance and terminal disposition
 also purge the queued payload. Prompts stay in the controller's owner-only
 outbox file and are excluded from Hub requests and status, error, tick, and
-receipt projections.
+receipt projections. `payload_purged` means logical removal, without guaranteed
+physical erasure from SQLite/WAL, snapshots, storage journals, or backups.
 
 ## Attention and continuations
 

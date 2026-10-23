@@ -420,6 +420,45 @@ class AgentTests(unittest.TestCase):
             "model_admission": ADMISSION,
         }
 
+    def test_wrong_selected_host_is_rejected_before_any_mutation(self) -> None:
+        for action in ("submit", "claim", "reserve_followup", "followup", "interrupt", "approve", "answer", "recover", "release", "lookup"):
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(ValidationError, "host"):
+                    self.agent.handle({**self.submit_request, "action": action, "host": "other-worker"})
+                self.assertEqual(self.git_calls, [])
+                self.assertEqual(self.fake_t3.dispatched, [])
+                self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+                self.assertIsNone(self.agent._store)
+
+    def test_valid_claim_for_wrong_host_does_not_reserve_or_launch(self) -> None:
+        request = {**self.submit_request, "action": "claim", "host": "other-worker",
+                   "request_id": "linux-worker-controller-a-12345678-1234-1234-1234-123456789abc", "digest": "d" * 64}
+        with self.assertRaisesRegex(ValidationError, "host"):
+            self.agent.handle(request)
+        self.assertEqual(self.git_calls, [])
+        self.assertEqual(self.fake_t3.dispatched, [])
+        self.assertIsNone(self.agent._store)
+        self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+
+    def test_valid_followup_for_wrong_host_does_not_send_turn(self) -> None:
+        self.agent.handle(self.submit_request)
+        before_commands = list(self.fake_t3.dispatched)
+        before_receipt = self.agent._target_store().lookup(self.submit_request["request_id"])
+        with self.assertRaisesRegex(ValidationError, "host"):
+            self.agent.handle({**self.submit_request, "action": "followup", "thread_id": "thread-1", "host": "other-worker"})
+        self.assertEqual(self.fake_t3.dispatched, before_commands)
+        self.assertEqual(self.agent._target_store().lookup(self.submit_request["request_id"]), before_receipt)
+
+    def test_success_boundary_attests_not_found_and_action_request(self) -> None:
+        result = self.agent.handle({"action": "lookup", "request_id": "req-12345678"})
+        self.assertEqual(result["state"], "not_found")
+        self.assertEqual(result.get("host"), "linux-worker")
+        self.assertEqual(result.get("request_id"), "req-12345678")
+        self.agent.handle(self.submit_request)
+        result = self.agent.handle({"action": "status", "thread_id": "thread-1", "request_id": "req-12345678"})
+        self.assertEqual(result.get("request_id"), "req-12345678")
+        self.assertEqual(result.get("host"), "linux-worker")
+
     def _seed_admitted_request(self) -> None:
         store = self.agent._target_store()
         store.claim(
@@ -1961,7 +2000,7 @@ class AgentTests(unittest.TestCase):
 
     def test_lookup_returns_redacted_receipt_and_not_found_without_mutation(self) -> None:
         missing = self.agent.handle({"action": "lookup", "request_id": "req-87654321"})
-        self.assertEqual(missing, {"schema": "t3-fleet.agent-result.v1", "state": "not_found"})
+        self.assertEqual(missing, {"schema": "t3-fleet.agent-result.v1", "state": "not_found", "host": "linux-worker", "request_id": "req-87654321"})
 
 
 

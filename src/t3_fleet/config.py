@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from .errors import ConfigError
+from .t3_origin import validate_t3_origin
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SHELL_META = re.compile(r"[;&|`$<>\r\n]")
@@ -316,6 +317,10 @@ def load_config(path: str | Path) -> FleetConfig:
         expected_hostname = value.get("expected_hostname")
         if not isinstance(expected_hostname, str) or not expected_hostname:
             raise ConfigError(f"host {host_id} requires expected_hostname")
+        try:
+            t3_url = validate_t3_origin(value.get("t3_url", "http://127.0.0.1:3773"))
+        except ValueError:
+            raise ConfigError("invalid T3 origin") from None
         t3_command = value.get("t3_command", ["t3"])
         hosts[host_id] = HostConfig(
             host_id=host_id,
@@ -326,7 +331,7 @@ def load_config(path: str | Path) -> FleetConfig:
             agent_command=_command(value.get("agent_command"), f"host {host_id} agent_command"),
             active_limit=_positive_int(value.get("active_limit"), f"host {host_id} active_limit"),
             expected_hostname=expected_hostname,
-            t3_url=value.get("t3_url", "http://127.0.0.1:3773"),
+            t3_url=t3_url,
             t3_command=_command(t3_command, f"host {host_id} t3_command"),
             t3_base_dir=value.get("t3_base_dir"),
             agent_state_dir=value.get("agent_state_dir"),

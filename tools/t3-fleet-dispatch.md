@@ -240,10 +240,11 @@ separates a queue pending an autotick from one a tick has drained.
 
 The queued prompt and request never leave the controller's own owner-only outbox
 file: not to the Fleet Hub, not into a status payload, a receipt, an error, or a
-tick result. The payload is purged on a known acceptance, on any terminal
-disposition, and on retention expiry. Retention bounds how long this client
-stores a prompt and nothing else. An expiry is never proof that an execution
-stopped. Work whose acceptance is unknown is held, never retried, and its
+tick result. The payload is logically removed from live records on a known
+acceptance, on any terminal disposition, and on retention expiry.
+`payload_purged` reports logical removal. Physical erasure from SQLite/WAL,
+snapshots, storage journals, or backups is not guaranteed. An expiry is never
+proof that an execution stopped. Work whose acceptance is unknown is held, never retried, and its
 capacity is never freed speculatively.
 
 An external scoped timer may call the local `t3-fleet tick` periodically. This

@@ -35,6 +35,22 @@ Transport is `local` or `ssh`. There is no HTTP transport and no remote agent li
 
 The controller never opens a direct connection to T3 Code on a remote host. It always goes through the agent. This keeps the trust boundary at the agent process.
 
+Each request names the selected logical host. The agent rejects a different
+host before acquiring request locks or mutating state. Every successful reply
+attests the agent's host and uses `t3-fleet.agent-result.v1`. The controller
+checks the schema, every supplied host/target identity, and the matching
+request ID before accepting a reply, including `not_found`. Invalid replies
+after mutation leave acceptance unknown and capacity reserved for recovery.
+Upgrade controllers and targets together to preserve these protocol checks.
+
+The target's `t3_url` must use HTTP or HTTPS with a literal loopback IPv4 or
+IPv6 address, such as `127.0.0.1` or `[::1]`. Hostname aliases, including
+`localhost`, remote addresses, scoped IPv6, user information, query strings,
+fragments, non-root paths, and invalid ports are rejected before session
+issuance or network I/O. The production HTTP client does not follow redirects.
+Injected HTTP openers are trusted application code and own their redirect
+behavior.
+
 ## Capacity as a safety control
 
 Each host has an `active_limit`. The fleet has a `global_active_limit`. In `target-authoritative` mode the global limit must equal the sum of enabled host limits.
@@ -93,9 +109,13 @@ exact adoption retries replay its durable receipt without new routing.
 The local queue is disabled by default and accepts only explicit
 `--allow-queue` submissions. It stores protected prompt/request payloads in an
 owner-only controller outbox, outside Hub and public status/error projections.
-On Windows restrict the parent directory ACL. Retention expiry purges stored
-payloads and never proves execution stopped. Ambiguous acceptance remains held,
-never retried, and never frees capacity speculatively.
+On Windows restrict the parent directory ACL. Known acceptance, terminal
+disposition, and retention expiry logically remove payloads from live queue
+records. `payload_purged` reports that logical removal. Each outbox connection
+sets and verifies SQLite `secure_delete=ON` as defense in depth. This does not
+guarantee physical erasure from SQLite pages or WAL, snapshots, storage journals,
+or backups. Retention expiry never proves execution stopped. Ambiguous
+acceptance remains held, never retried, and never frees capacity speculatively.
 
 The model-facing schema contains 11 dispatch actions including bounded `tick`.
 Settlement and timer installation are operator-only CLI commands, excluded from

@@ -13,15 +13,17 @@ import urllib.parse
 from typing import Any
 
 from .errors import T3HttpError
+from .t3_origin import validate_t3_origin
 
 MAX_BYTES = 1024 * 1024
 MAX_UPGRADE_BYTES = 16 * 1024
 
 
 def websocket_rpc(base_url: str, token: str, method: str, payload: dict[str, Any], timeout: float) -> Any:
-    parsed = urllib.parse.urlsplit(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise T3HttpError("invalid T3 WebSocket origin")
+    try:
+        parsed = urllib.parse.urlsplit(validate_t3_origin(base_url))
+    except ValueError:
+        raise T3HttpError("invalid T3 origin") from None
     if any(c in token for c in "\r\n") or timeout <= 0 or timeout > 30:
         raise T3HttpError("invalid T3 WebSocket credentials or timeout")
     request_body = json.dumps({"_tag": "Request", "id": "1", "tag": method,

@@ -24,7 +24,12 @@ required, with no third-party Python runtime dependencies.
 5. Start and authenticate the target's local T3 Code environment through its
    supported operator workflow. Register the exact configured checkout as a
    T3 project. Configure `t3_command`, `t3_url`, and any base/state directories
-   only in the operator config. The controller invokes the agent over local
+   only in the operator config. `t3_url` must be an HTTP(S) origin with a
+   literal loopback address, such as `http://127.0.0.1:3773` or
+   `http://[::1]:3773`. `localhost`, remote addresses, scoped IPv6, user
+   information, query strings, fragments, non-root paths, and invalid ports are
+   rejected. The production HTTP client does not follow redirects.
+   The controller invokes the agent over local
    process transport or a reviewed SSH alias. It never opens a remote T3 API.
 6. Run scoped `t3-fleet doctor --host target-a --repository example-repo` and
    `t3-fleet capacity --host target-a`. Check per-host eligibility, compatible
@@ -77,6 +82,11 @@ also opt in with `--allow-queue`. Tune the bounded settings in
 drains already authorized work and renews this node's own target reservations.
 An external operator-managed scheduler may call tick. The package installs no
 daemon or schedule. See [recovery](recovery.md) for ambiguous acceptance.
+Queue retention and `payload_purged` mean logical removal from live records.
+SQLite/WAL, snapshots, storage journals, and backups may retain prior payload
+bytes. Secure deletion is enabled on each outbox connection, but physical
+erasure is not guaranteed. Protect backup copies with the same owner-only
+access rules as live state.
 
 Settlement is disabled unless `[settle] enabled = true`. `settle-sweep` and
 `install-settle-timer` are operator-only CLI commands and are rejected by JSON

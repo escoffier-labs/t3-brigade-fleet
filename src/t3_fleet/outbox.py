@@ -16,11 +16,11 @@ failed. It is deliberately narrow:
   already exists centrally; re-queueing it locally would make it two.
 * The prompt is local-only. It lives in one owner-only file, it is never
   carried into a Hub call, a status payload, a receipt, an error, or a tick
-  result, and it is purged as soon as the work is no longer queued.
+  result, and it is logically removed as soon as the work is no longer queued.
 
-Retention bounds how long a payload may sit here. It is a storage bound and
-nothing else: a payload that ages out proves that this client stopped holding
-the prompt, never that an execution stopped running.
+Retention bounds how long a payload remains in live records. Logical removal
+never proves physical erasure from SQLite/WAL or storage copies, or that an
+execution stopped running.
 """
 
 from __future__ import annotations
@@ -190,8 +190,11 @@ class OutboxStore:
     Everything is one SQLite database inside an owner-only directory. The index
     and the payload live in the same transactional store on purpose: a claim, a
     disposition, and a payload purge are one atomic fact, so a crash between
-    them cannot leave a job that looks drained while its prompt is still on
-    disk, or a job that looks queued with nothing left to replay.
+    them cannot leave a job that looks drained while its prompt remains in
+    the live record, or a job that looks queued with nothing left to replay.
+    `payload_purged` means logical removal from live records. Secure deletion
+    is enabled, but SQLite/WAL, snapshots, storage journals and backups may
+    retain prior bytes. Physical erasure is not guaranteed.
     """
 
     def __init__(
@@ -215,6 +218,10 @@ class OutboxStore:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA secure_delete = ON")
+        if connection.execute("PRAGMA secure_delete").fetchone()[0] != 1:
+            connection.close()
+            raise ValidationError("outbox secure deletion setting is unavailable")
         connection.execute("PRAGMA journal_mode = WAL")
         return connection
 
@@ -289,7 +296,7 @@ class OutboxStore:
         return None if row is None else self._job(row)
 
     def payload(self, job_id: str) -> OutboxPayload | None:
-        """The stored intent and prompt, or nothing once the payload is purged."""
+        """The live intent and prompt, or nothing after logical payload removal."""
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT intent_json, prompt FROM outbox_jobs WHERE job_id = ?",
@@ -403,8 +410,8 @@ class OutboxStore:
         `never-dispatched` because that is what is actually known about it: no
         drain attempt ever reached a target with it. A held job keeps its own
         state and its `unknown` execution state; only its payload goes. The
-        window bounds how long this client stores a prompt and says nothing at
-        all about whether a run is still going.
+        window bounds prompt retention in live records. It guarantees neither
+        physical erasure from storage copies nor that a run has stopped.
         """
         connection.execute(
             """

@@ -104,6 +104,26 @@ class OutboxStoreTests(unittest.TestCase):
         payload.update(overrides)
         return self.store.enqueue(**payload)
 
+    def test_each_connection_enables_secure_delete_even_when_sqlite_default_is_off(self) -> None:
+        import sqlite3
+        from unittest.mock import patch
+        connect = sqlite3.connect
+        connections = []
+        def initially_insecure(*args, **kwargs):
+            connection = connect(*args, **kwargs)
+            connection.execute("PRAGMA secure_delete = OFF")
+            self.assertEqual(connection.execute("PRAGMA secure_delete").fetchone()[0], 0)
+            connections.append(connection)
+            return connection
+        try:
+            with patch("t3_fleet.outbox.sqlite3.connect", side_effect=initially_insecure):
+                for _ in range(2):
+                    connection = self.store._connect()
+                    self.assertEqual(connection.execute("PRAGMA secure_delete").fetchone()[0], 1)
+        finally:
+            for connection in connections:
+                connection.close()
+
     def test_the_store_is_owner_only_on_disk(self) -> None:
         if os.name == "nt":
             self.skipTest("POSIX mode bits do not apply on Windows")

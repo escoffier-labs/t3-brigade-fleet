@@ -208,8 +208,8 @@ class FakeSettleTransport:
         if host.host_id in self.down:
             raise HostUnavailable("simulated outage")
         answer = self.outcomes.get(request["thread_id"], {"outcome": "settled", "sequence": 11})
-        return {"schema": "t3-fleet.agent-result.v1", "request_id": request["request_id"],
-                "thread_id": request["thread_id"], **answer}
+        return {"schema": "t3-fleet.agent-result.v1", "host": host.host_id,
+                "request_id": request["request_id"], "thread_id": request["thread_id"], **answer}
 
 
 class SettleSweepTests(unittest.TestCase):
@@ -367,7 +367,7 @@ class SettleSweepTests(unittest.TestCase):
     def test_a_response_for_another_thread_is_not_recorded(self) -> None:
         self.request("done0001", "succeeded")
         self.age(20)
-        with patch.object(self.transport, "call", return_value={"outcome": "settled", "thread_id": "x", "request_id": "y"}):
+        with patch.object(self.transport, "call", return_value={"schema": "t3-fleet.agent-result.v1", "host": "linux-worker", "outcome": "settled", "thread_id": "x", "request_id": "req-done0001"}):
             result = self.controller.settle_sweep()
         self.assertEqual(result["errors"], [{"request_id": "req-done0001", "code": "invalid_response"}])
         self.assertIsNone(self.store.settle_receipt("req-done0001"))

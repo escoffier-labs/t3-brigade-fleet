@@ -33,7 +33,9 @@ Maintainers acknowledge reports within five business days and aim to ship a fix 
 - Store the fleet config at mode `0600` on a filesystem that honors Unix permissions.
 - Review every `ssh_alias` before adding it to config. Use reviewed SSH aliases, not raw hostnames or IP literals.
 - Keep queued prompts and state in owner-only storage. Queue retention limits
-  storage duration and never proves that an execution stopped.
+  payload duration in live records and never proves that an execution stopped.
+  `payload_purged` means logical removal. Physical erasure from SQLite/WAL,
+  snapshots, storage journals, or backups is not guaranteed.
 - Keep `active_limit` and `global_active_limit` low. Capacity is a safety control first and a throughput knob second.
 - Do not enable `full-access` on targets that share state with other work.
 
