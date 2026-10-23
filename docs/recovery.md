@@ -64,6 +64,18 @@ is reused. A new route requires proof that the earlier attempt never started
 and that its reservation was released or expired. The original submission's
 authorization covers only that same deferred work. A tick is never authority to create new work.
 
+Preparation checkpoints retain the policy session and execution handle through
+model-plan outages. An unresolved routing reply blocks further placement until
+its saved decision is available. It does not free capacity. A caller-qualified
+handle keeps its target. If renewed placement would require an override the
+caller did not authorize, the job stays retryably blocked within the configured
+attempt and retention limits.
+
+Stop old outbox writers before upgrading. The additive checkpoint migration
+preserves existing rows and treats old saved execution handles conservatively.
+Reopening the upgraded store preserves new preparation checkpoints. Concurrent
+old and new writers and outbox downgrades are unsupported.
+
 Inspect `last_tick_at`, `queue_disposition`, and `queue_reason` in results.
 `held-acceptance-unknown` means the target may already have accepted the work.
 Such jobs are held, never retried, and do not free capacity speculatively.

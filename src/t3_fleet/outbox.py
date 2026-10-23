@@ -123,6 +123,8 @@ class OutboxJob:
     expires_at: float
     next_attempt_at: float
     lease_owner: str | None = None
+    policy_session_id: str | None = None
+    attempt_phase: str = "legacy"
 
     def redacted(self) -> dict[str, Any]:
         """The machine-readable view that may leave this process.
@@ -266,16 +268,29 @@ class OutboxStore:
                 """
             )
             connection.execute("BEGIN IMMEDIATE")
-            if connection.execute("PRAGMA user_version").fetchone()[0] == 0:
-                # Older writers saved an ID before dispatch but never recorded
-                # whether they crossed the mutation boundary. Do not infer
-                # absence from their default execution_state after a restart.
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(outbox_jobs)")
+            }
+            if "policy_session_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE outbox_jobs ADD COLUMN policy_session_id TEXT"
+                )
+            if "attempt_phase" not in columns:
+                # Stop old writers before upgrading. An old saved ID cannot
+                # prove which side of target acceptance the attempt reached.
+                connection.execute(
+                    "ALTER TABLE outbox_jobs ADD COLUMN attempt_phase TEXT NOT NULL DEFAULT 'legacy'"
+                )
+            if version < 2:
                 connection.execute(
                     "UPDATE outbox_jobs SET execution_state = 'unknown' "
                     "WHERE state = 'queued' AND request_id IS NOT NULL "
-                    "AND execution_state = 'never-dispatched'"
+                    "AND execution_state = 'never-dispatched' "
+                    "AND (? = 0 OR attempt_phase = 'legacy')",
+                    (version,),
                 )
-                connection.execute("PRAGMA user_version = 1")
+                connection.execute("PRAGMA user_version = 2")
 
     # -- reading -------------------------------------------------------
 
@@ -295,6 +310,8 @@ class OutboxStore:
             payload_purged=bool(row["payload_purged"]),
             lease_generation=row["lease_generation"],
             lease_owner=row["lease_owner"],
+            policy_session_id=row["policy_session_id"],
+            attempt_phase=row["attempt_phase"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             expires_at=row["expires_at"],
@@ -401,9 +418,9 @@ class OutboxStore:
                     (job_id, digest, state, disposition, execution_state, attempts,
                      request_id, parent_request_id, host, repository, intent_json,
                      prompt, payload_purged, lease_owner, lease_expires_at,
-                     lease_generation, created_at, updated_at, expires_at, next_attempt_at)
+                     lease_generation, created_at, updated_at, expires_at, next_attempt_at, attempt_phase)
                 VALUES (?, ?, 'queued', ?, 'never-dispatched', 0, ?, NULL, ?, ?, ?, ?,
-                        0, ?, ?, ?, ?, ?, ?, ?)
+                        0, ?, ?, ?, ?, ?, ?, ?, 'pre-target')
                 """,
                 (
                     job_id,
@@ -600,6 +617,40 @@ class OutboxStore:
             raise StaleLease("fleet outbox job disappeared under its lease")
         return job
 
+    def record_policy_attempt(
+        self,
+        job_id: str,
+        generation: int,
+        owner: str,
+        *,
+        session_id: str,
+        routing: bool,
+    ) -> OutboxJob:
+        """Fence the session and routing uncertainty before taking capacity.
+
+        A route reply may still arrive after lease takeover. Until its decision
+        is saved or a definitive refusal is known, another owner must not route.
+        """
+        return self._fenced(
+            job_id,
+            generation,
+            owner,
+            "policy_session_id = ?, attempt_phase = ?",
+            (session_id, "routing" if routing else "pre-target"),
+        )
+
+    def record_target_attempt(
+        self, job_id: str, generation: int, owner: str
+    ) -> OutboxJob:
+        """Record possible acceptance immediately before claim/submit."""
+        return self._fenced(
+            job_id,
+            generation,
+            owner,
+            "attempt_phase = 'target', execution_state = 'unknown'",
+            (),
+        )
+
     def record_execution_identity(
         self,
         job_id: str,
@@ -608,21 +659,25 @@ class OutboxStore:
         *,
         request_id: str,
         host: str | None = None,
+        pre_target: bool = False,
     ) -> OutboxJob:
-        """Record the execution identity a drain attempt is about to use.
+        """Save identity before planning; legacy callers remain conservative.
 
-        Written before the attempt can mutate anything on a target, so a crash
-        during dispatch still leaves the identity and possible acceptance
-        behind. The next tick reconciles that identity before any placement.
-        Only a definitive pre-launch refusal may reset the execution state and
-        make the intent replayable. This records no additional drain attempt.
+        The explicit pre-target checkpoint permits a model-plan retry without
+        a full launch journal. Only record_target_attempt crosses into possible
+        target acceptance. This metadata never changes the caller digest.
         """
         return self._fenced(
             job_id,
             generation,
             owner,
-            "request_id = ?, host = COALESCE(?, host), execution_state = 'unknown'",
-            (request_id, host),
+            "request_id = ?, host = COALESCE(?, host), execution_state = ?, attempt_phase = ?",
+            (
+                request_id,
+                host,
+                "never-dispatched" if pre_target else "unknown",
+                "pre-target" if pre_target else "target",
+            ),
         )
 
     def mark_dispatched(
@@ -731,6 +786,7 @@ class OutboxStore:
             (
                 "disposition = ?, host = COALESCE(?, host), "
                 "execution_state = 'never-dispatched', "
+                "attempt_phase = CASE WHEN attempt_phase = 'target' THEN 'pre-target' ELSE attempt_phase END, "
                 "next_attempt_at = ?, lease_owner = NULL, lease_expires_at = NULL"
             ),
             (

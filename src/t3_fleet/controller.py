@@ -710,12 +710,13 @@ class FleetController:
         *,
         execution_request_id: str | None = None,
         allow_rebind: bool = False,
+        outbox_attempt: tuple[OutboxJob, int, str] | None = None,
     ) -> _PolicyPlan:
         """Resolve policy and obtain a routing decision before anything mutates.
 
-        Nothing is journalled, admitted, or dispatched until the Fleet Hub has
-        both resolved the policy and reserved a machine, so an unreachable or
-        refusing Hub fails closed with no half-launched request.
+        The outbox binds its session and records an unresolved route before
+        capacity can be reserved. The launch journal and target mutation wait
+        for a valid decision. No route is repeated while its reply is unknown.
         """
         repository_id = self._required(request, "repository")
         if repository_id not in self.config.repositories:
@@ -750,23 +751,81 @@ class FleetController:
         origin = self.config.controller_host
         workload = self._requested_workload(request)
         existing = None
+        job = outbox_attempt[0] if outbox_attempt is not None else None
         request_id = execution_request_id or request.get("request_id")
-        if isinstance(request_id, str) and request_id:
+        if job is not None and job.policy_session_id is not None:
+            existing = self.store.get_policy_session(job.policy_session_id)
+        elif isinstance(request_id, str) and request_id:
             existing = self.store.policy_session_for_request(request_id)
+        if (
+            job is not None
+            and job.attempt_phase == "routing"
+            and (existing is None or existing.decision is None)
+        ):
+            raise HostUnavailable(
+                "saved route result is unresolved; capacity may still be reserved",
+                reason="capacity-exhausted",
+            )
         rebound = False
-        if allow_rebind and existing is not None and existing.decision is not None:
-            # A new binding is permitted only for a journalled unstarted run,
-            # and only after the old reservation is gone. Never hold two live
-            # reservations for one outbox intent.
-            if (
+        if existing is not None and existing.decision is not None:
+            ended = (
                 existing.reservation_state == "released"
                 or decision_expiry(existing.decision) <= self._policy_now()
+            )
+            fixed_peer = (
+                self.config.coordination_mode == "target-authoritative"
+                and request.get("request_id") is not None
+            )
+            if ended and fixed_peer:
+                # A caller-qualified ID cannot follow renewed auto placement.
+                # A named machine is an override requiring caller justification;
+                # an ID supplies no such authority. Wait instead of reserving
+                # on a newly preferred machine.
+                if machine is None:
+                    raise HostUnavailable(
+                        "saved caller target needs authorized placement after reservation expiry",
+                        reason="host-ineligible",
+                    )
+                self._validate_peer_request_id(request_id, machine)
+            if ended and (
+                allow_rebind
+                or (
+                    job is not None
+                    and job.request_id is None
+                    and job.attempt_phase != "legacy"
+                )
             ):
                 existing = None
                 rebound = True
-        session_id = (
-            existing.session_id if existing is not None else self._new_session_id()
-        )
+        if existing is not None:
+            session_id = existing.session_id
+        elif job is not None and job.policy_session_id is not None and not rebound:
+            session_id = job.policy_session_id
+        else:
+            session_id = self._new_session_id()
+        if allow_rebind and request.get("request_id") is None and not rebound:
+            previous = self.store.policy_session_for_request(request_id)
+            if (
+                previous is not None
+                and previous.session_id != session_id
+                and previous.decision is not None
+                and (
+                    previous.reservation_state == "released"
+                    or decision_expiry(previous.decision) <= self._policy_now()
+                )
+            ):
+                # A restart may have saved the new route but not its execution
+                # ID. Finish that proven-unstarted rebind in the saved session.
+                rebound = True
+        if outbox_attempt is not None and session_id != job.policy_session_id:
+            assert self._outbox is not None
+            self._outbox.record_policy_attempt(
+                job.job_id,
+                outbox_attempt[1],
+                outbox_attempt[2],
+                session_id=session_id,
+                routing=False,
+            )
         envelope = self._policy.resolve(
             consumer=POLICY_CONSUMER,
             repository=repo_identity,
@@ -774,7 +833,7 @@ class FleetController:
             origin=origin,
         )
         if (
-            execution_request_id is not None
+            (execution_request_id is not None or job is not None)
             and existing is not None
             and existing.decision is not None
             and existing.reservation_state == "active"
@@ -797,11 +856,21 @@ class FleetController:
             origin=origin,
             workload=workload,
             envelope=envelope,
+            preserve_decision=outbox_attempt is not None,
         )
         decision = self._reusable_decision(session, machine, caller_seat)
         if decision is None:
-            decision = self._check_decision(
-                self._policy.route(
+            if outbox_attempt is not None:
+                assert self._outbox is not None
+                self._outbox.record_policy_attempt(
+                    job.job_id,
+                    outbox_attempt[1],
+                    outbox_attempt[2],
+                    session_id=session_id,
+                    routing=True,
+                )
+            try:
+                routed = self._policy.route(
                     consumer=POLICY_CONSUMER,
                     repository=repo_identity,
                     session_id=session_id,
@@ -810,9 +879,20 @@ class FleetController:
                     machine=machine,
                     seat=caller_seat,
                     override_reason=override_reason,
-                ),
-                envelope,
-            )
+                )
+            except HostUnavailable as error:
+                # A typed no-capacity refusal proves the route took no
+                # reservation. Transport failure may hide an in-flight reply.
+                if outbox_attempt is not None and error.reason == "capacity-exhausted":
+                    self._outbox.record_policy_attempt(
+                        job.job_id,
+                        outbox_attempt[1],
+                        outbox_attempt[2],
+                        session_id=session_id,
+                        routing=False,
+                    )
+                raise
+            decision = self._check_decision(routed, envelope)
             self.store.record_policy_decision(session_id, decision)
         selected = decision["machine"]
         if machine is not None and selected != machine:
@@ -1188,6 +1268,7 @@ class FleetController:
         prompt: str,
         resume_request_id: str | None = None,
         on_request_id: Callable[[str, str], None] | None = None,
+        outbox_attempt: tuple[OutboxJob, int, str] | None = None,
     ) -> dict[str, Any]:
         """One dispatch attempt. This is the whole pre-queue submit path.
 
@@ -1234,6 +1315,39 @@ class FleetController:
             raise IdempotencyConflict(
                 "saved execution conflicts with caller request identity"
             )
+        resume_record = None
+        pre_target = (
+            outbox_attempt is not None
+            and outbox_attempt[0].attempt_phase == "pre-target"
+        )
+        if resume_request_id is not None:
+            try:
+                resume_record = self.store.get(resume_request_id)
+            except ValidationError as error:
+                if not pre_target or not str(error).startswith("unknown request id:"):
+                    raise UnknownState(
+                        "saved execution has no controller journal; run recover",
+                        request_id=resume_request_id,
+                    ) from error
+            if resume_record is not None and resume_record.digest != digest:
+                raise IdempotencyConflict("saved execution has a different digest")
+            if (
+                pre_target
+                and resume_record is not None
+                and resume_record.thread_id is None
+                and resume_record.state in {"preflight", "dispatching"}
+            ):
+                # A journal can reach dispatching just before the uncertainty
+                # checkpoint. Fence the old owner before resuming preparation.
+                self._outbox.record_execution_identity(
+                    outbox_attempt[0].job_id,
+                    outbox_attempt[1],
+                    outbox_attempt[2],
+                    request_id=resume_request_id,
+                    host=resume_record.host,
+                    pre_target=True,
+                )
+                resume_record = self.store.transition(resume_request_id, "queued")
         replay = self._durable_replay(
             {"request_id": resume_request_id}
             if resume_request_id is not None
@@ -1242,14 +1356,6 @@ class FleetController:
         )
         if replay is not None:
             return self._result(replay)
-        if resume_request_id is not None:
-            try:
-                resume_record = self.store.get(resume_request_id)
-            except ValidationError as error:
-                raise UnknownState(
-                    "saved execution has no controller journal; run recover",
-                    request_id=resume_request_id,
-                ) from error
         plan: _PolicyPlan | None = None
         if delegation_id is not None:
             plan = self._adopt_delegation(
@@ -1269,10 +1375,15 @@ class FleetController:
                     execution_request_id=resume_request_id,
                     allow_rebind=(
                         resume_request_id is not None
-                        and request.get("request_id") is None
-                        and resume_record.state in {"queued", "blocked_offline"}
-                        and resume_record.thread_id is None
+                        and (
+                            pre_target
+                            and resume_record is None
+                            or resume_record is not None
+                            and resume_record.state in {"queued", "blocked_offline"}
+                            and resume_record.thread_id is None
+                        )
                     ),
+                    outbox_attempt=outbox_attempt,
                 )
             except HostUnavailable as error:
                 # Everything this call talks to besides the local allowlist is
@@ -1332,6 +1443,10 @@ class FleetController:
             request_id = self._required(request, "request_id")
         if on_request_id is not None:
             on_request_id(request_id, host_id)
+        if plan is not None:
+            # Keep the association through a plan-helper outage before the
+            # launch journal (which needs the full model plan) can exist.
+            self.store.link_policy_request(plan.session_id, request_id)
         seat = self._required(request, "seat")
         admission: dict[str, Any] | None = None
         model_plan: dict[str, Any] | None = None
@@ -1375,8 +1490,6 @@ class FleetController:
             plan=model_plan,
             replan=resume_request_id is not None,
         )
-        if plan is not None:
-            self.store.link_policy_request(plan.session_id, request_id)
         if record.state not in {"queued", "blocked_offline"}:
             return self._result(record)
         if self.store.circuit_is_open(host_id):
@@ -1419,6 +1532,10 @@ class FleetController:
             agent_request["prompt"] = prompt
             if plan is not None:
                 agent_request["fleet_policy"] = plan.stamp
+            if outbox_attempt is not None:
+                self._outbox.record_target_attempt(
+                    outbox_attempt[0].job_id, outbox_attempt[1], outbox_attempt[2]
+                )
             try:
                 response = self._call(host, agent_request)
             except (PolicyRejected, PolicyRevisionConflict):
@@ -1502,6 +1619,10 @@ class FleetController:
         agent_request["prompt"] = prompt
         if plan is not None:
             agent_request["fleet_policy"] = plan.stamp
+        if outbox_attempt is not None:
+            self._outbox.record_target_attempt(
+                outbox_attempt[0].job_id, outbox_attempt[1], outbox_attempt[2]
+            )
         try:
             response = self._call(host, agent_request)
         except (PolicyRejected, PolicyRevisionConflict):
@@ -1854,7 +1975,12 @@ class FleetController:
             recorded["request_id"] = request_id
             recorded["host"] = host_id
             outbox.record_execution_identity(
-                job.job_id, generation, owner, request_id=request_id, host=host_id
+                job.job_id,
+                generation,
+                owner,
+                request_id=request_id,
+                host=host_id,
+                pre_target=True,
             )
 
         try:
@@ -1863,6 +1989,7 @@ class FleetController:
                 prompt=payload.prompt,
                 resume_request_id=job.request_id,
                 on_request_id=remember,
+                outbox_attempt=(job, generation, owner),
             )
         except UnknownState as error:
             updated = outbox.mark_held(

@@ -179,6 +179,65 @@ class OutboxStoreTests(unittest.TestCase):
         # Reopening a migrated database is harmless and retains the same ID.
         self.assertEqual(self.build().get(job.job_id), updated)
 
+    def test_upgrade_preserves_legacy_uncertainty_and_new_pre_target_checkpoints(
+        self,
+    ) -> None:
+        job = self.enqueue()
+        with self.store._connect() as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(outbox_jobs)")
+            }
+            for name in ("policy_session_id", "attempt_phase"):
+                if name in columns:
+                    connection.execute(f"ALTER TABLE outbox_jobs DROP COLUMN {name}")
+            connection.execute("PRAGMA user_version = 1")
+            connection.execute(
+                "UPDATE outbox_jobs SET request_id = 'legacy-execution' WHERE job_id = ?",
+                (job.job_id,),
+            )
+        upgraded = self.build()
+        legacy = upgraded.get(job.job_id)
+        self.assertEqual(legacy.execution_state, "unknown")
+        self.assertEqual(legacy.attempt_phase, "legacy")
+        self.assertEqual(
+            (legacy.request_id, legacy.digest), ("legacy-execution", job.digest)
+        )
+        fresh = upgraded.enqueue(
+            digest="e" * 64,
+            intent={"host": "auto"},
+            prompt=PROMPT,
+            host="auto",
+            repository="example-repo",
+        )
+        fresh, generation = upgraded.claim(fresh.job_id, "owner")
+        upgraded.record_policy_attempt(
+            fresh.job_id, generation, "owner", session_id="t3f-session", routing=False
+        )
+        upgraded.record_execution_identity(
+            fresh.job_id,
+            generation,
+            "owner",
+            request_id="new-execution",
+            host="second-worker",
+            pre_target=True,
+        )
+        upgraded.reschedule(fresh.job_id, generation, "owner")
+        for _ in range(2):
+            upgraded = self.build()
+            resumed = upgraded.get(fresh.job_id)
+            self.assertEqual(
+                (
+                    resumed.attempt_phase,
+                    resumed.execution_state,
+                    resumed.request_id,
+                    resumed.policy_session_id,
+                ),
+                ("pre-target", "never-dispatched", "new-execution", "t3f-session"),
+            )
+            self.assertEqual(upgraded.get(job.job_id), legacy)
+        with upgraded._connect() as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+
     def test_the_record_count_is_bounded(self) -> None:
         for index in range(3):
             self.enqueue(digest=f"{index}" * 64)
@@ -802,6 +861,386 @@ class PeerModeOutboxTests(_OutboxControllerFixture, unittest.TestCase):
         self.request = {
             key: value for key, value in self.request.items() if key != "request_id"
         }
+
+    def test_route_in_flight_takeover_waits_for_the_bound_session(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        from unittest.mock import patch
+
+        entered, release = Event(), Event()
+        route = self.policy.route
+
+        def pause_route(**kwargs):
+            decision = route(**kwargs)
+            if not entered.is_set():
+                entered.set()
+                if not release.wait(10):
+                    raise AssertionError("route was not released")
+            return decision
+
+        with patch.object(self.policy, "route", side_effect=pause_route):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                first = executor.submit(
+                    self.controller.submit, self.request, prompt=PROMPT
+                )
+                try:
+                    self.assertTrue(entered.wait(10))
+                    (job,) = self.outbox.jobs()
+                    session_id = self.policy.route_calls[0]["session_id"]
+                    self.now[0] += 121
+                    other = FleetController(
+                        self.config,
+                        FleetStore(self.store.path),
+                        self.transport,
+                        admission=self.admission,
+                        policy=self.policy,
+                        outbox=OutboxStore(
+                            self.outbox.directory,
+                            limits=self.outbox.limits,
+                            clock=lambda: self.now[0],
+                        ),
+                        wall_clock=lambda: POLICY_WALL_CLOCK,
+                    )
+                    result = other.tick()
+                    self.assertEqual(len(self.policy.route_calls), 1)
+                    self.assertFalse(self.transport.receipts)
+                    self.assertEqual(len(result["blocked"]), 1)
+                    self.assertEqual(
+                        self.outbox.get(job.job_id).policy_session_id, session_id
+                    )
+                finally:
+                    release.set()
+                with self.assertRaises(StaleLease):
+                    first.result(timeout=10)
+        session = self.store.get_policy_session(session_id)
+        self.assertEqual(session.decision["reservation_id"], "reservation-1")
+        self.assertEqual(session.reservation_state, "active")
+        self.now[0] = self.outbox.get(job.job_id).next_attempt_at
+        self.build().tick()
+        updated = self.outbox.get(job.job_id)
+        self.assertEqual(updated.state, "dispatched")
+        self.assertEqual(
+            [c["session_id"] for c in self.policy.route_calls], [session_id]
+        )
+        self.assertEqual(
+            self.store.policy_session_for_request(updated.request_id).session_id,
+            session_id,
+        )
+        self.assertEqual(len(self.transport.receipts), 1)
+        self.assertEqual(
+            len([c for c in self.transport.calls if c["action"] == "claim"]), 1
+        )
+        self.assertFalse(self.policy.release_calls)
+
+    def test_restart_after_saved_route_decision_reuses_its_reservation(self) -> None:
+        from unittest.mock import patch
+
+        save = self.store.record_policy_decision
+
+        def crash_after_save(*args):
+            save(*args)
+            raise RuntimeError("crash after route")
+
+        with patch.object(
+            self.store, "record_policy_decision", side_effect=crash_after_save
+        ):
+            with self.assertRaisesRegex(RuntimeError, "crash after route"):
+                self.controller.submit(self.request, prompt=PROMPT)
+        (job,) = self.outbox.jobs()
+        session_id = self.policy.route_calls[0]["session_id"]
+        reservation = self.store.get_policy_session(session_id).decision[
+            "reservation_id"
+        ]
+        self.assertIsNone(job.request_id)
+        self.now[0] += 121
+        self.store = FleetStore(self.store.path)
+        self.outbox = OutboxStore(
+            self.outbox.directory, limits=self.outbox.limits, clock=lambda: self.now[0]
+        )
+        self.build().tick()
+        updated = self.outbox.get(job.job_id)
+        self.assertEqual(updated.state, "dispatched")
+        self.assertEqual(len(self.policy.route_calls), 1)
+        session = self.store.policy_session_for_request(updated.request_id)
+        self.assertEqual(
+            (
+                session.session_id,
+                session.decision["reservation_id"],
+                session.reservation_state,
+            ),
+            (session_id, reservation, "active"),
+        )
+        self.assertEqual(len(self.transport.receipts), 1)
+        self.assertEqual(
+            len([c for c in self.transport.calls if c["action"] == "claim"]), 1
+        )
+
+    def test_model_plan_outage_preserves_pre_target_identity_across_reopen(
+        self,
+    ) -> None:
+        self.admission.plan_error = HostUnavailable("plan helper offline")
+        result = self.controller.submit(self.request, prompt=PROMPT)
+        job = self.outbox.get(result["job_id"])
+        self.assertEqual(
+            (job.state, job.execution_state), ("queued", "never-dispatched")
+        )
+        named, digest = job.request_id, job.digest
+        self.assertIsNotNone(named)
+        session = self.store.policy_session_for_request(named)
+        self.assertIsNotNone(session)
+        self.assertEqual(session.reservation_state, "active")
+        reservation = session.decision["reservation_id"]
+        self.assertFalse(self.transport.receipts)
+        with self.assertRaises(ValidationError):
+            self.store.get(named)
+        self.assertEqual(
+            self.controller.submit(self.request, prompt=PROMPT)["job_id"], job.job_id
+        )
+        self.admission.plan_error = None
+        self.now[0] = job.next_attempt_at
+        self.store = FleetStore(self.store.path)
+        self.outbox = OutboxStore(
+            self.outbox.directory, limits=self.outbox.limits, clock=lambda: self.now[0]
+        )
+        self.build().tick()
+        updated = self.outbox.get(job.job_id)
+        self.assertEqual(
+            (updated.state, updated.request_id, updated.digest),
+            ("dispatched", named, digest),
+        )
+        saved = self.store.policy_session_for_request(named)
+        self.assertEqual(
+            (saved.session_id, saved.decision["reservation_id"]),
+            (session.session_id, reservation),
+        )
+        self.assertEqual(len(self.policy.route_calls), 1)
+        self.assertEqual(len(self.admission.plan_calls), 2)
+        self.assertEqual(set(self.transport.receipts), {named})
+        self.assertEqual(
+            len([c for c in self.transport.calls if c["action"] == "claim"]), 1
+        )
+
+    def test_fixed_caller_id_cannot_reserve_an_incompatible_renewed_target(
+        self,
+    ) -> None:
+        from datetime import datetime, UTC
+        from unittest.mock import patch
+
+        named = "second-worker-controller-a-00000000-0000-0000-0000-000000000001"
+        self.request["request_id"] = named
+        self.transport.fail_on = "claim"
+        self.transport.fail_exc = TargetBusy("busy", reason="repository-busy")
+        result = self.controller.submit(self.request, prompt=PROMPT)
+        job = self.outbox.get(result["job_id"])
+        session = self.store.policy_session_for_request(named)
+        reservation = session.decision["reservation_id"]
+        self.policy.machine = "linux-worker"
+        self.policy.expires_at = "2026-09-05T12:20:00Z"
+        self.transport.fail_on = None
+        self.now[0] = job.next_attempt_at
+        later = datetime(2026, 9, 5, 12, 11, tzinfo=UTC).timestamp()
+        with patch.object(self.controller, "_wall_clock", return_value=later):
+            result = self.controller.tick()
+        updated = self.outbox.get(job.job_id)
+        self.assertIn(updated.state, {"queued", "dispatched"})
+        self.assertEqual((updated.request_id, updated.digest), (named, job.digest))
+        self.assertEqual(len(self.policy.route_calls), 1)
+        saved = self.store.get_policy_session(session.session_id)
+        self.assertEqual(
+            (saved.decision["reservation_id"], saved.decision["machine"]),
+            (reservation, "second-worker"),
+        )
+        self.assertFalse(updated.payload_purged)
+        self.assertEqual(self.outbox.payload(job.job_id).intent, self.request)
+        self.assertFalse(self.transport.receipts)
+        self.assertEqual(len(result["blocked"]), 1)
+        self.assertIn(
+            result["blocked"][0]["queue_reason"],
+            {"capacity-exhausted", "host-ineligible"},
+        )
+
+    def test_live_saved_decision_survives_policy_change_before_identity(self) -> None:
+        from unittest.mock import patch
+
+        save = self.store.record_policy_decision
+
+        def crash_after_save(*args):
+            save(*args)
+            raise RuntimeError("crash after route")
+
+        with patch.object(
+            self.store, "record_policy_decision", side_effect=crash_after_save
+        ):
+            with self.assertRaises(RuntimeError):
+                self.controller.submit(self.request, prompt=PROMPT)
+        (job,) = self.outbox.jobs()
+        session_id = self.policy.route_calls[0]["session_id"]
+        decision = self.store.get_policy_session(session_id).decision
+        self.policy.version += 1
+        self.now[0] += 121
+        self.build().tick()
+        self.assertEqual(len(self.policy.route_calls), 1)
+        self.assertEqual(self.store.get_policy_session(session_id).decision, decision)
+        self.assertEqual(self.outbox.get(job.job_id).state, "queued")
+        self.assertFalse(self.transport.receipts)
+
+    def test_explicit_fixed_target_renews_in_a_distinct_durable_session(self) -> None:
+        from datetime import datetime, UTC
+        from unittest.mock import patch
+
+        named = "second-worker-controller-a-00000000-0000-0000-0000-000000000001"
+        self.request.update(
+            request_id=named,
+            host="second-worker",
+            override_reason="operator selected target",
+        )
+        self.transport.fail_on = "claim"
+        self.transport.fail_exc = TargetBusy("busy", reason="repository-busy")
+        result = self.controller.submit(self.request, prompt=PROMPT)
+        job = self.outbox.get(result["job_id"])
+        old = self.store.policy_session_for_request(named)
+        self.policy.expires_at = "2026-09-05T12:20:00Z"
+        self.transport.fail_on = None
+        self.now[0] = job.next_attempt_at
+        later = datetime(2026, 9, 5, 12, 11, tzinfo=UTC).timestamp()
+        with patch.object(self.controller, "_wall_clock", return_value=later):
+            self.controller.tick()
+        current = self.store.policy_session_for_request(named)
+        self.assertNotEqual(current.session_id, old.session_id)
+        self.assertEqual(
+            self.store.get_policy_session(old.session_id).decision, old.decision
+        )
+        self.assertEqual(
+            self.outbox.get(job.job_id).policy_session_id, current.session_id
+        )
+        self.assertEqual(current.decision["machine"], "second-worker")
+        self.assertEqual(len(self.policy.route_calls), 2)
+        self.assertEqual(self.policy.route_calls[-1]["machine"], "second-worker")
+        self.assertEqual(
+            self.policy.route_calls[-1]["override_reason"],
+            self.request["override_reason"],
+        )
+        self.assertEqual(set(self.transport.receipts), {named})
+        self.assertEqual(self.outbox.get(job.job_id).digest, job.digest)
+
+    def test_unresolved_route_transport_never_reissues_capacity_request(self) -> None:
+        self.policy.route_error = HostUnavailable("reply lost")
+        result = self.controller.submit(self.request, prompt=PROMPT)
+        job = self.outbox.get(result["job_id"])
+        self.policy.route_error = None
+        self.now[0] = job.next_attempt_at
+        self.build().tick()
+        self.assertEqual(len(self.policy.route_calls), 1)
+        self.assertFalse(self.transport.receipts)
+        self.assertEqual(self.outbox.get(job.job_id).state, "queued")
+        self.assertFalse(self.policy.release_calls)
+
+    def test_crash_before_target_checkpoint_resumes_preparation(self) -> None:
+        from unittest.mock import patch
+
+        with patch.object(
+            self.outbox,
+            "record_target_attempt",
+            side_effect=RuntimeError("before target"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "before target"):
+                self.controller.submit(self.request, prompt=PROMPT)
+        (job,) = self.outbox.jobs()
+        self.assertFalse(self.transport.receipts)
+        self.now[0] += 121
+        self.build().tick()
+        self.assertEqual(self.outbox.get(job.job_id).state, "dispatched")
+        self.assertEqual(len(self.policy.route_calls), 1)
+        self.assertEqual(set(self.transport.receipts), {job.request_id})
+        self.assertEqual(
+            len([c for c in self.transport.calls if c["action"] == "claim"]), 1
+        )
+
+    def test_stale_resolve_cannot_erase_the_takeover_route_decision(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        from unittest.mock import patch
+
+        entered, release = Event(), Event()
+        resolve = self.policy.resolve
+
+        def pause_resolve(**kwargs):
+            envelope = resolve(**kwargs)
+            if not entered.is_set():
+                entered.set()
+                if not release.wait(10):
+                    raise AssertionError("resolve was not released")
+            return envelope
+
+        with patch.object(self.policy, "resolve", side_effect=pause_resolve):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                first = executor.submit(
+                    self.controller.submit, self.request, prompt=PROMPT
+                )
+                try:
+                    self.assertTrue(entered.wait(10))
+                    (job,) = self.outbox.jobs()
+                    self.policy.version += 1
+                    self.now[0] += 121
+                    self.build().tick()
+                    updated = self.outbox.get(job.job_id)
+                    self.assertEqual(updated.state, "dispatched")
+                    session = self.store.policy_session_for_request(updated.request_id)
+                    saved = session.decision
+                finally:
+                    release.set()
+                with self.assertRaises((StaleLease, HostUnavailable)):
+                    first.result(timeout=10)
+        current = self.store.get_policy_session(session.session_id)
+        self.assertEqual(current.decision, saved)
+        self.assertEqual(current.reservation_state, "active")
+        self.assertEqual(len(self.policy.route_calls), 1)
+        self.assertEqual(set(self.transport.receipts), {updated.request_id})
+
+    def test_restart_finishes_a_saved_rebind_before_execution_identity(self) -> None:
+        from datetime import datetime, UTC
+        from unittest.mock import patch
+
+        self.transport.fail_on = "claim"
+        self.transport.fail_exc = TargetBusy("busy", reason="repository-busy")
+        result = self.controller.submit(self.request, prompt=PROMPT)
+        job = self.outbox.get(result["job_id"])
+        old = self.store.policy_session_for_request(job.request_id)
+        self.policy.machine = "linux-worker"
+        self.policy.expires_at = "2026-09-05T12:20:00Z"
+        self.transport.fail_on = None
+        self.now[0] = job.next_attempt_at
+        later = datetime(2026, 9, 5, 12, 11, tzinfo=UTC).timestamp()
+        save = self.store.record_policy_decision
+
+        def crash_after_save(*args):
+            save(*args)
+            raise RuntimeError("saved rebind")
+
+        with patch.object(self.controller, "_wall_clock", return_value=later):
+            with patch.object(
+                self.store, "record_policy_decision", side_effect=crash_after_save
+            ):
+                with self.assertRaisesRegex(RuntimeError, "saved rebind"):
+                    self.controller.tick()
+        self.assertFalse(self.transport.receipts)
+        self.now[0] += 121
+        restarted = self.build()
+        with patch.object(restarted, "_wall_clock", return_value=later):
+            restarted.tick()
+        updated = self.outbox.get(job.job_id)
+        self.assertEqual(updated.state, "dispatched")
+        self.assertEqual(updated.digest, job.digest)
+        self.assertNotEqual(updated.request_id, job.request_id)
+        self.assertTrue(updated.request_id.startswith("linux-worker-"))
+        current = self.store.policy_session_for_request(updated.request_id)
+        self.assertNotEqual(current.session_id, old.session_id)
+        self.assertEqual(current.decision["reservation_id"], "reservation-2")
+        self.assertEqual(
+            self.store.get_policy_session(old.session_id).decision, old.decision
+        )
+        self.assertEqual(len(self.policy.route_calls), 2)
+        self.assertEqual(set(self.transport.receipts), {updated.request_id})
 
     def test_a_queued_peer_submit_stores_no_minted_identity(self) -> None:
         self.block()

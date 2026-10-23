@@ -630,6 +630,7 @@ class FleetStore:
         origin: str,
         workload: str,
         envelope: Mapping[str, Any],
+        preserve_decision: bool = False,
     ) -> PolicySessionRecord:
         """Persist the resolved envelope, dropping a decision made under an
         older policy version so it can never be replayed as current."""
@@ -673,6 +674,17 @@ class FleetStore:
                     existing["policy_version"] == stored["version"]
                     and existing["policy_digest"] == stored["digest"]
                 )
+                if (
+                    preserve_decision
+                    and not unchanged
+                    and existing["decision_json"] is not None
+                ):
+                    # A late resolver cannot erase a newer owner's reservation.
+                    # Outbox retries use a new session once the old one ends.
+                    raise HostUnavailable(
+                        "saved reservation awaits release or expiry under the new policy",
+                        reason="capacity-exhausted",
+                    )
                 connection.execute(
                     """
                     UPDATE policy_sessions
@@ -822,9 +834,14 @@ class FleetStore:
         return self._policy_session(row) if row is not None else None
 
     def policy_session_for_request(self, request_id: str) -> PolicySessionRecord | None:
+        """Return the latest binding, including renewed fixed-ID placement.
+
+        Prior expired sessions remain evidence. Insertion order also handles
+        equal wall-clock timestamps without selecting the old reservation.
+        """
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM policy_sessions WHERE request_id = ? ORDER BY created_at LIMIT 1",
+                "SELECT * FROM policy_sessions WHERE request_id = ? ORDER BY rowid DESC LIMIT 1",
                 (request_id,),
             ).fetchone()
         return self._policy_session(row) if row is not None else None
