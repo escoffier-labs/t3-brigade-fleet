@@ -1,9 +1,8 @@
 {
   "id": "t3-fleet-dispatch",
   "title": "T3 Fleet Dispatch",
-  "version": "0.1.0",
-  "description": "Dispatch and manage allowlisted T3 Code tasks across enrolled machines.",
-  "license": "Apache-2.0",
+  "version": "0.2.0",
+  "description": "Route and supervise attached T3 child tasks, requested separate sessions, and app operations, and dispatch allowlisted fleet tasks across enrolled machines.",
   "required_mcp_servers": [],
   "required_tools": [
     "t3-fleet"
@@ -15,7 +14,9 @@
     "openclaw"
   ],
   "tests": [
-    "bash ../../../tests/lint-skills.sh t3-fleet-dispatch"
+    "env PYTHONPATH=src:tests python3 -m unittest test_skill_package",
+    "python3 scripts/project-skill.py --check"
   ],
-  "trust_level": "public"
+  "trust_level": "public",
+  "license": "Apache-2.0"
 }

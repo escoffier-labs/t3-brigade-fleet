@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+import runpy
 import tempfile
 import tomllib
 import unittest
@@ -32,7 +34,11 @@ PUBLIC_COMMANDS = (
     "approve",
     "answer",
     "recover",
+    "tick",
 )
+OPERATOR_COMMANDS = ("settle-sweep", "install-settle-timer")
+INTEGRATION_COMMANDS = ("invoke", "brigade-invoke")
+
 # Harness projection paths that .gitignore keeps local. Public docs must not
 # reference them, because they do not exist in a clean checkout.
 PROJECTION_PATHS = (
@@ -108,14 +114,14 @@ class SkillPackageTests(unittest.TestCase):
                 self.assertIn(name, text, f"{path} does not document {name}")
             self.assertIn("`unknown`", text, f"{path} does not mention unknown")
 
-    def test_readme_lists_exactly_the_public_ten_commands(self) -> None:
+    def test_readme_lists_exactly_the_dispatch_commands(self) -> None:
         text = _read(REPO_ROOT / "README.md")
         section = self._public_commands_section(text)
         bullets = re.findall(r"^- `t3-fleet ([a-z][a-z-]*)`", section, re.MULTILINE)
         self.assertEqual(
             sorted(bullets),
             sorted(PUBLIC_COMMANDS),
-            "Public commands section must list exactly the ten public commands",
+            "Public commands section must list exactly the dispatch commands",
         )
         # Each command appears as a bullet exactly once in the section.
         for command in PUBLIC_COMMANDS:
@@ -228,7 +234,7 @@ class T3FleetDispatchSkillTests(unittest.TestCase):
         self.assertTrue(SKILL_JSON.is_file(), "skill.json must exist")
         data = json.loads(_read(SKILL_JSON))
         self.assertEqual(data.get("id"), "t3-fleet-dispatch")
-        self.assertEqual(data.get("version"), "0.1.0")
+        self.assertEqual(data.get("version"), "0.2.0")
         self.assertEqual(data.get("license"), "Apache-2.0")
         self.assertEqual(data.get("trust_level"), "public")
         self.assertEqual(data.get("required_tools"), ["t3-fleet"])
@@ -257,12 +263,14 @@ class T3FleetDispatchSkillTests(unittest.TestCase):
         self.assertEqual(prompt.count("."), 1)
         self.assertNotRegex(prompt, r"[?!]")
 
-    def test_skill_md_command_set_matches_public_ten(self) -> None:
+    def test_skill_md_distinguishes_dispatch_and_operator_commands(self) -> None:
         self.assertTrue(SKILL_MD.is_file(), "SKILL.md must exist")
         found = set(
             re.findall(r"\bt3-fleet\s+([a-z][a-z-]*)\b", _read(SKILL_MD))
         )
-        self.assertEqual(found, set(PUBLIC_COMMANDS))
+        self.assertEqual(found, set(PUBLIC_COMMANDS) | set(OPERATOR_COMMANDS))
+        for command in OPERATOR_COMMANDS:
+            self.assertTrue(self._command_co_occurs_with(_read(SKILL_MD), command, "operator"))
 
     def test_mutating_commands_require_operator_approval(self) -> None:
         text = _read(SKILL_MD)
@@ -297,11 +305,45 @@ class T3FleetDispatchSkillTests(unittest.TestCase):
         for projection in PROJECTION_PATHS:
             self.assertNotIn(projection, text)
 
+
+    def test_dispatch_actions_exclude_operator_and_integration_commands(self) -> None:
+        from t3_fleet.cli import _parser
+
+        runtime = json.loads(_read(REPO_ROOT / "schemas" / "request.schema.json"))
+        planner = json.loads(_read(REPO_ROOT / "schemas" / "tool-call.input.schema.json"))
+        self.assertEqual(set(runtime["properties"]["action"]["enum"]), set(PUBLIC_COMMANDS))
+        self.assertEqual(set(planner["properties"]["action"]["enum"]), set(PUBLIC_COMMANDS))
+        self.assertFalse(planner["additionalProperties"])
+        self.assertNotIn("prompt", planner["properties"])
+        self.assertIn("prompt_file", planner["properties"])
+        # Operator commands must remain usable from CLI and unavailable to models.
+        for command in OPERATOR_COMMANDS + ("tick",):
+            self.assertEqual(_parser().parse_args([command]).command, command)
+        tool = _read(REPO_ROOT / "tools" / "t3-fleet-dispatch.md")
+        self.assertIn('approval_mode = "always"', tool)
+        self.assertIn('command = "t3-fleet brigade-invoke"', tool)
+
+    def test_generated_projections_keep_public_approval_and_prompt_guards(self) -> None:
+        generated = runpy.run_path(str(REPO_ROOT / "scripts" / "project-skill.py"))["render"]()
+        self.assertEqual(len(generated), 4)
+        for relative, content in generated.items():
+            with self.subTest(surface=relative):
+                self.assertEqual(_read(REPO_ROOT / relative), content)
+                self.assertNotIn("full-access", content.lower())
+                self.assertNotIn("bypass-permissions", content.lower())
+                self.assertIn('runtime_mode = "approval-required"', content)
+                self.assertIn('approval_mode = "always"', content)
+                self.assertIn("Never put", content)
+                self.assertIn("operator approval", content)
+                self.assertIn("Brigade model admission", content)
+                for prefix in PRIVATE_PATH_PREFIXES:
+                    self.assertNotIn(prefix, content)
+
     def test_skill_package_examples_use_generic_hosts(self) -> None:
         text = _skill_package_text()
-        hosts = set(re.findall(r"--host[= ]+([^\s\\\"']+)", text))
+        hosts = set(re.findall(r"--host[= ]+([^\s`\\\"']+)", text))
         self.assertTrue(
-            hosts <= GENERIC_ROLES,
+            hosts <= GENERIC_ROLES | {"auto"},
             f"skill package names non-generic hosts: {sorted(hosts - GENERIC_ROLES)}",
         )
         self.assertNotRegex(

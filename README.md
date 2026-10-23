@@ -112,8 +112,17 @@ The controller never connects directly to a remote T3 Code server. It talks to t
 - `t3-fleet answer` answers a pending structured input request.
 - `t3-fleet interrupt` requests a graceful stop.
 - `t3-fleet recover` reconciles a request whose dispatch outcome is unknown.
+- `t3-fleet tick` drains previously authorized queued work and renews local target reservations.
 
 Most commands accept flags or a single JSON object on standard input. `answer` is JSON-stdin-only. The request and result contracts live in [`schemas/`](schemas/).
+
+## Operator and integration commands
+
+`settle-sweep` and `install-settle-timer` are operator-only commands. JSON
+`invoke` rejects them. Settlement is disabled by default and requires an
+operator to configure it. Do not install a timer as part of model-driven work.
+`invoke` reads request JSON for integrations, while `brigade-invoke` reads only
+the authorized Brigade tool-call journal. Neither bypasses admission or approval.
 
 ## Approval modes
 
