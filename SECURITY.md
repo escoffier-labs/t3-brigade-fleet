@@ -22,13 +22,18 @@ Maintainers acknowledge reports within five business days and aim to ship a fix 
 
 - The controller runs on your workstation and reads a config file that must be mode `0600`.
 - Hosts are listed explicitly. Transport is local or SSH only. IP literals are rejected in `ssh_alias`.
-- Mutating commands default to `approval-required`. The controller never selects `full-access` for you.
+- Submit and follow-up default to `approval-required`. Mutating actions also
+  require operator authorization, independent of runtime permissions.
+- Brigade model admission is mandatory even when policy enrollment is off.
+  Missing helpers and denied or stale authority fail closed before launch.
 - Prompt text is accepted only through a prompt file or a single JSON object on standard input. The controller rejects inline prompts in Brigade tool calls.
 
 ## Configuration hardening
 
 - Store the fleet config at mode `0600` on a filesystem that honors Unix permissions.
 - Review every `ssh_alias` before adding it to config. Use reviewed SSH aliases, not raw hostnames or IP literals.
+- Keep queued prompts and state in owner-only storage. Queue retention limits
+  storage duration and never proves that an execution stopped.
 - Keep `active_limit` and `global_active_limit` low. Capacity is a safety control first and a throughput knob second.
 - Do not enable `full-access` on targets that share state with other work.
 

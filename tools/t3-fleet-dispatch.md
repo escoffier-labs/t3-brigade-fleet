@@ -87,7 +87,7 @@ never opens a Hub connection and never ranks machines locally.
 Limits worth knowing before scripting against it:
 
 - Policy is resolved on every submit that reaches the Hub. A live decision is
-  reused for the same request instead of taking a second reservation; an
+  reused for the same request instead of taking a second reservation. An
   unstarted retry after an expired decision or a new policy version produces a
   fresh decision. A reusable decision has to match the machine and the seat the
   caller explicitly named, so an override never inherits capacity reserved for
@@ -96,7 +96,7 @@ Limits worth knowing before scripting against it:
   without resolving policy, routing, or taking a second reservation, however far
   the policy has moved since. The same request id with a different payload is
   still a conflict. Request identity is the caller's own payload, including the
-  host, seat, and override reason it asked for; the Hub-chosen machine and seat
+  host, seat, and override reason it asked for. The Hub-chosen machine and seat
   are excluded from it.
 - Decision windows are bounded. A reservation that claims to last longer than
   24 hours is refused.
@@ -107,14 +107,14 @@ Limits worth knowing before scripting against it:
   target's own resolution, not from the caller, and they ride in ordinary turn
   text because T3 exposes no higher-priority channel here.
 - Only the target renews or releases a reservation. It renews while it observes
-  a live run and releases only on its own durable terminal outcome; the
+  a live run and releases only on its own durable terminal outcome. The
   controller relays status and records what the target reported. An `unknown`
   state or a transport failure keeps the reservation counted.
 - `followup`, `approve`, and `answer` are admitted again before they resume
   anything. The target revalidates its own durable policy receipt, the current
   canonical policy version and digest, the same routing decision, and the live
   reservation, and only a granted renewal admits the action. A reservation that
-  was released, expired, or never recorded fails closed; resuming then needs a
+  was released, expired, or never recorded fails closed. Resuming then needs a
   newly negotiated reservation, which this client does not invent. An
   unreachable helper keeps the reservation held and still refuses to resume.
   `interrupt`, `status`, and `wait` are unchanged.
@@ -132,7 +132,7 @@ acts taken by different machines:
   `launch_authorized: false`, it is Hub-only with no last-known-good fallback,
   and the client re-checks both. The plan travels as `model_plan` and is
   recorded as `state: planned` everywhere, so it can never be read as proof
-  that a launch was permitted. A caller may not supply a plan or an admission;
+  that a launch was permitted. A caller may not supply a plan or an admission.
   both are refused rather than overwritten.
 - The target **prepares and then admits**. It replays the route fenced to the
   stamped decision, asks the Hub to prepare that decision for the exact native
@@ -142,7 +142,7 @@ acts taken by different machines:
   binding, the roster revision, the selected target, or the reservation fails,
   no turn starts, the pre-turn cleanup runs, and a durable failure receipt is
   written.
-- The canonical model identity is what the fleet admits; the native model the
+- The canonical model identity is what the fleet admits. The native model the
   provider runs is the plan's explicit binding when it has one, and the
   canonical model verbatim when it does not. The prepared reply states both:
   `selected.model` is canonical and the optional `selected.launch_model` is the
@@ -159,16 +159,16 @@ acts taken by different machines:
   the session, version, digest, and decision, plus `--repo <canonical verified
   policy identity>` and `--policy-context-hash <the exact prepared digest>`.
   Both are forwarded verbatim and neither is derived at that boundary. The
-  acknowledge verb keeps its own `--context-hash` spelling; only the launch
+  acknowledge verb keeps its own `--context-hash` spelling. Only the launch
   admission spells it `--policy-context-hash`.
 - The acknowledgement reply is the unchanged session envelope plus one mandatory
   `context_hash` key. An enrolled session that applied a prepared context must
-  see its exact prepared SHA-256 echoed back; a missing key, a null, a different
+  see its exact prepared SHA-256 echoed back. A missing key, a null, a different
   digest, or an unknown extra key is a refusal. A null means only a legacy
   resolve-only session that loaded no context, and such a receipt is not
   launchable.
 - A successful launch binds the policy session and the decision to one request
-  id. An exact retry is idempotent; a different request id cannot reuse the
+  id. An exact retry is idempotent. A different request id cannot reuse the
   proof. An approval or an answer for the execution already running reuses the
   same request and reservation generation instead of claiming another launch.
 - **Known limitation:** once the reservation is terminal, released, or expired,
@@ -179,7 +179,7 @@ acts taken by different machines:
 
 A parent Brigade run that already holds a decision and a live reservation may
 hand it to this fleet. `--delegation-id <id>` is the only public flag that opens
-that path; there is no consumer or adapter flag, and creation is always the
+that path. There is no consumer or adapter flag, and creation is always the
 parent's act.
 
 - The policy consumer stays the parent's `brigade-run` and `t3-fleet` is the
@@ -198,7 +198,7 @@ parent's act.
 - The receipt supplies the placement, session, decision, reservation, seat,
   workload, canonical repository, and immutable source revision. A supplied
   `host`, `repository`, `seat`, `workload`, or `source_revision` may only
-  confirm it; `override_reason` and a caller `request_id` are refused.
+  confirm it. `override_reason` and a caller `request_id` are refused.
 - The canonical repository identity is resolved to exactly one configured local
   alias, so the parent never needs local alias knowledge. `--repository` may
   narrow an ambiguous identity to a matching alias. No match, an ambiguous
@@ -222,9 +222,9 @@ instead of failing, and answers `"state": "pending_autotick"` with a `job_id`, a
 `queue_disposition`, and a `queue_reason`. `pending_autotick` is not a dispatch
 state: nothing started and nothing was reserved.
 
-`allow_queue` is opt-in per call. Absent, a block fails the call as before;
-`false` is an explicit refusal and is honoured as one; a controller without the
-queue enabled refuses it outright; and it is never valid beside `delegation_id`,
+`allow_queue` is opt-in per call. Absent, a block fails the call as before.
+`false` is an explicit refusal and is honoured as one. A controller without the
+queue enabled refuses it outright. And it is never valid beside `delegation_id`,
 because an adopted delegation is one execution that already exists centrally. A
 transport lost after a target could have accepted the work stays `unknown_state`
 and is never queued for a second run.
@@ -242,7 +242,7 @@ The queued prompt and request never leave the controller's own owner-only outbox
 file: not to the Fleet Hub, not into a status payload, a receipt, an error, or a
 tick result. The payload is purged on a known acceptance, on any terminal
 disposition, and on retention expiry. Retention bounds how long this client
-stores a prompt and nothing else; an expiry is never proof that an execution
+stores a prompt and nothing else. An expiry is never proof that an execution
 stopped. Work whose acceptance is unknown is held, never retried, and its
 capacity is never freed speculatively.
 
@@ -287,7 +287,7 @@ More controllers do not increase provider quota.
 ## Delegated result handoff
 
 `state` is always the real execution state. A terminal delegated execution whose
-writable target worktree was retained may additionally report
+writable target worktree was retained may also report
 `disposition: "pending-handoff"` and a frozen
 `handoff: {target_machine, repository, branch, source_revision, request_id,
 worktree_ref}`. `worktree_ref` is an opaque target-owned request reference, not

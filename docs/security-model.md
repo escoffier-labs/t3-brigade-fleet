@@ -8,7 +8,9 @@ Three systems share responsibility. Each owns a distinct surface.
 
 - **T3 Code** owns the session. It runs the model, manages the working tree, and produces the turn stream. `t3-fleet` does not interpret session contents.
 - **t3-fleet** owns the allowlisted cross-machine transport, target authority, and recovery. It decides which hosts may receive work, which request may run on which target, and how an unknown outcome is reconciled.
-- **Brigade** owns dispatch and verification receipts when `t3-fleet` is invoked through Brigade. `t3-fleet` does not grade its own work.
+- **Brigade** owns model admission and enrolled policy routing, reservations,
+  and prepared context. These gates apply even outside a Brigade tool runner.
+  Verification receipts record observations. `t3-fleet` does not grade itself.
 
 The human reviewer owns approval decisions. `t3-fleet` enforces that a decision is required. It does not make the decision.
 
@@ -43,27 +45,35 @@ A host that fails repeatedly opens a circuit breaker. The controller stops sendi
 
 ## Approval model
 
-All mutating commands default to `approval-required`. The controller never selects `full-access` for you.
+`submit` and `followup` default to `approval-required`. Mutating actions also
+require operator authorization for their exact scope. Model admission and tool
+runner approval remain independent gates. Existing authorization for an exact
+action can be reused.
 
-A session in `approval-required` mode pauses for a human decision before any action that touches the working tree. The reviewer returns a decision with `approve`:
+A session in `approval-required` retains T3 runtime permission prompts. The
+operator can return `accept`, `acceptForSession`, `decline`, or `cancel` for a
+current approval. Session-wide acceptance has broader scope than one action.
+Non-edit questions use `answer`. A bounded `pending_request` carries the ID and
+`respond_with` for the current response. Never guess an ID or answer.
 
-- `accept` approves this one action.
-- `acceptForSession` approves this action and the rest of the session.
-- `decline` rejects this action.
-- `cancel` cancels the session.
+## Runtime modes and admission
 
-For non-edit questions the session raises an input request. The reviewer returns answers with `answer`.
+Public guidance recommends `approval-required`. The runtime also recognizes
+`auto-accept-edits`, `auto`, and `full-access`. These modes reduce permission
+prompts and need separate operator review. Public examples do not enable them.
+Runtime mode never authorizes another host, model, publication, or task.
 
-## Runtime modes
+A compatible external Brigade CLI and admitted logical seat are required on
+controllers and targets. Policy enrollment off does not disable model admission.
+An enrolled controller sends a plan, while the target prepares the exact policy
+context, acknowledges its hash, and admits immediately before launch. Caller
+provider/model overrides and T3 project defaults are never authority. Missing,
+malformed, expired, or denied authority fails closed.
 
-`t3-fleet` supports four runtime modes. Public guidance only recommends `approval-required`.
-
-- `approval-required` is the default. Every action that touches the working tree pauses for a human decision.
-- `auto-accept-edits` accepts edit approvals automatically. Useful for trusted, reviewed prompts. Still pauses for non-edit questions.
-- `auto` runs without pausing for approvals. Treat as a high-trust, scoped mode.
-- `full-access` removes the remaining guardrails. This is a high-risk mode that public guidance does not recommend. It exists for sealed reference environments, not for everyday work.
-
-Do not enable `full-access` on targets that share state with other work. Do not set `full-access` as a default in shared config.
+Enrolled continuations must renew the same live reservation. Released, expired,
+or missing authority cannot be resurrected by followup or an approval response.
+Unknown transport outcomes retain capacity. Only explicit operator recovery may
+request containment. Passive status and settlement never stop running work.
 
 ## Prompt input
 
@@ -73,7 +83,25 @@ The CLI caps prompt size at 120000 characters and standard input at 1 MiB. A pro
 
 ## Idempotency
 
-`submit` accepts a client-chosen `request_id`. The controller records the request and rejects a conflicting submit with `idempotency_conflict`. Use a stable `request_id` for retries after a network failure, not a fresh one.
+In single-controller mode, `submit` accepts a client-chosen `request_id`.
+Target-authoritative submit generates a qualified controller-and-target handle. The controller records the request and rejects a conflicting submit with `idempotency_conflict`. After uncertain acceptance, preserve the returned handle and recover instead
+of replaying the original prompt. A parent delegation is one execution and
+exact adoption retries replay its durable receipt without new routing.
+
+## Queue storage and operator controls
+
+The local queue is disabled by default and accepts only explicit
+`--allow-queue` submissions. It stores protected prompt/request payloads in an
+owner-only controller outbox, outside Hub and public status/error projections.
+On Windows restrict the parent directory ACL. Retention expiry purges stored
+payloads and never proves execution stopped. Ambiguous acceptance remains held,
+never retried, and never frees capacity speculatively.
+
+The model-facing schema contains 11 dispatch actions including bounded `tick`.
+Settlement and timer installation are operator-only CLI commands, excluded from
+JSON actions. Catalog invocation requires a matching approved journal record,
+protected prompt files, and `approval_mode = "always"`. A model cannot use
+integration plumbing to bypass those gates.
 
 ## What t3-fleet does not do
 

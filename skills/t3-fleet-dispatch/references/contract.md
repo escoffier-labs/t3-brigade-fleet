@@ -25,7 +25,7 @@ or the approved tool runner's gates.
 | `t3-fleet recover` | Recover an `unknown` request without resubmission. | Yes, approval required |
 | `t3-fleet tick` | Drain a bounded slice of the local outbox and renew this machine's own reservations. | Yes, under the approval the queued submits already had |
 | `t3-fleet install-settle-timer` | Operator-only timer installation, never a model-driven action. | Operator authorization |
-| `t3-fleet settle-sweep` | Operator and timer only (rejected by JSON `invoke`). Settle the T3 threads of fleet requests terminal past `[settle] grace_minutes`. Off unless `[settle] enabled = true`. | Operator-installed timer; not a tool action |
+| `t3-fleet settle-sweep` | Operator and timer only (rejected by JSON `invoke`). Settle the T3 threads of fleet requests terminal past `[settle] grace_minutes`. Off unless `[settle] enabled = true`. | Operator-installed timer. Not a tool action |
 
 ## T3 version gate
 
@@ -413,10 +413,10 @@ can differ in override or model, so the Hub compares the digest under its own
 transaction and an older applied context can never acknowledge a replacement.
 
 The launch reply is the `brigade.model_admission.v1` envelope. Its binding
-accepts `instance_id`, `service_tier`, and an optional `model`; any other key is
+accepts `instance_id`, `service_tier`, and an optional `model`. Any other key is
 refused. The canonical model identity is what the admission carries as `model`
 and what the ledger and receipts keep. A `binding.model` is the explicit native
-model the provider is launched on; it is exposed on the admission as
+model the provider is launched on. It is exposed on the admission as
 `launch_model`, and the thread is created and every turn is dispatched with it.
 It must equal the plan's launch model and the prepared selection. When the
 binding names no model, the canonical model is used verbatim. Nothing here
@@ -542,7 +542,7 @@ daemon, installs no service, and adds no cron entry of its own.
 ## Delegated result handoff
 
 `state` always remains the real execution state. A terminal delegated execution
-whose writable target worktree was retained may *additionally* report:
+whose writable target worktree was retained may also report:
 
 ```json
 {

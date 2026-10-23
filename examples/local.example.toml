@@ -1,3 +1,5 @@
+# Offline config validation only. The placeholder agent must remain unavailable.
+# Real dispatch requires a configured Brigade CLI and an admitted logical seat.
 schema = "t3-fleet.config.v1"
 controller_host = "controller-a"
 coordination_mode = "single-controller"
@@ -7,7 +9,7 @@ global_active_limit = 1
 enabled = true
 platform = "linux"
 transport = "local"
-agent_command = ["/home/operator/.local/bin/t3-fleet-agent"]
+agent_command = ["/opt/t3-fleet/example-unconfigured-agent"]
 active_limit = 1
 expected_hostname = "controller-a"
 

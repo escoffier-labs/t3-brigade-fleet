@@ -17,6 +17,7 @@ PUBLIC_DOCS = [
     REPO_ROOT / "docs" / "quickstart.md",
     REPO_ROOT / "docs" / "recovery.md",
     REPO_ROOT / "docs" / "security-model.md",
+    REPO_ROOT / "docs" / "deployment.md",
 ]
 EXAMPLE_CONFIGS = [
     REPO_ROOT / "examples" / "fleet.example.toml",

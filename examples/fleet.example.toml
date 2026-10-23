@@ -1,3 +1,5 @@
+# Replace reviewed executable paths and host identities before dispatch.
+# A compatible Brigade CLI and admitted logical seat are required on every node.
 schema = "t3-fleet.config.v1"
 controller_host = "controller-a"
 controller_id = "controller-a"
@@ -8,7 +10,7 @@ global_active_limit = 3
 enabled = true
 platform = "linux"
 transport = "local"
-agent_command = ["/home/operator/.local/bin/t3-fleet-agent"]
+agent_command = ["/opt/t3-fleet/bin/t3-fleet-agent"]
 active_limit = 1
 expected_hostname = "controller-a"
 # Optional. Per-repository cap on this host. 0 or unset uses active_limit.
@@ -22,7 +24,7 @@ enabled = true
 platform = "linux"
 transport = "ssh"
 ssh_alias = "target-a"
-agent_command = ["/home/operator/.local/bin/t3-fleet-agent"]
+agent_command = ["/opt/t3-fleet/bin/t3-fleet-agent"]
 active_limit = 1
 expected_hostname = "target-a"
 
@@ -31,11 +33,12 @@ enabled = true
 platform = "linux"
 transport = "ssh"
 ssh_alias = "target-b"
-agent_command = ["/home/operator/.local/bin/t3-fleet-agent"]
+agent_command = ["/opt/t3-fleet/bin/t3-fleet-agent"]
 active_limit = 1
 expected_hostname = "target-b"
 
 [repositories.example-repo]
+policy_identity = "github.com/example-org/example-repo"
 default_branch = "main"
 branch_prefix = "codex/"
 
@@ -43,3 +46,26 @@ branch_prefix = "codex/"
 controller-a = "/srv/repos/example"
 target-a = "/srv/repos/example"
 target-b = "/srv/repos/example"
+
+# Model admission is mandatory even with policy enrollment off.
+# Enable policy routing only after enrolling this controller and its targets.
+# [policy]
+# enrollment = "required"
+# workload = "linux-development"
+
+# Optional bounded local queue. Only explicit --allow-queue submits enter it.
+# Keep state in an owner-only directory. Unknown acceptance is held, never retried.
+# [outbox]
+# enabled = true
+# max_records = 64
+# max_prompt_bytes = 120000
+# retention_seconds = 86400
+# max_attempts = 5
+# max_jobs_per_tick = 4
+# max_tick_seconds = 60
+
+# Settlement is an operator-only opt-in. No timer is installed by this package.
+# [settle]
+# enabled = false
+# grace_minutes = 10
+# unlink_pull_requests = false

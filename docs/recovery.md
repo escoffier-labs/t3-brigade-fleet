@@ -1,77 +1,93 @@
 # Recovery
 
-This document covers the `recover` command and how `t3-fleet` handles unknown outcomes. For the request lifecycle see `docs/architecture.md`.
+Preserve the exact request handle after uncertain acceptance. Recovery checks
+the execution already named by that handle. It never replays its prompt.
 
-## When an outcome is unknown
+## Unknown outcomes
 
-A request normally reaches one of these terminal states: `succeeded`, `failed`, or `interrupted`. A request that the controller cannot confirm reaches `unknown`.
+Terminal states are `succeeded`, `failed`, and `interrupted`. `unknown` is
+non-terminal. Lost transport, a process interruption, or unmatched T3 evidence
+can leave the outcome unknown. Capacity and reservations remain counted until
+the target can establish a safe outcome. A timeout alone proves no termination.
 
-`unknown` is non-terminal. It means the controller lost contact with the target mid-mutation and cannot prove the session ended. The slot stays reserved until `recover` reconciles the request.
-
-Common causes:
-
-- The transport dropped after the controller sent the request but before the agent acknowledged.
-- The controller process was interrupted between sending the request and recording the result.
-- The target host rebooted while a session was running.
-
-## What recover does
-
-`recover` reconciles a request against the target store. The target store is the source of truth in `target-authoritative` mode and a strong hint in `single-controller` mode.
-
-The controller asks the agent for the recorded outcome of the request. The agent returns one of:
-
-- A terminal receipt: `succeeded`, `failed`, or `interrupted`. The controller records the receipt and releases the slot.
-- No receipt: the controller marks the request as not started and releases the slot.
-- An indeterminate state: the controller leaves the slot reserved and returns `unknown`. Retry `recover` after the target is reachable.
-
-`recover` does not start a new session. It only reconciles the existing one.
-
-## When to use recover
-
-Run `recover` when:
-
-- `status` or `wait` returns `unknown_state` (exit 5).
-- A controller process was killed mid-request.
-- A target host was unreachable during a request and is now reachable.
-
-Do not run `recover` for a request that already returned `succeeded`, `failed`, or `interrupted`. It is a no-op in those cases and adds load to the target.
-
-## How to call recover
-
-By request id:
+Require operator authorization before recovery:
 
 ```bash
-t3-fleet recover --request-id <request-id>
+t3-fleet recover --request-id <qualified-request-id> --include-output
 ```
 
-By target hint, when you do not have the request id but know which host ran the work:
+Without a request ID, `recover --target target-a` succeeds only when this
+controller journal has exactly one unknown request for that target. Zero or
+multiple matches fail closed. The target is a lookup hint and cannot redirect
+an explicit qualified request ID. Preserve the controller and target portions
+of cross-controller handles unchanged.
 
-```bash
-t3-fleet recover --target target-a
-```
+In target-authoritative mode the target receipt owns the outcome. A second
+controller can discover an existing request through its qualified handle.
+Missing receipts remain subject to a grace period, and live or ambiguous work
+keeps its capacity. Do not treat an immediate `not_found` as proof of no run.
+Recovery releases capacity only after the applicable identity and containment
+rules establish a safe result.
 
-Include output to see the reconciled result:
+## Terminal evidence and containment
 
-```bash
-t3-fleet recover --request-id <request-id> --include-output
-```
+A terminal projection must match request, thread, and turn identity. Missing or
+uncorroborated identity remains unresolved. Doctor and capacity can report a
+bounded `resolution` with its reason and deadline. A starting or running session
+retains capacity and clears a terminal-resolution clock. Queued work starts
+launch grace after the previous run projects terminal.
 
-`recover` requires at least a `request_id` or a `target`. The CLI rejects an empty `target`.
+At a blocking timeout the host remains blocked. Explicit operator `recover`
+may request containment of the unresolved execution, or matching identity
+may resolve it. Passive status, doctor, capacity, observation, and settlement
+never interrupt, cancel, or stop target work. A reservation stays held while
+acceptance or execution remains uncertain.
 
-## Multi-controller recovery
+Read fresh status after recovery. Report `unknown` if it remains unresolved.
+Do not submit replacement work to guess whether the earlier request ran.
 
-In `target-authoritative` mode more than one controller may dispatch to the same fleet. Each controller writes its own request id. The target store records the controller id with each receipt.
+## Queue recovery
 
-When `controller-a` loses contact with a request, a second controller may run `recover` against the same target store. The target store returns the receipt that `controller-a` recorded, or the agent's record if the controller receipt is missing. This is why the target store is the source of truth in this mode.
+The optional local outbox admits only explicit `--allow-queue` submissions on a
+controller with `[outbox] enabled = true`. Known pre-launch capacity or offline
+blocks can yield `pending_autotick` with a `job_id`. No execution has started.
+Queueing cannot adopt a parent `--delegation-id`.
 
-In `single-controller` mode there is one controller. `recover` still reconciles against the target store, but the controller-side store is the primary record.
+`t3-fleet tick` drains a bounded slice under a single-owner lease and renews
+reservations this local node owns as a target. Overlapping ticks return `busy`.
+Every attempt uses live policy, roster, privacy, and capacity checks. A retry
+routes the caller's original intent again rather than replaying a failed
+machine selection. The original submission's authorization covers only that
+same deferred work. A tick is never authority to create new work.
 
-## Recovery is not a retry
+Inspect `last_tick_at`, `queue_disposition`, and `queue_reason` in results.
+`held-acceptance-unknown` means the target may already have accepted the work.
+Such jobs are held, never retried, and do not free capacity speculatively.
+Retention expiry only removes this client's stored prompt and request. It is
+never evidence that a run stopped. Known acceptance and terminal disposition
+also purge the queued payload. Prompts stay in the controller's owner-only
+outbox file and are excluded from Hub requests and status, error, tick, and
+receipt projections.
 
-`recover` does not resubmit a failed request. If a session ended in `failed`, fix the cause and submit a new request with a new `request_id`. If a session ended in `interrupted`, that was a deliberate stop. Submit a new request only if you want to restart the work.
+## Attention and continuations
 
-## Limits
+`needs_attention` carries the current `pending_request`. Its `respond_with`
+selects `approve` or `answer`. Preserve the ID and return only the operator's
+specific decision or input. Followup cannot answer a pending request.
 
-- `recover` cannot reconcile a request that the target store never recorded. In that case the controller releases the slot and marks the request as not started.
-- `recover` cannot prove a negative. If the target is unreachable, it returns `unknown` and leaves the slot reserved. Bring the target up before retrying.
-- `recover` does not bypass approvals. A session that paused for an approval stays paused. Use `approve` or `answer` to drive it forward.
+Enrolled `followup`, `approve`, and `answer` revalidate policy and renew the
+same live reservation before resuming. Expired, released, or missing
+reservations fail closed with `continuation-admission-required`. They need
+newly negotiated admission. No resurrection protocol is invented here.
+
+A terminal delegated result can report `disposition: "pending-handoff"` and
+an opaque `worktree_ref`. The target retained writable work for review. This
+proves no source checkout was updated or branch merged. Preserve the worktree
+and handoff record for the operator.
+
+## Rollback
+
+Do not downgrade a live concurrency database directly. Drain known active work,
+back up state, and review the rollback helper described in
+[deployment](deployment.md#upgrade-and-rollback). Unknown work and retained
+worktrees require reconciliation before any destructive cleanup.

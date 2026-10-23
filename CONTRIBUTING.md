@@ -35,15 +35,30 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-Python 3.11 or newer is required.
+Python 3.11 or newer is required. Runtime dependencies remain empty. Tests use
+standard-library unittest. Live dispatch also needs the external Brigade
+CLI and operator admission setup described in `docs/deployment.md`.
 
 ## Running tests
 
 Run the suite before and after your change. Do not skip tests to land a feature.
 
 ```bash
-python -m pytest -q
+python scripts/project-skill.py
+PYTHONPATH=src:tests python -m unittest discover -s tests -v
+python scripts/project-skill.py --check
 ```
+
+The cross-repository wire check is explicitly skipped unless
+`T3_FLEET_BRIGADE_SOURCE` names a compatible Brigade source checkout. The
+checked-in generic wire fixture is still exercised on every run. Do not hide a
+skip or claim it proves current interoperability with a live Hub.
+
+CI retains Linux Python 3.11/3.12/3.13, wheel installation, and a Windows
+PowerShell launcher contract. Run the PowerShell check on Windows when changing
+launcher behavior. Generated harness files are local outputs of
+`scripts/project-skill.py`. Edit the canonical skill and tool sources, then
+regenerate and run the public safety checks. Do not commit operator settings.
 
 ## Style and writing rules
 

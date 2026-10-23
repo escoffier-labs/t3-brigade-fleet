@@ -130,7 +130,7 @@ On builds with [event filters](https://github.com/pingdotgg/t3code/pull/22194),
 all `filters` must match. Supported operators are `equals`, `notEquals`, `in`,
 `startsWith`, and `exists`, on request paths such as `headers.x-github-event`
 and `body.action`. A filtered delivery starts no run. On update, omitting
-`filters` preserves them; `filters: []` clears them.
+`filters` preserves them. `filters: []` clears them.
 
 [Replay deduplication and coalescing](https://github.com/pingdotgg/t3code/pull/22234)
 use the webhook schedule's `dedupe` object. `replayKey` and `coalesceKey` are
@@ -145,7 +145,7 @@ delivery. `coalesceWindowSeconds` accepts 10-3600, default 120. For example:
 Read delivery outcomes, including `filtered`, `duplicate`, and `coalesced`,
 when checking whether a request started work. Delivery acceptance alone does
 not prove that a provider turn ran. These behaviors are source-verified for
-nightly 20261021.3473; they were not exercised against a live webhook here.
+nightly 20261021.3473. They were not exercised against a live webhook here.
 
 `maxDeliveryAgeMinutes` accepts 1-1440 and skips requests held by the relay
 longer than that while the environment was offline. Offline holding is opt-in
