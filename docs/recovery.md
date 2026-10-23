@@ -65,11 +65,12 @@ and that its reservation was released or expired. The original submission's
 authorization covers only that same deferred work. A tick is never authority to create new work.
 
 Preparation checkpoints retain the policy session and execution handle through
-model-plan outages. An unresolved routing reply blocks further placement until
-its saved decision is available. It does not free capacity. A caller-qualified
-handle keeps its target. If renewed placement would require an override the
-caller did not authorize, the job stays retryably blocked within the configured
-attempt and retention limits.
+model-plan outages and replacement routing before target contact. A saved
+replacement decision resumes without another route. An unresolved routing reply
+blocks further placement until its saved decision is available. It does not
+free capacity. A caller-qualified handle keeps its target. If initial or renewed
+placement would require an override the caller did not authorize, the job stays
+retryably blocked within the configured attempt and retention limits.
 
 Stop old outbox writers before upgrading. The additive checkpoint migration
 preserves existing rows and treats old saved execution handles conservatively.

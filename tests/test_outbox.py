@@ -1020,6 +1020,412 @@ class PeerModeOutboxTests(_OutboxControllerFixture, unittest.TestCase):
             len([c for c in self.transport.calls if c["action"] == "claim"]), 1
         )
 
+    def test_prejournal_rebind_restart_reuses_the_saved_replacement(self) -> None:
+        from datetime import datetime, UTC
+        from unittest.mock import patch
+
+        self.admission.plan_error = HostUnavailable("plan helper offline")
+        result = self.controller.submit(self.request, prompt=PROMPT)
+        original = self.outbox.get(result["job_id"])
+        self.assertEqual(original.attempt_phase, "pre-target")
+        self.assertEqual(original.execution_state, "never-dispatched")
+        with self.assertRaisesRegex(ValidationError, "unknown request id:"):
+            self.store.get(original.request_id)
+        old = self.store.policy_session_for_request(original.request_id)
+        self.admission.plan_error = None
+        self.policy.machine = "linux-worker"
+        self.policy.expires_at = "2026-09-05T12:20:00Z"
+        later = datetime(2026, 9, 5, 12, 11, tzinfo=UTC).timestamp()
+        self.now[0] = original.next_attempt_at
+        save = self.store.record_policy_decision
+
+        def crash_after_save(*args):
+            save(*args)
+            raise RuntimeError("saved replacement before identity")
+
+        with patch.object(self.controller, "_wall_clock", return_value=later):
+            with patch.object(
+                self.store, "record_policy_decision", side_effect=crash_after_save
+            ):
+                with self.assertRaisesRegex(RuntimeError, "saved replacement"):
+                    self.controller.tick()
+        interrupted = self.outbox.get(original.job_id)
+        replacement = self.store.get_policy_session(interrupted.policy_session_id)
+        self.assertEqual(interrupted.attempt_phase, "routing")
+        self.assertEqual(interrupted.request_id, original.request_id)
+        self.assertNotEqual(replacement.session_id, old.session_id)
+        self.assertEqual(replacement.decision["machine"], "linux-worker")
+        self.assertFalse(self.transport.receipts)
+        self.assertEqual(self.outbox.payload(original.job_id).prompt, PROMPT)
+        self.now[0] += 121
+        self.store = FleetStore(self.store.path)
+        self.outbox = OutboxStore(
+            self.outbox.directory, limits=self.outbox.limits, clock=lambda: self.now[0]
+        )
+        restarted = self.build()
+        with patch.object(restarted, "_wall_clock", return_value=later):
+            restarted.tick()
+        final = self.outbox.get(original.job_id)
+        self.assertEqual(final.state, "dispatched")
+        self.assertEqual(final.digest, original.digest)
+        self.assertNotEqual(final.request_id, original.request_id)
+        self.assertTrue(final.request_id.startswith("linux-worker-"))
+        current = self.store.policy_session_for_request(final.request_id)
+        self.assertEqual(current.session_id, replacement.session_id)
+        self.assertEqual(current.decision, replacement.decision)
+        self.assertEqual(current.reservation_state, "active")
+        self.assertEqual(self.store.get_policy_session(old.session_id), old)
+        self.assertEqual(len(self.policy.route_calls), 2)
+        self.assertEqual(set(self.transport.receipts), {final.request_id})
+        self.assertEqual(
+            len([c for c in self.transport.calls if c["action"] == "claim"]), 1
+        )
+        self.assertFalse(self.policy.release_calls)
+
+    def test_prejournal_renewal_with_unresolved_route_waits_after_reopen(self) -> None:
+        from datetime import datetime, UTC
+        from unittest.mock import patch
+
+        self.admission.plan_error = HostUnavailable("plan helper offline")
+        result = self.controller.submit(self.request, prompt=PROMPT)
+        original = self.outbox.get(result["job_id"])
+        old = self.store.policy_session_for_request(original.request_id)
+        with self.assertRaisesRegex(ValidationError, "unknown request id:"):
+            self.store.get(original.request_id)
+        self.admission.plan_error = None
+        self.policy.machine = "linux-worker"
+        self.policy.expires_at = "2026-09-05T12:20:00Z"
+        self.policy.route_error = HostUnavailable("replacement reply lost")
+        later = datetime(2026, 9, 5, 12, 11, tzinfo=UTC).timestamp()
+        self.now[0] = original.next_attempt_at
+        with patch.object(self.controller, "_wall_clock", return_value=later):
+            self.controller.tick()
+        pending = self.outbox.get(original.job_id)
+        self.assertEqual(pending.attempt_phase, "routing")
+        self.assertNotEqual(pending.policy_session_id, old.session_id)
+        self.assertIsNone(
+            self.store.get_policy_session(pending.policy_session_id).decision
+        )
+        self.policy.route_error = None
+        self.now[0] = pending.next_attempt_at
+        self.store = FleetStore(self.store.path)
+        self.outbox = OutboxStore(
+            self.outbox.directory, limits=self.outbox.limits, clock=lambda: self.now[0]
+        )
+        restarted = self.build()
+        with patch.object(restarted, "_wall_clock", return_value=later):
+            result = restarted.tick()
+        final = self.outbox.get(original.job_id)
+        self.assertEqual(
+            (final.state, final.execution_state), ("queued", "never-dispatched")
+        )
+        self.assertEqual(
+            (final.request_id, final.digest), (original.request_id, original.digest)
+        )
+        self.assertEqual(final.policy_session_id, pending.policy_session_id)
+        self.assertEqual(self.store.get_policy_session(old.session_id), old)
+        self.assertEqual(self.outbox.payload(final.job_id).intent, self.request)
+        self.assertEqual(self.outbox.payload(final.job_id).prompt, PROMPT)
+        self.assertEqual(result["blocked"][0]["queue_reason"], "capacity-exhausted")
+        self.assertEqual(len(self.policy.route_calls), 2)
+        self.assertFalse(self.transport.receipts)
+        self.assertFalse(self.policy.release_calls)
+
+    def test_missing_journal_keeps_legacy_and_target_uncertainty_conservative(
+        self,
+    ) -> None:
+        for phase in ("legacy", "target"):
+            with self.subTest(phase=phase):
+                named = f"second-worker-controller-a-00000000-0000-0000-0000-{len(self.outbox.jobs()) + 1:012d}"
+                intent = {**self.request, "title": f"Missing journal in {phase}"}
+                job = self.outbox.enqueue(
+                    digest=self.controller._digest(
+                        self.controller._caller_payload(intent, None), PROMPT
+                    ),
+                    intent=intent,
+                    prompt=PROMPT,
+                    host="second-worker",
+                    repository="example-repo",
+                    request_id=named,
+                    initial_owner="stopped-owner",
+                )
+                if phase == "target":
+                    self.outbox.record_target_attempt(
+                        job.job_id, job.lease_generation, "stopped-owner"
+                    )
+                else:
+                    # Prior writers had no explicit proof of pre-target status.
+                    with self.outbox._connect() as connection:
+                        connection.execute(
+                            "UPDATE outbox_jobs SET attempt_phase = 'legacy' WHERE job_id = ?",
+                            (job.job_id,),
+                        )
+                self.now[0] += 121
+                self.store = FleetStore(self.store.path)
+                self.outbox = OutboxStore(
+                    self.outbox.directory,
+                    limits=self.outbox.limits,
+                    clock=lambda: self.now[0],
+                )
+                result = self.build().tick()
+                final = self.outbox.get(job.job_id)
+                self.assertEqual(
+                    (final.state, final.execution_state), ("held", "unknown")
+                )
+                self.assertEqual(final.request_id, named)
+                self.assertEqual(len(result["held"]), 1)
+                self.assertFalse(self.policy.route_calls)
+                self.assertFalse(self.transport.receipts)
+                self.assertFalse(self.policy.release_calls)
+
+    def test_stale_planner_journal_cannot_erase_unresolved_renewal(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import datetime, UTC
+        from threading import Event
+        from unittest.mock import patch
+
+        self.config = outbox_config(self.config, max_attempts=6)
+        self.outbox = OutboxStore(
+            self.outbox.directory,
+            limits=replace(self.outbox.limits, max_attempts=6),
+            clock=lambda: self.now[0],
+        )
+        self.controller = self.build()
+        entered, release = Event(), Event()
+        plan = self.admission.plan
+
+        def pause_first_plan(*args, **kwargs):
+            result = plan(*args, **kwargs)
+            if not entered.is_set():
+                entered.set()
+                if not release.wait(10):
+                    raise AssertionError("planner was not released")
+            return result
+
+        later = datetime(2026, 9, 5, 12, 11, tzinfo=UTC).timestamp()
+        with patch.object(self.admission, "plan", side_effect=pause_first_plan):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                stale = executor.submit(
+                    self.controller.submit, self.request, prompt=PROMPT
+                )
+                try:
+                    self.assertTrue(entered.wait(10))
+                    (original,) = self.outbox.jobs()
+                    with self.assertRaisesRegex(ValidationError, "unknown request id:"):
+                        self.store.get(original.request_id)
+                    old = self.store.policy_session_for_request(original.request_id)
+                    self.now[0] += 121
+                    self.policy.machine = "linux-worker"
+                    self.policy.expires_at = "2026-09-05T12:20:00Z"
+                    self.policy.route_error = HostUnavailable("renewal reply lost")
+                    self.store = FleetStore(self.store.path)
+                    self.outbox = OutboxStore(
+                        self.outbox.directory,
+                        limits=self.outbox.limits,
+                        clock=lambda: self.now[0],
+                    )
+                    takeover = self.build()
+                    with patch.object(takeover, "_wall_clock", return_value=later):
+                        takeover.tick()
+                    pending = self.outbox.get(original.job_id)
+                    self.assertEqual(pending.attempt_phase, "routing")
+                    self.assertNotEqual(pending.policy_session_id, old.session_id)
+                finally:
+                    release.set()
+                with self.assertRaises(StaleLease):
+                    stale.result(timeout=10)
+        # The old planner legitimately created its journal after takeover; its
+        # target checkpoint was fenced, but the journal writes precede it.
+        journal = self.store.get(original.request_id)
+        self.assertEqual((journal.state, journal.thread_id), ("dispatching", None))
+        self.assertFalse(self.transport.receipts)
+        self.policy.route_error = None
+        for _ in range(2):
+            self.now[0] = self.outbox.get(original.job_id).next_attempt_at
+            self.store = FleetStore(self.store.path)
+            self.outbox = OutboxStore(
+                self.outbox.directory,
+                limits=self.outbox.limits,
+                clock=lambda: self.now[0],
+            )
+            restarted = self.build()
+            with patch.object(restarted, "_wall_clock", return_value=later):
+                restarted.tick()
+        final = self.outbox.get(original.job_id)
+        self.assertEqual(len(self.policy.route_calls), 2)
+        self.assertEqual((final.state, final.attempt_phase), ("queued", "routing"))
+        self.assertEqual(
+            (final.request_id, final.digest), (original.request_id, original.digest)
+        )
+        self.assertEqual(final.policy_session_id, pending.policy_session_id)
+        self.assertIsNone(
+            self.store.get_policy_session(pending.policy_session_id).decision
+        )
+        self.assertEqual(self.store.get_policy_session(old.session_id), old)
+        self.assertEqual(self.outbox.payload(final.job_id).intent, self.request)
+        self.assertEqual(self.outbox.payload(final.job_id).prompt, PROMPT)
+        self.assertFalse(self.transport.receipts)
+        self.assertFalse([c for c in self.transport.calls if c["action"] == "claim"])
+        self.assertFalse(self.policy.release_calls)
+
+    def test_initial_auto_fixed_id_blocks_before_incompatible_reservation(self) -> None:
+        named = "linux-worker-controller-a-00000000-0000-0000-0000-000000000001"
+        self.request["request_id"] = named
+        digest = self.controller._digest(
+            self.controller._caller_payload(self.request, None), PROMPT
+        )
+        # On the broken path this valid deferred work raises and purges itself.
+        try:
+            result = self.controller.submit(self.request, prompt=PROMPT)
+        except ValidationError:
+            result = None
+        (job,) = self.outbox.jobs()
+        self.assertEqual(job.state, "queued")
+        self.assertEqual((job.request_id, job.digest), (named, digest))
+        self.assertEqual(job.execution_state, "never-dispatched")
+        self.assertFalse(job.payload_purged)
+        self.assertEqual(self.outbox.payload(job.job_id).intent, self.request)
+        self.assertEqual(self.outbox.payload(job.job_id).prompt, PROMPT)
+        self.assertEqual(result["queue_reason"], "host-ineligible")
+        self.assertEqual(self.policy.route_calls, [])
+        self.assertFalse(self.transport.receipts)
+        self.now[0] = job.next_attempt_at
+        self.store = FleetStore(self.store.path)
+        self.outbox = OutboxStore(
+            self.outbox.directory, limits=self.outbox.limits, clock=lambda: self.now[0]
+        )
+        self.build().tick()
+        final = self.outbox.get(job.job_id)
+        self.assertEqual(
+            (final.state, final.request_id, final.digest), ("queued", named, digest)
+        )
+        self.assertEqual(self.outbox.payload(job.job_id).intent, self.request)
+        self.assertEqual(self.outbox.payload(job.job_id).prompt, PROMPT)
+        self.assertEqual(self.policy.route_calls, [])
+        self.assertFalse(self.policy.release_calls)
+        self.assertFalse(self.transport.receipts)
+
+    def test_invalid_or_unknown_fixed_target_is_rejected_before_route(self) -> None:
+        for named in (
+            "malformed",
+            "unknown-worker-controller-a-00000000-0000-0000-0000-000000000001",
+        ):
+            with self.subTest(request_id=named):
+                with self.assertRaises(ValidationError):
+                    self.controller.submit(
+                        {**self.request, "request_id": named}, prompt=PROMPT
+                    )
+                self.assertEqual(self.policy.route_calls, [])
+                self.assertFalse(self.transport.receipts)
+
+    def test_fixed_id_does_not_reset_saved_unresolved_routing_before_identity(
+        self,
+    ) -> None:
+        self.request.update(
+            request_id="second-worker-controller-a-00000000-0000-0000-0000-000000000001",
+            host="second-worker",
+            override_reason="operator selected target",
+        )
+        # Prior checkpoint writers saved routing before the caller ID callback.
+        session_id = "t3f-prior-unresolved"
+        self.store.record_policy_envelope(
+            session_id,
+            consumer="t3-fleet",
+            repository="github.com/example-org/example-repo",
+            origin=self.config.controller_host,
+            workload="linux-development",
+            envelope=self.policy.resolve(),
+        )
+        job = self.outbox.enqueue(
+            digest=self.controller._digest(
+                self.controller._caller_payload(
+                    self.request, self.request["override_reason"]
+                ),
+                PROMPT,
+            ),
+            intent=self.request,
+            prompt=PROMPT,
+            host="second-worker",
+            repository="example-repo",
+            initial_owner="stopped-owner",
+        )
+        self.outbox.record_policy_attempt(
+            job.job_id,
+            job.lease_generation,
+            "stopped-owner",
+            session_id=session_id,
+            routing=True,
+        )
+        self.outbox.reschedule(job.job_id, job.lease_generation, "stopped-owner")
+        for _ in range(2):
+            self.now[0] = self.outbox.get(job.job_id).next_attempt_at
+            self.store = FleetStore(self.store.path)
+            self.outbox = OutboxStore(
+                self.outbox.directory,
+                limits=self.outbox.limits,
+                clock=lambda: self.now[0],
+            )
+            result = self.build().tick()
+            final = self.outbox.get(job.job_id)
+            self.assertEqual((final.state, final.attempt_phase), ("queued", "routing"))
+            self.assertEqual(final.policy_session_id, session_id)
+            self.assertEqual(result["blocked"][0]["queue_reason"], "capacity-exhausted")
+            self.assertEqual(self.outbox.payload(job.job_id).intent, self.request)
+            self.assertFalse(self.policy.route_calls)
+            self.assertFalse(self.transport.receipts)
+
+    def test_auto_fixed_id_reuses_an_existing_matching_live_binding(self) -> None:
+        named = "second-worker-controller-a-00000000-0000-0000-0000-000000000001"
+        self.request["request_id"] = named
+        # A prior authorized placement is durable, but no launch journal exists.
+        plan = self.controller._plan_policy(
+            {**self.request, "host": "second-worker"}, "operator selected target"
+        )
+        self.store.link_policy_request(plan.session_id, named)
+        self.policy.machine = "linux-worker"
+        result = self.controller.submit(self.request, prompt=PROMPT)
+        self.assertEqual((result["state"], result["request_id"]), ("running", named))
+        self.assertEqual(len(self.policy.route_calls), 1)
+        self.assertEqual(
+            self.store.policy_session_for_request(named).session_id, plan.session_id
+        )
+        self.assertEqual(set(self.transport.receipts), {named})
+        self.assertEqual(len(self.admission.plan_calls), 1)
+        self.assertEqual(
+            self.controller.submit(self.request, prompt=PROMPT)["request_id"], named
+        )
+        self.assertEqual(len(self.policy.route_calls), 1)
+        self.assertEqual(
+            len([c for c in self.transport.calls if c["action"] == "claim"]), 1
+        )
+
+    def test_initial_explicit_fixed_target_keeps_caller_override_and_replay(
+        self,
+    ) -> None:
+        named = "second-worker-controller-a-00000000-0000-0000-0000-000000000001"
+        self.request.update(
+            request_id=named,
+            host="second-worker",
+            override_reason="operator selected target",
+        )
+        result = self.controller.submit(self.request, prompt=PROMPT)
+        self.assertEqual((result["state"], result["request_id"]), ("running", named))
+        self.assertEqual(len(self.policy.route_calls), 1)
+        self.assertEqual(self.policy.route_calls[0]["machine"], "second-worker")
+        self.assertEqual(
+            self.policy.route_calls[0]["override_reason"],
+            self.request["override_reason"],
+        )
+        self.assertEqual(len(self.admission.plan_calls), 1)
+        self.assertEqual(
+            self.controller.submit(self.request, prompt=PROMPT)["request_id"], named
+        )
+        self.assertEqual(len(self.policy.route_calls), 1)
+        self.assertEqual(set(self.transport.receipts), {named})
+        self.assertEqual(
+            len([c for c in self.transport.calls if c["action"] == "claim"]), 1
+        )
+
     def test_fixed_caller_id_cannot_reserve_an_incompatible_renewed_target(
         self,
     ) -> None:
@@ -1028,6 +1434,11 @@ class PeerModeOutboxTests(_OutboxControllerFixture, unittest.TestCase):
 
         named = "second-worker-controller-a-00000000-0000-0000-0000-000000000001"
         self.request["request_id"] = named
+        # Auto retry starts from an existing authorized durable binding.
+        plan = self.controller._plan_policy(
+            {**self.request, "host": "second-worker"}, "operator selected target"
+        )
+        self.store.link_policy_request(plan.session_id, named)
         self.transport.fail_on = "claim"
         self.transport.fail_exc = TargetBusy("busy", reason="repository-busy")
         result = self.controller.submit(self.request, prompt=PROMPT)
@@ -1531,8 +1942,10 @@ class PeerModeOutboxTests(_OutboxControllerFixture, unittest.TestCase):
         self.assertEqual(len(self.policy.route_calls), 3)  # blocked, refused, rebound
 
     def test_caller_identity_conflicts_remain_errors_on_every_retry(self) -> None:
-        self.request["request_id"] = (
-            "second-worker-controller-a-00000000-0000-0000-0000-000000000001"
+        self.request.update(
+            request_id="second-worker-controller-a-00000000-0000-0000-0000-000000000001",
+            host="second-worker",
+            override_reason="operator selected target",
         )
         self.controller.submit(self.request, prompt=PROMPT)
         for _ in range(2):

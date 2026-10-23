@@ -860,6 +860,17 @@ class FleetController:
         )
         decision = self._reusable_decision(session, machine, caller_seat)
         if decision is None:
+            if (
+                self.config.coordination_mode == "target-authoritative"
+                and request.get("request_id") is not None
+                and machine is None
+            ):
+                # A qualified ID fixes identity, but grants no placement
+                # override. Reuse a valid binding or wait before taking capacity.
+                raise HostUnavailable(
+                    "caller target needs authorized placement before routing",
+                    reason="host-ineligible",
+                )
             if outbox_attempt is not None:
                 assert self._outbox is not None
                 self._outbox.record_policy_attempt(
@@ -1316,9 +1327,12 @@ class FleetController:
                 "saved execution conflicts with caller request identity"
             )
         resume_record = None
+        # Routing a renewal advances policy progress without contacting a
+        # target. Only explicit new checkpoints with no mutation retain proof.
         pre_target = (
             outbox_attempt is not None
-            and outbox_attempt[0].attempt_phase == "pre-target"
+            and outbox_attempt[0].attempt_phase in {"pre-target", "routing"}
+            and outbox_attempt[0].execution_state == "never-dispatched"
         )
         if resume_request_id is not None:
             try:
@@ -1339,14 +1353,27 @@ class FleetController:
             ):
                 # A journal can reach dispatching just before the uncertainty
                 # checkpoint. Fence the old owner before resuming preparation.
-                self._outbox.record_execution_identity(
-                    outbox_attempt[0].job_id,
-                    outbox_attempt[1],
-                    outbox_attempt[2],
-                    request_id=resume_request_id,
-                    host=resume_record.host,
-                    pre_target=True,
-                )
+                if outbox_attempt[0].attempt_phase == "routing":
+                    # A stale planner can write this journal after renewal
+                    # starts. Fence the repair without erasing its route wait.
+                    session_id = outbox_attempt[0].policy_session_id
+                    assert session_id is not None  # bound before routing
+                    self._outbox.record_policy_attempt(
+                        outbox_attempt[0].job_id,
+                        outbox_attempt[1],
+                        outbox_attempt[2],
+                        session_id=session_id,
+                        routing=True,
+                    )
+                else:
+                    self._outbox.record_execution_identity(
+                        outbox_attempt[0].job_id,
+                        outbox_attempt[1],
+                        outbox_attempt[2],
+                        request_id=resume_request_id,
+                        host=resume_record.host,
+                        pre_target=True,
+                    )
                 resume_record = self.store.transition(resume_request_id, "queued")
         replay = self._durable_replay(
             {"request_id": resume_request_id}
@@ -1356,6 +1383,37 @@ class FleetController:
         )
         if replay is not None:
             return self._result(replay)
+        if (
+            self.config.coordination_mode == "target-authoritative"
+            and request.get("request_id") is not None
+            and delegation_id is None
+        ):
+            provided_id = request["request_id"]
+            caller_target = self._required(request, "host")
+            if caller_target == AUTO_HOST:
+                caller_target = max(
+                    (
+                        host_id
+                        for host_id in self.config.hosts
+                        if isinstance(provided_id, str)
+                        and provided_id.startswith(f"{host_id}-")
+                    ),
+                    key=len,
+                    default="",
+                )
+            self._validate_peer_request_id(provided_id, caller_target)
+            self._target(caller_target, self._required(request, "repository"))
+            if (
+                on_request_id is not None
+                and resume_request_id is None
+                and (
+                    outbox_attempt is None
+                    or outbox_attempt[0].attempt_phase == "pre-target"
+                )
+            ):
+                # Retain valid caller identity even if placement must wait.
+                # A retry must preserve its existing routing uncertainty.
+                on_request_id(provided_id, caller_target)
         plan: _PolicyPlan | None = None
         if delegation_id is not None:
             plan = self._adopt_delegation(
