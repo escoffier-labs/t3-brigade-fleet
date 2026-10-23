@@ -1317,6 +1317,132 @@ class SubmitContextTests(unittest.TestCase):
 
 
 class EnrolledReportingTests(legacy._AgentPolicyFixture, unittest.TestCase):
+    def test_acknowledged_terminal_retries_release_after_restart(self):
+        from t3_fleet.errors import HostUnavailable, PolicyRejected
+
+        events = []
+        request = dict(
+            self.submit_request, action="claim",
+            request_id=legacy.PEER_REQUEST_ID, digest="d" * 64,
+        )
+        with patch(
+            "t3_fleet.agent.report_event",
+            side_effect=lambda event: events.append(event) or "delivered",
+        ):
+            self.agent.handle(request)
+            launches = list(self.fake_t3.dispatched)
+            self.fake_t3.thread["latestTurn"] = {
+                "state": "completed", "turnId": "turn-1",
+            }
+            self.fake_t3.thread["session"] = {"status": "idle"}
+            for failure in (
+                HostUnavailable("temporary helper failure"),
+                PolicyRejected("release refused"),
+                None,
+            ):
+                with self.subTest(failure=type(failure).__name__):
+                    self.policy.release_error = failure
+                    self.agent = self.build()
+                    # A successful helper call that still reports active also
+                    # cannot prove that capacity was returned.
+                    if failure is None:
+                        release = patch.object(
+                            self.policy, "release_reservation",
+                            return_value={"state": "active"},
+                        )
+                    else:
+                        release = patch.object(
+                            self.policy, "release_reservation",
+                            wraps=self.policy.release_reservation,
+                        )
+                    with release as call:
+                        result = self.agent.handle({"action": "observe", "max": 1})
+                        self.assertEqual(result["examined"], 1)
+                        call.assert_called_once_with(
+                            reservation_id="reservation-1", decision_id="decision-1",
+                            session_id="t3f-" + "0" * 32,
+                        )
+                    receipt = self.agent._target_store().lookup(legacy.PEER_REQUEST_ID)
+                    self.assertEqual(receipt.state, "succeeded")
+                    self.assertEqual(receipt.reservation_state, "active")
+                    self.assertEqual(
+                        receipt.lifecycle["reported_sequence"], receipt.lifecycle["sequence"],
+                    )
+            self.agent = self.build()
+            before = len(self.policy.release_calls)
+            result = self.agent.handle({"action": "observe", "max": 1})
+            self.assertEqual(result["examined"], 1)
+            self.assertEqual(len(self.policy.release_calls), before + 1)
+            self.assertEqual(self.policy.release_calls[-1], self.policy.release_calls[0])
+            self.assertEqual(
+                self.agent._target_store().lookup(legacy.PEER_REQUEST_ID).reservation_state,
+                "released",
+            )
+            self.assertEqual(self.agent.handle({"action": "observe", "max": 1})["examined"], 0)
+            self.assertEqual(len(self.policy.release_calls), before + 1)
+            self.assertEqual(self.fake_t3.dispatched, launches)
+            self.assertEqual([event["state"] for event in events], ["run.started", "external.completed"])
+
+    def test_terminal_release_batch_is_bounded_owned_and_fair(self):
+        from dataclasses import replace
+        from t3_fleet.target_store import TargetStore
+        from tests.test_target_store import TargetStoreTests
+
+        self.agent.handle(dict(
+            self.submit_request, action="claim",
+            request_id=legacy.PEER_REQUEST_ID, digest="d" * 64,
+        ))
+        policy = self.agent._target_store().lookup(legacy.PEER_REQUEST_ID).policy
+        store = TargetStore(Path(self.directory.name) / "batch.db")
+        template = TargetStoreTests("runTest").claim("req-template")
+        expected = []
+        pending = None
+        for index, (state, has_policy, released, acknowledged, target) in enumerate((
+            ("succeeded", True, False, True, "linux-worker"),
+            ("failed", True, False, True, "linux-worker"),
+            ("interrupted", True, False, True, "linux-worker"),
+            ("succeeded", False, False, True, "linux-worker"),
+            ("failed", True, True, True, "linux-worker"),
+            ("interrupted", True, True, False, "linux-worker"),
+            ("succeeded", True, False, True, "other-worker"),
+        )):
+            claim = replace(
+                template, request_id=f"req-batch-{index}", repository=f"repo-{index}",
+                target_id=target, policy=policy if has_policy else None,
+                execution_context={"schema": "brigade.t3_execution_context.v1"},
+            )
+            store.claim(claim, active_limit=10, reservation_ttl=30)
+            receipt = store.reconcile(claim.request_id, state=state, thread_id=None)
+            event = store.lifecycle_event(
+                claim.request_id, expected_version=receipt.observation_version,
+                state=state, observed_at="2026-10-23T18:00:00Z",
+            )
+            if acknowledged:
+                store.acknowledge_event(claim.request_id, event["sequence"])
+            else:
+                pending = (claim.request_id, event["sequence"])
+            if released:
+                store.set_reservation_state(claim.request_id, "released")
+            if target == "linux-worker" and (has_policy and not released or not acknowledged):
+                expected.append(claim.request_id)
+        store = TargetStore(store.path)
+        visited = []
+        for _ in expected:
+            batch = store.observation_batch(target_id="linux-worker", maximum=1)
+            self.assertEqual(len(batch), 1)
+            visited.append(batch[0].request_id)
+            store.mark_observed(batch[0].request_id, "2026-10-23T18:01:00Z")
+        self.assertEqual(visited, expected)
+        self.assertEqual(len(set(visited)), len(expected))
+        for request_id in expected:
+            store.set_reservation_state(request_id, "released")
+        self.assertEqual(
+            [receipt.request_id for receipt in store.observation_batch(target_id="linux-worker", maximum=10)],
+            [pending[0]],
+        )
+        store.acknowledge_event(*pending)
+        self.assertEqual(store.observation_batch(target_id="linux-worker", maximum=10), [])
+
     def test_required_enrollment_reports_target_policy_and_launch_seat(self):
         self.agent = self.build(enrollment="required")
         events = []

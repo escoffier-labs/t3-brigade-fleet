@@ -1205,12 +1205,14 @@ class TargetStore:
     def observation_batch(self, *, target_id: str, maximum: int) -> list[TargetReceipt]:
         # Round robin by last visit prevents a permanently failing helper from
         # starving later requests. Also select a terminal whose state commit
-        # survived a crash before its event could be frozen.
+        # survived a crash before its event could be frozen, or whose policy
+        # reservation still needs release after the event was acknowledged.
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM target_requests WHERE target_id = ? AND (
                     state NOT IN ('succeeded', 'failed', 'interrupted')
+                    OR (policy_json IS NOT NULL AND reservation_state = 'active')
                     OR (json_extract(lifecycle_json, '$.resolution') IS NOT NULL
                         AND COALESCE(json_extract(lifecycle_json, '$.resolution.blocking'), 1) != 0)
                     OR (lifecycle_json IS NOT NULL AND (
