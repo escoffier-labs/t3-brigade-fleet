@@ -131,6 +131,7 @@ class _PolicyPlan:
     host: HostConfig
     repository: RepositoryConfig
     delegation_id: str | None = None
+    rebound: bool = False
 
     @property
     def consumer(self) -> str:
@@ -687,7 +688,7 @@ class FleetController:
         was reserved for a different seat.
         """
         decision = session.decision
-        if decision is None:
+        if decision is None or session.reservation_state != "active":
             return None
         if (
             decision["policy_version"] != session.policy_version
@@ -706,6 +707,9 @@ class FleetController:
         self,
         request: dict[str, Any],
         override_reason: Any,
+        *,
+        execution_request_id: str | None = None,
+        allow_rebind: bool = False,
     ) -> _PolicyPlan:
         """Resolve policy and obtain a routing decision before anything mutates.
 
@@ -746,16 +750,46 @@ class FleetController:
         origin = self.config.controller_host
         workload = self._requested_workload(request)
         existing = None
-        request_id = request.get("request_id")
+        request_id = execution_request_id or request.get("request_id")
         if isinstance(request_id, str) and request_id:
             existing = self.store.policy_session_for_request(request_id)
-        session_id = existing.session_id if existing is not None else self._new_session_id()
+        rebound = False
+        if allow_rebind and existing is not None and existing.decision is not None:
+            # A new binding is permitted only for a journalled unstarted run,
+            # and only after the old reservation is gone. Never hold two live
+            # reservations for one outbox intent.
+            if (
+                existing.reservation_state == "released"
+                or decision_expiry(existing.decision) <= self._policy_now()
+            ):
+                existing = None
+                rebound = True
+        session_id = (
+            existing.session_id if existing is not None else self._new_session_id()
+        )
         envelope = self._policy.resolve(
             consumer=POLICY_CONSUMER,
             repository=repo_identity,
             session_id=session_id,
             origin=origin,
         )
+        if (
+            execution_request_id is not None
+            and existing is not None
+            and existing.decision is not None
+            and existing.reservation_state == "active"
+            and decision_expiry(existing.decision) > self._policy_now()
+            and (
+                envelope["version"] != existing.policy_version
+                or envelope["digest"] != existing.policy_digest
+            )
+        ):
+            # A policy refresh cannot erase evidence of outstanding capacity.
+            # Wait for release/expiry instead of reserving under a new policy.
+            raise HostUnavailable(
+                "saved reservation awaits release or expiry under the new policy",
+                reason="capacity-exhausted",
+            )
         session = self.store.record_policy_envelope(
             session_id,
             consumer=POLICY_CONSUMER,
@@ -805,6 +839,7 @@ class FleetController:
             seat=seat,
             host=host,
             repository=repository,
+            rebound=rebound,
         )
 
     def _requested_workload(self, request: dict[str, Any]) -> str:
@@ -1124,6 +1159,28 @@ class FleetController:
             return
         self.store.set_reservation_state(session.session_id, "released")
 
+    def _validate_submit_request(self, request: dict[str, Any], prompt: str) -> None:
+        """Apply the same caller checks before dispatch and outbox replay."""
+        if not isinstance(prompt, str) or not prompt:
+            raise ValidationError("prompt must be a non-empty string")
+        if request.get("run_setup_script", False):
+            raise ValidationError(
+                "run_setup_script is unavailable through the T3 HTTP dispatch fallback"
+            )
+        if "model_selection" in request:
+            raise ValidationError(
+                "caller model_selection is forbidden; use a logical seat"
+            )
+        # A plan and an admission are both obtained from the Fleet Hub by this
+        # controller. Accepting either from a caller would let the caller name
+        # the model, so they are refused rather than silently overwritten.
+        for forbidden in ("model_admission", "model_plan"):
+            if forbidden in request:
+                raise ValidationError(
+                    f"caller {forbidden} is forbidden; the Fleet Hub decides the model"
+                )
+        self._requested_workload(request)
+
     def _dispatch_submit(
         self,
         request: dict[str, Any],
@@ -1145,22 +1202,7 @@ class FleetController:
         so a caller that must survive a crash mid-dispatch has the identity
         written down first.
         """
-        if not isinstance(prompt, str) or not prompt:
-            raise ValidationError("prompt must be a non-empty string")
-        if request.get("run_setup_script", False):
-            raise ValidationError(
-                "run_setup_script is unavailable through the T3 HTTP dispatch fallback"
-            )
-        if "model_selection" in request:
-            raise ValidationError("caller model_selection is forbidden; use a logical seat")
-        # A plan and an admission are both obtained from the Fleet Hub by this
-        # controller. Accepting either from a caller would let the caller name
-        # the model, so they are refused rather than silently overwritten.
-        for forbidden in ("model_admission", "model_plan"):
-            if forbidden in request:
-                raise ValidationError(
-                    f"caller {forbidden} is forbidden; the Fleet Hub decides the model"
-                )
+        self._validate_submit_request(request, prompt)
         request = dict(request)
         request["execution_context"] = launch_context(
             request,
@@ -1169,9 +1211,6 @@ class FleetController:
         )
         override_reason = request.pop("override_reason", None)
         delegation_id = self._delegation_id(request)
-        # Validated here so a malformed workload is refused before anything is
-        # journalled, whether or not this controller is enrolled.
-        self._requested_workload(request)
         # The digest is taken from what the caller asked for, before central
         # routing rewrites the host and seat. Hub-chosen placement is ephemeral
         # policy metadata that moves between otherwise identical submissions,
@@ -1188,9 +1227,29 @@ class FleetController:
                 replay = self._durable_replay({"request_id": binding[0]}, digest)
                 if replay is not None:
                     return self._result(replay)
-        replay = self._durable_replay(request, digest)
+        if resume_request_id is not None and request.get("request_id") not in {
+            None,
+            resume_request_id,
+        }:
+            raise IdempotencyConflict(
+                "saved execution conflicts with caller request identity"
+            )
+        replay = self._durable_replay(
+            {"request_id": resume_request_id}
+            if resume_request_id is not None
+            else request,
+            digest,
+        )
         if replay is not None:
             return self._result(replay)
+        if resume_request_id is not None:
+            try:
+                resume_record = self.store.get(resume_request_id)
+            except ValidationError as error:
+                raise UnknownState(
+                    "saved execution has no controller journal; run recover",
+                    request_id=resume_request_id,
+                ) from error
         plan: _PolicyPlan | None = None
         if delegation_id is not None:
             plan = self._adopt_delegation(
@@ -1204,7 +1263,17 @@ class FleetController:
             repository_id = repository.repository_id
         elif self.config.policy.enrolled:
             try:
-                plan = self._plan_policy(request, override_reason)
+                plan = self._plan_policy(
+                    request,
+                    override_reason,
+                    execution_request_id=resume_request_id,
+                    allow_rebind=(
+                        resume_request_id is not None
+                        and request.get("request_id") is None
+                        and resume_record.state in {"queued", "blocked_offline"}
+                        and resume_record.thread_id is None
+                    ),
+                )
             except HostUnavailable as error:
                 # Everything this call talks to besides the local allowlist is
                 # the Fleet Hub, so an otherwise unclassified block here is the
@@ -1226,9 +1295,7 @@ class FleetController:
                     "override_reason requires fleet policy enrollment"
                 )
             if request.get("workload") is not None:
-                raise ValidationError(
-                    "workload requires fleet policy enrollment"
-                )
+                raise ValidationError("workload requires fleet policy enrollment")
             host_id = self._required(request, "host")
             repository_id = self._required(request, "repository")
             host, repository = self._target(host_id, repository_id)
@@ -1241,27 +1308,22 @@ class FleetController:
             if provided_id is not None:
                 request_id = self._validate_peer_request_id(provided_id, host_id)
             elif resume_request_id is not None:
-                # A replayed attempt for work that already named an identity.
-                # Reusing it is what makes the replay land on the durable record
-                # rather than start a second execution, so it is kept even
-                # though the route was taken again.
-                #
-                # A target-qualified id belongs to one machine. If this attempt
-                # planned onto a different one, the previous attempt's execution
-                # cannot be reconciled from here and cannot be proved to have
-                # never started, so this is an unknown outcome rather than a
-                # malformed request. Re-routing under a fresh id here is exactly
-                # the second execution the replay exists to prevent.
-                try:
-                    request_id = self._validate_peer_request_id(
-                        resume_request_id, host_id
-                    )
-                except ValidationError as error:
-                    raise UnknownState(
-                        "a previous attempt named an execution on another "
-                        "machine; run recover",
-                        request_id=resume_request_id,
-                    ) from error
+                if plan is not None and plan.rebound:
+                    # The saved attempt is proven unstarted and its reservation
+                    # has ended. This explicit rebind is execution metadata,
+                    # never a change to the immutable caller digest.
+                    request_id = f"{host_id}-{self.config.controller_id}-{self._uuid()}"
+                else:
+                    try:
+                        request_id = self._validate_peer_request_id(
+                            resume_request_id, host_id
+                        )
+                    except ValidationError as error:
+                        raise UnknownState(
+                            "a previous attempt named an execution on another "
+                            "machine; run recover",
+                            request_id=resume_request_id,
+                        ) from error
                 request["request_id"] = request_id
             else:
                 request_id = f"{host_id}-{self.config.controller_id}-{self._uuid()}"
@@ -1292,10 +1354,16 @@ class FleetController:
             )
             request["model_plan"] = model_plan
         else:
-            admission = normalize_admission(self._admission.admit({
-                "consumer": "t3-fleet", "phase": "controller", "request_id": request_id,
-                "seat": seat,
-            }))
+            admission = normalize_admission(
+                self._admission.admit(
+                    {
+                        "consumer": "t3-fleet",
+                        "phase": "controller",
+                        "request_id": request_id,
+                        "seat": seat,
+                    }
+                )
+            )
             request["model_admission"] = admission
         record = self.store.create_request(
             request_id,
@@ -1323,7 +1391,9 @@ class FleetController:
         if self.store.blocking_resolution(host_id) is not None:
             if record.state == "queued":
                 self.store.transition(request_id, "blocked_offline")
-            raise HostUnavailable("host has an unresolved submit path", reason="host-ineligible")
+            raise HostUnavailable(
+                "host has an unresolved submit path", reason="host-ineligible"
+            )
         record = self.store.transition(request_id, "preflight")
         if self.config.coordination_mode == "target-authoritative":
             record = self.store.transition(request_id, "dispatching")
@@ -1480,7 +1550,9 @@ class FleetController:
         if not allow_queue:
             return False
         if self._outbox is None or not self.config.outbox.enabled:
-            raise ValidationError("the local fleet outbox is disabled on this controller")
+            raise ValidationError(
+                "the local fleet outbox is disabled on this controller"
+            )
         if request.get("delegation_id") is not None:
             # An adopted delegation is one execution that already exists
             # centrally. Deferring it locally would make it two.
@@ -1489,12 +1561,11 @@ class FleetController:
 
     @staticmethod
     def _queued_result(job: OutboxJob, reason: str | None) -> dict[str, Any]:
-        """The truthful answer for work that was accepted but not launched.
+        """Return the queue view, with execution knowledge stated separately.
 
-        `pending_autotick` is deliberately not one of the dispatch states. The
-        work has not started, nothing was reserved for it, and the only thing
-        that will move it is a later `tick`, so a reader cannot mistake it for
-        a request that is queued on a target.
+        `pending_autotick` names the local submission surface. `job_state` and
+        `execution_state` distinguish replayable work from held uncertainty.
+        A journalled execution is returned through the ordinary result instead.
         """
         return {
             "schema": "t3-fleet.result.v1",
@@ -1513,38 +1584,57 @@ class FleetController:
     ) -> dict[str, Any]:
         """Dispatch this work, or queue it locally when the caller allowed that.
 
-        Queueing is only ever reached from a pre-launch block. Every transport
-        loss that happens after a target could have accepted the work is turned
-        into an unknown state by the dispatch path itself, so a `HostUnavailable`
-        arriving here provably left no execution started and the same work may
-        be replayed later without risking a second one.
+        Explicit allow-queue work takes a durable intent fence before its first
+        attempt. A successful attempt returns the ordinary immediate result and
+        closes the fence. Only a definitive pre-launch block leaves replayable
+        work. Possible acceptance is held under its saved execution identity.
 
         The authorization for that later attempt is the one this call already
         had. Deferring the same work does not need a second approval, and it is
         never widened: what is stored is the caller's own request, unchanged.
         """
-        queue_allowed = self._queue_intent(request)
-        try:
+        self._validate_submit_request(request, prompt)
+        if not self._queue_intent(request):
             return self._dispatch_submit(request, prompt=prompt)
-        except HostUnavailable as error:
-            if not queue_allowed or self._outbox is None:
-                raise
-            # The caller's request exactly as it arrived. The dispatch path
-            # works on its own copy, so a minted execution identity never
-            # reaches this dict and there is nothing here to strip; a
-            # caller-supplied id is caller intent and stays.
-            intent = dict(request)
-            job = self._outbox.enqueue(
-                digest=self._digest(
-                    self._caller_payload(intent, intent.get("override_reason")),
-                    prompt,
-                ),
-                intent=intent,
-                prompt=prompt,
-                host=request.get("host"),
-                repository=request.get("repository"),
-            )
-            return self._queued_result(job, error.reason)
+        outbox = self._outbox
+        assert outbox is not None
+        owner = f"submit-{self._uuid()}"
+        intent = dict(request)
+        digest = self._digest(
+            self._caller_payload(intent, intent.get("override_reason")), prompt
+        )
+        # Preserve explicit request-ID conflict semantics even when an earlier
+        # conflicting outbox intent already closed and purged its payload.
+        replay = self._durable_replay(request, digest)
+        if replay is not None:
+            return self._result(replay)
+        job = outbox.enqueue(
+            digest=digest,
+            intent=intent,
+            prompt=prompt,
+            host=request.get("host"),
+            repository=request.get("repository"),
+            initial_owner=owner,
+        )
+        if job.lease_owner != owner:
+            # The insert and initial claim are one transaction. An existing
+            # job, whether a submit or a tick owns it, never opens another
+            # direct dispatch path. A closed job may answer from its journal.
+            if job.request_id is not None:
+                replay = self._durable_replay(
+                    {"request_id": job.request_id}, job.digest
+                )
+                if replay is not None:
+                    return self._result(replay)
+            return self._queued_result(job, None)
+        bucket, result = self._drain_job(
+            job, job.lease_generation, owner, immediate=True
+        )
+        if bucket == "dispatched":
+            return result
+        updated = outbox.get(job.job_id)
+        assert updated is not None
+        return self._queued_result(updated, result.get("queue_reason"))
 
     def _target_owned_reservations(self) -> list[dict[str, Any]]:
         """Renew the reservations this machine holds as the target that runs them.
@@ -1595,14 +1685,16 @@ class FleetController:
         generation it claimed. A tick that is slow enough to lose its lease
         cannot overwrite what a newer tick already decided.
 
-        Each job is revalidated from scratch against live policy, the live
-        roster, and live capacity, because the dispatch path it goes back
-        through is the same one an interactive submit uses. Nothing here trusts
-        the machine a previous attempt was routed to.
+        Saved execution evidence is consulted before planning. Unstarted jobs
+        revalidate live policy and roster through the normal dispatch path,
+        reusing a valid reservation. Possible acceptance is reconciled or held,
+        never routed into another execution.
         """
         outbox = self._outbox
         if outbox is None or not self.config.outbox.enabled:
-            raise ValidationError("the local fleet outbox is disabled on this controller")
+            raise ValidationError(
+                "the local fleet outbox is disabled on this controller"
+            )
         owner = f"tick-{self._uuid()}"
         if not outbox.acquire_tick(owner):
             status = outbox.tick_status()
@@ -1630,13 +1722,25 @@ class FleetController:
         truncated = False
         failure_reason: str | None = None
         try:
+            deadline = self._monotonic() + limits.max_tick_seconds
             expired_before = {job.job_id for job in outbox.jobs(state="expired")}
+            # Recover a saved acceptance before retention removes replay data.
+            # This reads only the journal and target receipts, never re-routes.
+            for candidate in outbox.expiring(limit=limits.max_jobs_per_tick):
+                if self._monotonic() >= deadline:
+                    truncated = True
+                    break
+                claimed = outbox.claim(candidate.job_id, owner)
+                if claimed is not None:
+                    job, generation = claimed
+                    examined += 1
+                    bucket, entry = self._reconcile_outbox_job(job, generation, owner)
+                    buckets[bucket].append(entry)
             outbox.purge_expired()
             for job in outbox.jobs(state="expired"):
                 if job.job_id not in expired_before:
                     buckets["expired"].append({**job.redacted(), "queue_reason": None})
-            deadline = self._monotonic() + limits.max_tick_seconds
-            for candidate in outbox.ready(limit=limits.max_jobs_per_tick):
+            for candidate in outbox.ready(limit=limits.max_jobs_per_tick - examined):
                 if self._monotonic() >= deadline:
                     truncated = True
                     break
@@ -1666,11 +1770,62 @@ class FleetController:
             **outbox.tick_status(),
         }
 
+    def _reconcile_outbox_job(
+        self, job: OutboxJob, generation: int, owner: str
+    ) -> tuple[str, dict[str, Any]]:
+        """Read saved execution evidence without ever opening a new launch.
+
+        Even a not-found receipt cannot prove an attempted mutation unstarted:
+        the original sender may still be in flight. Keep uncertainty and its
+        capacity until explicit recovery establishes the target outcome.
+        """
+        outbox = self._outbox
+        assert outbox is not None
+        record = None
+        try:
+            if job.request_id is not None:
+                try:
+                    record = self.store.get(job.request_id)
+                except ValidationError:
+                    pass
+                if record is not None and record.digest != job.digest:
+                    raise IdempotencyConflict("saved execution has a different digest")
+                if (
+                    record is None or record.thread_id is None
+                ) and self.config.coordination_mode == "target-authoritative":
+                    matches = self._lookup_targets(
+                        job.request_id,
+                        target_hint=job.host if job.host in self.config.hosts else None,
+                    )
+                    if (
+                        len(matches) == 1
+                        and matches[0].get("request_digest") == job.digest
+                    ):
+                        record = self.store.import_receipt(matches[0])
+        except FleetError:
+            # Failure to read a receipt is uncertainty, not permission to retry.
+            record = None
+        if record is not None and record.thread_id is not None:
+            updated = outbox.mark_dispatched(
+                job.job_id,
+                generation,
+                owner,
+                request_id=record.request_id,
+                host=record.host,
+            )
+            return "dispatched", {**updated.redacted(), "queue_reason": None}
+        updated = outbox.mark_held(
+            job.job_id, generation, owner, request_id=job.request_id, host=job.host
+        )
+        return "held", {**updated.redacted(), "queue_reason": None}
+
     def _drain_job(
         self,
         job: OutboxJob,
         generation: int,
         owner: str,
+        *,
+        immediate: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """One fenced dispatch attempt for one queued job.
 
@@ -1681,6 +1836,8 @@ class FleetController:
         """
         outbox = self._outbox
         assert outbox is not None
+        if job.request_id is not None and job.execution_state == "unknown":
+            return self._reconcile_outbox_job(job, generation, owner)
         payload = outbox.payload(job.job_id)
         if payload is None:
             # Retention already took the payload, so there is nothing left to
@@ -1715,6 +1872,8 @@ class FleetController:
                 request_id=error.request_id or recorded["request_id"],
                 host=recorded["host"],
             )
+            if immediate:
+                raise
             return "held", {**updated.redacted(), "queue_reason": None}
         except HostUnavailable as error:
             updated = outbox.reschedule(
@@ -1725,21 +1884,29 @@ class FleetController:
             updated = outbox.mark_failed(
                 job.job_id, generation, owner, disposition="failed-policy"
             )
+            if immediate:
+                raise
             return "blocked", {**updated.redacted(), "queue_reason": error.reason}
         except PolicyRevisionConflict:
             updated = outbox.mark_failed(
                 job.job_id, generation, owner, disposition="failed-policy"
             )
+            if immediate:
+                raise
             return "blocked", {**updated.redacted(), "queue_reason": None}
         except IdempotencyConflict:
             updated = outbox.mark_failed(
                 job.job_id, generation, owner, disposition="failed-conflict"
             )
+            if immediate:
+                raise
             return "blocked", {**updated.redacted(), "queue_reason": None}
         except ValidationError:
             updated = outbox.mark_failed(
                 job.job_id, generation, owner, disposition="failed-invalid"
             )
+            if immediate:
+                raise
             return "blocked", {**updated.redacted(), "queue_reason": None}
         state = result.get("state")
         request_id = result.get("request_id") or recorded["request_id"]
@@ -1752,7 +1919,10 @@ class FleetController:
                 request_id=request_id,
                 host=host_id,
             )
-            return "dispatched", {**updated.redacted(), "queue_reason": None}
+            return "dispatched", result if immediate else {
+                **updated.redacted(),
+                "queue_reason": None,
+            }
         # The dispatch path returned without an error and without a started
         # turn, which is exactly the shape a replayed attempt takes when a
         # previous one may already have been accepted. It is held, not retried.
@@ -1761,7 +1931,9 @@ class FleetController:
         )
         return "held", {**updated.redacted(), "queue_reason": None}
 
-    def status(self, request_id: str, *, include_output: bool = False) -> dict[str, Any]:
+    def status(
+        self, request_id: str, *, include_output: bool = False
+    ) -> dict[str, Any]:
         record = self._record_or_discover(request_id)
         if record.thread_id is None:
             return self._result(record)

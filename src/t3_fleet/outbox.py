@@ -122,6 +122,7 @@ class OutboxJob:
     updated_at: float
     expires_at: float
     next_attempt_at: float
+    lease_owner: str | None = None
 
     def redacted(self) -> dict[str, Any]:
         """The machine-readable view that may leave this process.
@@ -264,6 +265,17 @@ class OutboxStore:
                 INSERT OR IGNORE INTO outbox_tick (id) VALUES (1);
                 """
             )
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("PRAGMA user_version").fetchone()[0] == 0:
+                # Older writers saved an ID before dispatch but never recorded
+                # whether they crossed the mutation boundary. Do not infer
+                # absence from their default execution_state after a restart.
+                connection.execute(
+                    "UPDATE outbox_jobs SET execution_state = 'unknown' "
+                    "WHERE state = 'queued' AND request_id IS NOT NULL "
+                    "AND execution_state = 'never-dispatched'"
+                )
+                connection.execute("PRAGMA user_version = 1")
 
     # -- reading -------------------------------------------------------
 
@@ -282,6 +294,7 @@ class OutboxStore:
             repository=row["repository"],
             payload_purged=bool(row["payload_purged"]),
             lease_generation=row["lease_generation"],
+            lease_owner=row["lease_owner"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             expires_at=row["expires_at"],
@@ -304,7 +317,9 @@ class OutboxStore:
             ).fetchone()
         if row is None or row["intent_json"] is None or row["prompt"] is None:
             return None
-        return OutboxPayload(intent=json.loads(row["intent_json"]), prompt=row["prompt"])
+        return OutboxPayload(
+            intent=json.loads(row["intent_json"]), prompt=row["prompt"]
+        )
 
     def jobs(self, *, state: str | None = None) -> list[OutboxJob]:
         query = "SELECT * FROM outbox_jobs"
@@ -336,14 +351,19 @@ class OutboxStore:
         repository: str | None,
         request_id: str | None = None,
         disposition: str = "queued-blocked",
+        initial_owner: str | None = None,
     ) -> OutboxJob:
         """Store one explicitly submitted job, or return the one already stored.
 
         The digest is the caller's own payload identity, so submitting the same
         work twice while it is still queued is one job rather than two. Nothing
         about the machine that just refused it is part of that identity: the
-        stored host is a record of where the attempt went, never an input to
-        the retry.
+        stored host identifies an execution to reconcile, while the policy
+        session determines whether its reservation may be reused.
+
+        An initial owner takes the claim in this same insert transaction. A
+        duplicate submit receives the existing row and cannot become a second
+        independent dispatcher. Initial attempts do not consume drain budget.
         """
         if disposition not in DISPOSITIONS:
             raise ValidationError("unsupported outbox disposition")
@@ -352,6 +372,8 @@ class OutboxStore:
             # central decision and reservation, so it is never re-queued here as
             # fresh routable ordinary work.
             raise ValidationError("an adopted delegation cannot be queued locally")
+        if not isinstance(prompt, str) or not prompt:
+            raise ValidationError("prompt must be a non-empty string")
         encoded_prompt = prompt.encode("utf-8")
         if not prompt or len(encoded_prompt) > self.limits.max_prompt_bytes:
             raise ValidationError("outbox prompt exceeds the configured size limit")
@@ -378,10 +400,10 @@ class OutboxStore:
                 INSERT INTO outbox_jobs
                     (job_id, digest, state, disposition, execution_state, attempts,
                      request_id, parent_request_id, host, repository, intent_json,
-                     prompt, payload_purged, lease_generation, created_at, updated_at,
-                     expires_at, next_attempt_at)
+                     prompt, payload_purged, lease_owner, lease_expires_at,
+                     lease_generation, created_at, updated_at, expires_at, next_attempt_at)
                 VALUES (?, ?, 'queued', ?, 'never-dispatched', 0, ?, NULL, ?, ?, ?, ?,
-                        0, 0, ?, ?, ?, ?)
+                        0, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -392,6 +414,11 @@ class OutboxStore:
                     repository,
                     encoded_intent,
                     prompt,
+                    initial_owner,
+                    now + self.limits.lease_seconds
+                    if initial_owner is not None
+                    else None,
+                    1 if initial_owner is not None else 0,
                     now,
                     now,
                     now + self.limits.retention_seconds,
@@ -406,27 +433,32 @@ class OutboxStore:
     def _purge_expired(connection: sqlite3.Connection, now: float) -> None:
         """Drop the payload of everything past its retention window.
 
-        A queued job that never left the queue becomes `expired`, and it keeps
-        `never-dispatched` because that is what is actually known about it: no
-        drain attempt ever reached a target with it. A held job keeps its own
-        state and its `unknown` execution state; only its payload goes. The
+        Only a proven unstarted queued job becomes `expired`. A saved possible
+        acceptance becomes held, retaining its execution ID and uncertainty.
+        A live owner's claim is preserved so expiry cannot admit a competing
+        dispatch or fence out its eventual acceptance record. The
         window bounds prompt retention in live records. It guarantees neither
         physical erasure from storage copies nor that a run has stopped.
         """
         connection.execute(
             """
             UPDATE outbox_jobs
-               SET state = 'expired',
-                   disposition = 'expired-retention',
+               SET state = CASE WHEN execution_state = 'never-dispatched'
+                                THEN 'expired' ELSE 'held' END,
+                   disposition = CASE WHEN execution_state = 'never-dispatched'
+                                      THEN 'expired-retention'
+                                      ELSE 'held-acceptance-unknown' END,
                    intent_json = NULL,
                    prompt = NULL,
                    payload_purged = 1,
                    lease_owner = NULL,
                    lease_expires_at = NULL,
+                   lease_generation = lease_generation + 1,
                    updated_at = ?
              WHERE state = 'queued' AND expires_at <= ?
+               AND (lease_owner IS NULL OR lease_expires_at <= ?)
             """,
-            (now, now),
+            (now, now, now),
         )
         connection.execute(
             """
@@ -435,7 +467,7 @@ class OutboxStore:
                    prompt = NULL,
                    payload_purged = 1,
                    updated_at = ?
-             WHERE state != 'queued' AND expires_at <= ? AND payload_purged = 0
+             WHERE expires_at <= ? AND payload_purged = 0
             """,
             (now, now),
         )
@@ -478,7 +510,9 @@ class OutboxStore:
             ).fetchone()
             if row is None or row["state"] != "queued":
                 return None
-            held = row["lease_owner"] is not None and (row["lease_expires_at"] or 0) > now
+            held = (
+                row["lease_owner"] is not None and (row["lease_expires_at"] or 0) > now
+            )
             if held:
                 return None
             generation = row["lease_generation"] + 1
@@ -524,6 +558,20 @@ class OutboxStore:
             ).fetchall()
         return [self._job(row) for row in rows]
 
+    def expiring(self, *, limit: int) -> list[OutboxJob]:
+        """Attempted queued jobs needing receipt reconciliation before expiry."""
+        now = self._clock()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM outbox_jobs WHERE state = 'queued' "
+                "AND request_id IS NOT NULL AND execution_state != 'never-dispatched' "
+                "AND expires_at <= ? "
+                "AND (lease_owner IS NULL OR lease_expires_at <= ?) "
+                "ORDER BY created_at, job_id LIMIT ?",
+                (now, now, max(0, limit)),
+            ).fetchall()
+        return [self._job(row) for row in rows]
+
     def _fenced(
         self,
         job_id: str,
@@ -564,16 +612,16 @@ class OutboxStore:
         """Record the execution identity a drain attempt is about to use.
 
         Written before the attempt can mutate anything on a target, so a crash
-        during dispatch still leaves the identity behind. The next tick replays
-        that exact identity instead of minting a second one, which is what makes
-        a duplicate execution impossible across a restart. The attempt itself
-        was already counted at claim time; this records only the identity.
+        during dispatch still leaves the identity and possible acceptance
+        behind. The next tick reconciles that identity before any placement.
+        Only a definitive pre-launch refusal may reset the execution state and
+        make the intent replayable. This records no additional drain attempt.
         """
         return self._fenced(
             job_id,
             generation,
             owner,
-            "request_id = ?, host = COALESCE(?, host)",
+            "request_id = ?, host = COALESCE(?, host), execution_state = 'unknown'",
             (request_id, host),
         )
 
@@ -681,10 +729,15 @@ class OutboxStore:
             generation,
             owner,
             (
-                "disposition = 'queued-retry', host = COALESCE(?, host), "
+                "disposition = ?, host = COALESCE(?, host), "
+                "execution_state = 'never-dispatched', "
                 "next_attempt_at = ?, lease_owner = NULL, lease_expires_at = NULL"
             ),
-            (host, self._clock() + delay),
+            (
+                "queued-retry" if job.attempts else "queued-blocked",
+                host,
+                self._clock() + delay if job.attempts else self._clock(),
+            ),
         )
 
     def release(self, job_id: str, generation: int, owner: str) -> None:
