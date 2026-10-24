@@ -61,7 +61,7 @@ class RecordingOpener:
 INVALID_ORIGINS = (
     None, 42, [], {}, "", "http://example.invalid:3773", "https://example.invalid",
     "http://localhost:3773", "http://127.0.0.1.example.invalid", "ftp://127.0.0.1",
-    "http://user:private@127.0.0.1", "http://@127.0.0.1", "http://127.0.0.1/path",
+    "http://user:private@127.0.0.1", "http://@127.0.0.1", "http://127.0.0.1/path",  # content-guard: allow infrastructure/ssh-private-target
     "http://127.0.0.1?private", "http://127.0.0.1#private", "http://127.0.0.1?", "http://127.0.0.1#",
     "http://127.0.0.1:bad", "http://127.0.0.1:65536", "http://127.0.0.1:0", "http://127.0.0.1:",
     "http://[::1", "http://[::1%25lo]:3773", "http://127.1", "http://2130706433",

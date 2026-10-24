@@ -62,7 +62,7 @@ def windows_host() -> HostConfig:
             "-NoProfile",
             "-NonInteractive",
             "-File",
-            r"C:\Users\Example Operator\bin\t3-fleet-agent.ps1",
+            r"C:\Users\Example Operator\bin\t3-fleet-agent.ps1",  # content-guard: allow pii/windows-home-path
         ),
         active_limit=2,
         expected_hostname="windows-worker",
@@ -839,7 +839,7 @@ class TransportTests(unittest.TestCase):
                 "windows-worker",
                 (
                     "powershell.exe -NoProfile -NonInteractive -File "
-                    '"C:\\Users\\Example Operator\\bin\\t3-fleet-agent.ps1"'
+                    '"C:\\Users\\Example Operator\\bin\\t3-fleet-agent.ps1"'  # content-guard: allow pii/windows-home-path
                 ),
             ],
         )
