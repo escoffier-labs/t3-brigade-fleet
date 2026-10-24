@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +26,42 @@ def diagnostic_controller(config, transport):
     controller = FleetController(config, Mock(), transport)
     controller.refresh_submit_health = Mock()
     return controller
+
+
+class CliModuleTests(unittest.TestCase):
+    def invoke(self, *argv: str) -> subprocess.CompletedProcess[str]:
+        source = Path(__file__).resolve().parents[1] / "src"
+        with tempfile.TemporaryDirectory() as directory:
+            return subprocess.run(
+                [sys.executable, "-B", "-m", "t3_fleet.cli", *argv],
+                cwd=directory,
+                env={
+                    "PYTHONPATH": str(source),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "HOME": directory,
+                },
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+    def test_module_help_prints_usage(self) -> None:
+        result = self.invoke("--help")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("usage: t3-fleet", result.stdout)
+        self.assertIn("submit", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_module_invalid_command_propagates_error_exit_code(self) -> None:
+        result = self.invoke("not-a-command")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(len(result.stdout.strip().splitlines()), 1)
+        self.assertEqual(json.loads(result.stdout)["error"]["code"], "invalid_request")
+        self.assertEqual(result.stderr, "t3-fleet: invalid_request\n")
 
 
 class CliTests(unittest.TestCase):

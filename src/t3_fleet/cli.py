@@ -917,3 +917,7 @@ def main(
     finally:
         if application is not None:
             application.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
