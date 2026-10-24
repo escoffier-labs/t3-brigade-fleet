@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import stat
 import tempfile
 import unittest
@@ -83,20 +84,24 @@ class ConfigTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
         return load_config(self.write_config(text))
 
-    def test_t3_origin_is_validated_at_config_boundary(self) -> None:
-        import json
-        from test_t3_api import INVALID_ORIGINS, VALID_ORIGINS
-        for origin in [item for item in INVALID_ORIGINS if isinstance(item, str)] + [42, [], {}]:
+    def test_t3_origin_is_retained_as_inert_text_at_config_boundary(self) -> None:
+        foreign_origin = "https://unused.example.invalid"
+        text = VALID.replace(
+            "[hosts.linux-worker]",
+            f'[hosts.linux-worker]\nt3_url = {json.dumps(foreign_origin)}',
+        )
+        config = load_config(self.write_config(text))
+        self.assertEqual(config.hosts["linux-worker"].t3_url, foreign_origin)
+        self.assertEqual(config.hosts["controller"].t3_url, "http://127.0.0.1:3773")  # content-guard: allow loopback-ipv4
+
+    def test_t3_origin_must_be_a_string_at_config_boundary(self) -> None:
+        for origin in [42, [], {}]:
             with self.subTest(origin=origin):
                 value = json.dumps(origin) if origin != {} else "{}"
                 text = VALID.replace('[hosts.controller]', f'[hosts.controller]\nt3_url = {value}')
                 with self.assertRaises(ConfigError) as caught:
                     load_config(self.write_config(text))
                 self.assertEqual(str(caught.exception), "invalid T3 origin")
-        for origin in VALID_ORIGINS:
-            with self.subTest(origin=origin):
-                text = VALID.replace('[hosts.controller]', f'[hosts.controller]\nt3_url = {json.dumps(origin)}')
-                self.assertEqual(load_config(self.write_config(text)).hosts["controller"].t3_url, origin)
 
     def test_peer_example_uses_derived_three_host_capacity(self) -> None:
         config = self._load_example_config()

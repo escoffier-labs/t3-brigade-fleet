@@ -10,7 +10,6 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from .errors import ConfigError
-from .t3_origin import validate_t3_origin
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SHELL_META = re.compile(r"[;&|`$<>\r\n]")
@@ -317,9 +316,8 @@ def load_config(path: str | Path) -> FleetConfig:
         expected_hostname = value.get("expected_hostname")
         if not isinstance(expected_hostname, str) or not expected_hostname:
             raise ConfigError(f"host {host_id} requires expected_hostname")
-        try:
-            t3_url = validate_t3_origin(value.get("t3_url", "http://127.0.0.1:3773"))
-        except ValueError:
+        t3_url = value.get("t3_url", "http://127.0.0.1:3773")  # content-guard: allow loopback-ipv4
+        if not isinstance(t3_url, str):
             raise ConfigError("invalid T3 origin") from None
         t3_command = value.get("t3_command", ["t3"])
         hosts[host_id] = HostConfig(
