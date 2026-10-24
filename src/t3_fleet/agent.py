@@ -64,6 +64,7 @@ from .policy import (
 )
 from .reporting import SCHEMA, report_event, validate_context
 from .t3_api import T3Client, T3SessionIssuer, normalize_model_selection
+from .t3_origin import validate_t3_origin
 from .target_store import (
     LAUNCH_GRACE_SECONDS,
     TargetClaim,
@@ -4119,6 +4120,10 @@ def _build_agent(environ: Mapping[str, str]) -> T3Agent:
         raise ConfigError("target configuration could not be read") from error
     host_id = _select_local_host(config, environ)
     host = config.hosts[host_id]
+    try:
+        t3_url = validate_t3_origin(host.t3_url)
+    except ValueError:
+        raise ConfigError("invalid T3 origin") from None
     if not host.enabled:
         raise ConfigError("configured target host is disabled")
     repositories = {
@@ -4149,7 +4154,7 @@ def _build_agent(environ: Mapping[str, str]) -> T3Agent:
             max_concurrent_per_repository=host.max_concurrent_per_repository,
             repository_lease_ttl=host.repository_lease_ttl_seconds,
         ),
-        T3Client(host.t3_url, issuer),
+        T3Client(t3_url, issuer),
     )
 
 

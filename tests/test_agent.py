@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from t3_fleet.agent import AgentPolicy, RepositoryPolicy, T3Agent, _agent_error
 from t3_fleet.errors import (
+    ConfigError,
     HostUnavailable,
     PolicyRejected,
     PolicyRevisionConflict,
@@ -4857,6 +4858,104 @@ class ContinuationAdmissionWindowTests(unittest.TestCase):
     def test_submit_admission_keeps_the_request_id_key(self) -> None:
         self.agent.handle(self.fixture.submit_request)
         self.assertEqual(self.admission.calls[0]["request_id"], "req-12345678")
+
+
+class AgentConstructionTests(unittest.TestCase):
+    def _config(self, target_origin: str, foreign_origin: str) -> str:
+        return f'''\
+schema = "t3-fleet.config.v1"
+controller_host = "target-a"
+global_active_limit = 2
+
+[hosts.target-a]
+enabled = true
+platform = "linux"
+transport = "local"
+agent_command = ["/opt/t3-fleet/bin/t3-fleet-agent"]
+active_limit = 1
+expected_hostname = "target-a"
+t3_url = {json.dumps(target_origin)}
+
+[hosts.target-b]
+enabled = true
+platform = "linux"
+transport = "ssh"
+ssh_alias = "target-b"
+agent_command = ["/opt/t3-fleet/bin/t3-fleet-agent"]
+active_limit = 1
+expected_hostname = "target-b"
+t3_url = {json.dumps(foreign_origin)}
+
+[repositories.example]
+default_branch = "main"
+branch_prefix = "codex/"
+
+[repositories.example.paths]
+target-a = "/srv/repos/example"
+target-b = "/srv/repos/example"
+'''
+
+    def _write_config(self, directory: str, text: str) -> Path:
+        path = Path(directory) / "fleet.toml"
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def test_build_uses_valid_selected_origin_and_retains_foreign_origin(self) -> None:
+        from t3_fleet import agent as agent_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_config(
+                directory,
+                self._config(
+                    "http://127.0.0.1:3773",  # content-guard: allow loopback-ipv4
+                    "https://unused.example.invalid",
+                ),
+            )
+            built = agent_module._build_agent(
+                {"T3_FLEET_CONFIG": str(path), "T3_FLEET_HOST": "target-a"}
+            )
+        self.assertEqual(built.policy.host_id, "target-a")
+        self.assertEqual(built.t3._base_url, "http://127.0.0.1:3773/")  # content-guard: allow loopback-ipv4
+
+    def test_build_rejects_each_invalid_selected_origin_before_client_construction(self) -> None:
+        from unittest.mock import patch
+
+        from t3_fleet import agent as agent_module
+
+        cases = (
+            ("target-a", "https://selected.example.invalid", "http://127.0.0.1:3774"),  # content-guard: allow loopback-ipv4
+            ("target-b", "http://127.0.0.1:3773", "https://foreign.example.invalid"),  # content-guard: allow loopback-ipv4
+        )
+        for selected, target_origin, foreign_origin in cases:
+            with self.subTest(selected=selected), tempfile.TemporaryDirectory() as directory:
+                path = self._write_config(
+                    directory,
+                    self._config(target_origin, foreign_origin),
+                )
+                original_select = agent_module._select_local_host
+                with (
+                    patch.object(
+                        agent_module,
+                        "_select_local_host",
+                        wraps=original_select,
+                    ) as select,
+                    patch.object(
+                        agent_module,
+                        "T3SessionIssuer",
+                        side_effect=AssertionError("issuer constructed before origin validation"),
+                    ),
+                    patch.object(
+                        agent_module,
+                        "T3Client",
+                        side_effect=AssertionError("client constructed before origin validation"),
+                    ),
+                ):
+                    with self.assertRaisesRegex(ConfigError, "invalid T3 origin"):
+                        agent_module._build_agent(
+                            {"T3_FLEET_CONFIG": str(path), "T3_FLEET_HOST": selected}
+                        )
+                select.assert_called_once()
 
 
 class AgentNotStartedMarkerTests(unittest.TestCase):
