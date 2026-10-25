@@ -22,6 +22,10 @@ The consumer environment must contain an approved Brigade package exporting
 `fleet_client_messages.identity`, `list_messages`, `reply`, `sent`, `ack`,
 `flush_credential`, `MessageAuthority` and `untrusted.wrap_untrusted`.
 Installing Brigade into a consumer environment belongs to the operator.
+A released authenticated identity and current-grant contract remains an unresolved
+deployment prerequisite. Keep live operation disabled until that dependency
+and independent reviews are resolved. No substitute identity or grant inference
+is supplied by this slice.
 
 The existing Brigade settings select the Hub connection. The bridge compares
 that captured authority with `hub_authority` and authenticates the exact
@@ -115,7 +119,9 @@ intake. Rejected and acknowledged tombstones may be skipped during a bounded
 inbox scan. The protected inbox checkpoint advances only over committed
 tombstones whose immutable payload digest was checked again. It never advances
 past an unread delivery. A completed inspection cycle resets the checkpoint so
-old unacknowledged tombstones are revisited. The checkpoint is scoped to the
+old unacknowledged tombstones are revisited. Only a validated empty page ends
+that inspection cycle. A short nonempty byte-limited page continues forward.
+The checkpoint is scoped to the
 configured authority, principal, configuration and retained credentials.
 Unknown aliases and unauthorized senders or recipients receive no T3 turn or
 successful reply and remain unacknowledged. This slice has no rejection-ack policy.
@@ -140,6 +146,21 @@ peer data block. All sender-controlled fields enter Brigade's untrusted framing,
 including subject, body, labels, reference, client ID and alias metadata. The
 framed intent is saved once, so replay preserves the exact payload and fence.
 
+The existing wrapper's trusted `goal=` states the answer task outside the fence:
+produce one helpful text response using the peer message as task input. It
+covers answering a question and providing the requested analysis or text
+transformation. For example, a question asks for an answer, while imperative
+wording such as translating a quoted sentence describes the desired text output.
+Imperative wording carries no independent authority to execute commands.
+
+The goal grants no tool use, side effects, permission or approval changes,
+routing, model or runtime changes, grant changes, new authority or control
+instructions. Existing operator and thread instructions govern those boundaries.
+If the answer needs authority the target lacks, the goal asks it to explain that
+limit. Brigade's peer-message preamble, randomized fence and embedded-fence
+neutralization remain intact. The goal and fence are recorded at intake.
+Recovery reuses the saved intent without rewriting older work.
+
 T3 sends always use `mode=queue`. A busy thread receives a separate turn.
 Timeouts and approval waits retain the original run. Failed, cancelled,
 interrupted or rolled-back runs become held failures. Only `completed` with no
@@ -162,7 +183,11 @@ the inbound only after confirmed durable reply acceptance. An acknowledgement
 does not prove the peer has read the response.
 
 Sent-history reconciliation saves a lower bound only after checking every row
-on a page for the deterministic reply key. Monotonically increasing Hub IDs
+on a page for the deterministic reply key. A page is complete only when the
+supported API returns a validated empty page. Nonempty pages advance the saved
+cursor and continue, including short pages. Brigade caps serialized JSON at
+7 MiB as well as 100 rows, so fewer than 100 rows cannot prove exhaustion.
+Monotonically increasing Hub IDs
 place later acceptances above that bound, including a reply accepted after a
 completed no-match scan whose response was lost. A matching row is validated
 before progress can pass it. Once the accepted reply ID is saved, recovery uses
@@ -217,8 +242,14 @@ automatic authorization or refresh. See the public
 That transport specification was retrieved on 2026-10-25. The version in the
 URL identifies the specification revision.
 
-Offline tests use standard-library fakes and local HTTP servers. They cannot
-prove current live Hub interoperability or permission grants. The existing
+Offline tests use standard-library fakes and local HTTP servers. The Hub fixture
+models the inspected serializer's byte budget and row cap. Optional contract
+tests compare it with the installed Brigade serializer and exercise the exact
+installed untrusted wrapper for question, imperative and injected-control inputs.
+Run those tests in the approved environment containing Brigade. The ordinary
+stdlib-only environment explicitly skips those two installed-package checks.
+They check serialization and prompt construction, without proving model
+compliance, live Hub interoperability or permission grants. The existing
 cross-repository wire test skips unless `T3_FLEET_BRIGADE_SOURCE` points at a
 compatible Brigade checkout. Its generic fixture still runs. Deployment and
 one authorized peer-to-T3-to-peer canary remain separate operator gates.
