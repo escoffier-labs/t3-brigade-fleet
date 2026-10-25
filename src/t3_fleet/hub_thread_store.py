@@ -124,6 +124,9 @@ class BridgeStore:
                     CREATE TABLE IF NOT EXISTS drainer (
                         singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner INTEGER
                     );
+                    CREATE TABLE IF NOT EXISTS inbox_scans (
+                        scope TEXT PRIMARY KEY, after_id INTEGER NOT NULL CHECK(after_id>=0)
+                    );
                 """)
         except BaseException:
             self.close()
@@ -177,6 +180,17 @@ class BridgeStore:
         with self.transaction():
             self.db.execute("INSERT INTO deliveries VALUES (?,?) ON CONFLICT(delivery_key) DO UPDATE SET record=excluded.record",
                             (record["delivery_key"], json.dumps(record, sort_keys=True, separators=(",", ":"))))
+
+    def inbox_after(self, scope: str) -> int:
+        row = self.db.execute("SELECT after_id FROM inbox_scans WHERE scope=?", (scope,)).fetchone()
+        return row[0] if row is not None else 0
+
+    def save_inbox_after(self, scope: str, after: int) -> None:
+        # Callers advance only over checked, committed delivery tombstones.
+        # A crash before this commit repeats inspection, never skips intake.
+        with self.transaction():
+            self.db.execute("INSERT INTO inbox_scans VALUES (?,?) ON CONFLICT(scope) DO UPDATE SET after_id=excluded.after_id",
+                            (scope, after))
 
     def pending(self) -> dict | None:
         # The first retained work blocks new intake, including operator-held work.

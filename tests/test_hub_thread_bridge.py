@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import patch
 
 from t3_fleet import cli
-from t3_fleet.hub_thread_bridge import Bridge, BridgeError, PublicMCP, load_config, load_oauth
+from t3_fleet.hub_thread_bridge import Bridge, BridgeError, PublicMCP, digest, payload_identity, stable_key, load_config, load_oauth
 from t3_fleet.hub_thread_store import BridgeStore
 
 
@@ -43,6 +43,10 @@ class FakeHub:
         self.lose_reply = self.lose_ack = False
         self.mismatch = False
         self.revoked = False
+        self.sent_history = []
+        self.sent_reads = []
+        self.inbox_reads = []
+        self.before_reply_rows = 0
 
     def identity(self):
         if self.revoked:
@@ -50,8 +54,9 @@ class FakeHub:
         return self.principal
 
     def inbox(self, *, after=0, unacked=False):
+        self.inbox_reads.append((after, unacked))
         rows = [copy.deepcopy(m) for m in self.messages if m["id"] > after
-                and (not unacked or m["id"] not in self.acked)]
+                and (not unacked or m["id"] not in self.acked)][:100]
         return {"messages": rows, "next_cursor": rows[-1]["id"] if rows else after}
 
     def frame(self, text):
@@ -64,7 +69,10 @@ class FakeHub:
         if self.queued:
             return {"queued": True, "client_id": client_id}
         if client_id not in self.replies:
-            m = inbound(100 + len(self.replies))
+            self.add_history(self.before_reply_rows)
+            self.before_reply_rows = 0
+            previous = [m["id"] for m in [*self.sent_history, *self.replies.values()]]
+            m = inbound(max([99, *previous]) + 1)
             m.update(sender=self.principal, recipient="agent:peer-a", body=body,
                      reply_to=message_id, client_id=client_id)
             self.replies[client_id] = m
@@ -76,8 +84,17 @@ class FakeHub:
             row["recipient"] = "agent:other"
         return {"message": row}
 
-    def sent(self, *, after=0):
-        rows = [copy.deepcopy(m) for m in self.replies.values() if m["id"] > after]
+    def add_history(self, count):
+        start = max([0, *(m["id"] for m in self.sent_history), *(m["id"] for m in self.replies.values())])
+        for message_id in range(start + 1, start + count + 1):
+            row = inbound(message_id)
+            row.update(sender=self.principal, recipient="agent:peer-a", client_id=f"unrelated-{message_id}")
+            self.sent_history.append(row)
+
+    def sent(self, *, after=0, ids=None):
+        self.sent_reads.append((after, ids))
+        rows = sorted([*self.sent_history, *self.replies.values()], key=lambda m: m["id"])
+        rows = [copy.deepcopy(m) for m in rows if m["id"] > after and (ids is None or m["id"] in ids)][:100]
         return {"messages": rows, "next_cursor": rows[-1]["id"] if rows else after}
 
     def reconcile(self):
@@ -108,12 +125,13 @@ class FakeT3:
                            runtimeMode="approval-required", archived=False)
         self.pages = None
         self.chunks = {}
+        self.continuation_failures = 0
 
     def item(self, **values):
         return dict(itemId="item-a", messageId="answer-a", sourceThreadId="thread-a",
                     runId="run-a", type="assistant_message", status="completed",
                     visibility="local", text=self.result, textTruncated=False,
-                    nextTextOffset=None, **values)
+                    nextTextOffset=None, position=0, **values)
 
     def call(self, name, args):
         self.calls.append((name, copy.deepcopy(args)))
@@ -138,6 +156,9 @@ class FakeT3:
                         timedOut=self.status in {"running", "queued", "waiting"})
         if name == "t3_thread_read":
             if "itemId" in args:
+                if self.continuation_failures:
+                    self.continuation_failures -= 1
+                    raise OSError("offline continuation response lost")
                 items = self.chunks[args["textOffset"]]
                 return dict(thread=self.thread, items=items, hasMore=False, nextPosition=None)
             if args.get("maxCharsPerItem") == 1:
@@ -146,6 +167,13 @@ class FakeT3:
                 return copy.deepcopy(self.pages[args.get("afterPosition", 0)])
             return dict(thread=self.thread, items=[self.item()], hasMore=False, nextPosition=None)
         raise AssertionError(name)
+
+
+def drain_in_process(path, hub, t3, pipe):
+    """A fresh process opens only the real fixture ledger, never live clients."""
+    result = Bridge(Path(path), hub=hub, t3=t3).drain()
+    pipe.send((result, hub, t3))
+    pipe.close()
 
 
 def hold_claim(path, pipe):
@@ -335,6 +363,226 @@ class RelayTests(unittest.TestCase):
         self.t3.chunks = {9: [tail]}
         self.assertEqual(self.drain()["state"], "acked")
         self.assertEqual(next(iter(self.hub.replies.values()))["body"], "Answer 🧪 complete")
+
+    def process_drain(self):
+        parent, child = multiprocessing.Pipe()
+        process = multiprocessing.Process(target=drain_in_process,
+                                          args=(str(self.config_path), self.hub, self.t3, child))
+        process.start()
+        child.close()
+        try:
+            self.assertTrue(parent.poll(10), "offline drain did not return")
+            result, self.hub, self.t3 = parent.recv()
+        finally:
+            process.join(5)
+            if process.is_alive():
+                process.kill()
+                process.join(5)
+            parent.close()
+        self.assertEqual(process.exitcode, 0)
+        return result
+
+    def test_split_utf16_surrogate_pair_survives_process_replay(self):
+        first = self.t3.item()
+        first.update(text="a" * 7999 + "\ud83e", textTruncated=True, nextTextOffset=8000)
+        tail = copy.deepcopy(first)
+        tail.update(text="\uddea" + "z", textTruncated=False, nextTextOffset=None)
+        self.t3.pages = {0: dict(thread=self.t3.thread, items=[first], hasMore=False, nextPosition=None)}
+        self.t3.chunks = {8000: [tail]}
+        self.t3.lose_send = True
+        self.t3.continuation_failures = 1
+        self.assertEqual(self.process_drain()["state"], "dispatch-intent")
+        self.assertEqual(self.process_drain()["state"], "dispatched")
+        self.assertEqual(self.counts(), (1, 0, 0))
+        self.assertEqual(self.process_drain()["state"], "acked")
+        self.assertEqual(next(iter(self.hub.replies.values()))["body"], "a" * 7999 + "🧪z")
+        self.assertEqual(self.counts(), (1, 1, 1))
+        self.process_drain()
+        self.assertEqual(self.hub.reply_calls, 1)
+        self.assertEqual(self.t3.send_calls, 2)  # Same retained request key replayed.
+
+    def test_malformed_final_surrogates_hold_and_split_pair_obeys_byte_cap(self):
+        for first_text, tail_text, reason in (("\ud83e", "x", "result-ambiguous"),
+                                               ("\uddea", None, "result-ambiguous"),
+                                               ("a" * 7999 + "\ud83e", "\uddea" + "x" * 57534, "result-oversized")):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                Path(directory).chmod(0o700)
+                self.config["ledger_file"] = str(Path(directory) / "relay.db")
+                self.write(self.config_path, self.config)
+                self.hub, self.t3 = FakeHub(), FakeT3()
+                item = self.t3.item()
+                item.update(text=first_text, textTruncated=tail_text is not None,
+                            nextTextOffset=len(first_text) if tail_text is not None else None)
+                self.t3.pages = {0: dict(thread=self.t3.thread, items=[item], hasMore=False, nextPosition=None)}
+                if tail_text is not None:
+                    offset = len(first_text)
+                    while tail_text:
+                        chunk, tail_text = tail_text[:8000], tail_text[8000:]
+                        tail = copy.deepcopy(item)
+                        tail.update(text=chunk, textTruncated=bool(tail_text),
+                                    nextTextOffset=offset + len(chunk) if tail_text else None)
+                        self.t3.chunks[offset] = [tail]
+                        offset += len(chunk)
+                result = self.drain()
+                self.assertEqual((result["state"], result["reason"]), ("held", reason))
+                self.assertEqual(self.counts(), (1, 0, 0))
+
+    def test_long_sent_history_continues_after_process_restart_and_uses_exact_id(self):
+        self.hub.add_history(3201)
+        first = self.process_drain()
+        self.assertEqual((first["state"], first["reason"]), ("reply-intent", "bounded-limit"))
+        self.assertEqual(self.counts(), (1, 0, 0))
+        self.hub.sent_reads.clear()
+        self.assertEqual(self.process_drain()["state"], "acked")
+        self.assertEqual(self.counts(), (1, 1, 1))
+        self.assertEqual(self.hub.reply_calls, 1)
+        reply_id = next(iter(self.hub.replies.values()))["id"]
+        self.assertEqual(self.hub.sent_reads[0], (3200, None))
+        self.assertIn((0, [reply_id]), self.hub.sent_reads)
+        self.assertEqual(self.t3.send_calls, 1)
+
+    def test_reply_loss_after_completed_scan_does_not_skip_match_or_resend_early(self):
+        self.hub.add_history(3201)
+        self.assertEqual(self.drain()["reason"], "bounded-limit")
+        # Acceptance happens after a completed scan but behind another 33 pages.
+        self.hub.before_reply_rows = 3201
+        self.hub.lose_reply = True
+        self.assertEqual(self.drain()["state"], "reply-intent")
+        self.assertEqual(self.counts(), (1, 1, 0))
+        self.assertEqual(self.hub.reply_calls, 1)
+        self.assertEqual(self.drain()["reason"], "bounded-limit")
+        self.assertEqual(self.hub.reply_calls, 1)
+        self.assertEqual(self.drain()["state"], "acked")
+        self.assertEqual(self.counts(), (1, 1, 1))
+        self.assertEqual(self.hub.reply_calls, 1)
+        self.assertEqual(self.t3.send_calls, 1)
+
+    def test_sent_scan_crash_after_no_match_page_keeps_progress(self):
+        self.hub.add_history(3201)
+        original = BridgeStore.save
+        def crash(store, record):
+            original(store, record)
+            if record.get("sent_cursor") == 100:
+                raise KeyboardInterrupt()
+        with patch.object(BridgeStore, "save", crash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.drain()
+        self.hub.sent_reads.clear()
+        self.assertEqual(self.drain()["state"], "acked")
+        self.assertEqual(self.hub.sent_reads[0], (100, None))
+        self.assertEqual(self.counts(), (1, 1, 1))
+
+    def test_matching_sent_page_is_not_skipped_if_confirmation_save_crashes(self):
+        self.hub.lose_reply = True
+        self.assertEqual(self.drain()["state"], "reply-intent")
+        original = BridgeStore.save
+        def crash(store, record):
+            if record["state"] == "replied":
+                raise KeyboardInterrupt()
+            original(store, record)
+        with patch.object(BridgeStore, "save", crash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.drain()
+        self.assertEqual(self.drain()["state"], "acked")
+        self.assertEqual(self.counts(), (1, 1, 1))
+        self.assertEqual(self.hub.reply_calls, 1)
+
+    def test_timeline_over_32_pages_keeps_zero_based_candidate_and_detects_late_ambiguity(self):
+        for ambiguous in (False, True):
+            with self.subTest(ambiguous=ambiguous), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                Path(directory).chmod(0o700)
+                self.config["ledger_file"] = str(Path(directory) / "relay.db")
+                self.write(self.config_path, self.config)
+                self.hub, self.t3 = FakeHub(), FakeT3()
+                items = []
+                for position in range(3301):
+                    item = self.t3.item()
+                    item.update(itemId=f"item-{position}", position=position, runId="other-run")
+                    items.append(item)
+                items[0]["runId"] = "run-a"  # position zero must survive the checkpoint.
+                if ambiguous:
+                    items[-1]["runId"] = "run-a"
+                self.t3.pages = {}
+                for start in range(0, len(items), 100):
+                    page = items[start:start+100]
+                    self.t3.pages[0 if start == 0 else start-1] = dict(
+                        thread=self.t3.thread, items=page, hasMore=start+100 < len(items),
+                        nextPosition=page[-1]["position"] if start+100 < len(items) else None)
+                self.assertEqual(self.drain()["reason"], "bounded-limit")
+                self.assertEqual(self.counts(), (1, 0, 0))
+                self.t3.calls.clear()
+                result = self.drain()
+                self.assertEqual(result["state"], "held" if ambiguous else "acked")
+                reads = [args for name, args in self.t3.calls
+                         if name == "t3_thread_read" and args.get("maxCharsPerItem") != 1]
+                self.assertEqual(reads[0]["afterPosition"], 3199)
+                self.assertEqual(self.counts(), (1, 0, 0) if ambiguous else (1, 1, 1))
+                self.assertEqual(self.t3.send_calls, 1)
+
+    def test_rejected_inbox_scan_continues_only_past_committed_tombstones(self):
+        self.hub.messages[0]["thread"] = "unknown"
+        self.assertEqual(self.drain()["state"], "rejected")
+        with BridgeStore(self.root / "bridge.db") as store:
+            original = store.db.execute("SELECT record FROM deliveries").fetchone()[0]
+            for message_id in range(2, 3202):
+                message = inbound(message_id)
+                message["thread"] = "unknown"
+                self.hub.messages.append(message)
+                record = json.loads(original)
+                record.update(message_id=message_id, payload_digest=digest(payload_identity(message)),
+                              delivery_key=stable_key("in", [self.hub.authority, self.hub.principal, message_id]))
+                store.save(record)
+        self.hub.messages.append(inbound(3202))
+        self.hub.inbox_reads.clear()
+        first = self.drain()
+        self.assertEqual((first["state"], first["reason"]), ("pending", "bounded-limit"))
+        self.assertEqual(self.counts(), (0, 0, 0))
+        self.hub.inbox_reads.clear()
+        self.assertEqual(self.drain()["state"], "acked")
+        self.assertEqual(self.hub.inbox_reads[0], (3200, True))
+        self.assertEqual(self.counts(), (1, 1, 1))
+        self.assertEqual(self.hub.acked, {3202})
+
+    def test_exact_reply_lookup_rechecks_linkage_before_ack_retry(self):
+        self.hub.lose_ack = True
+        self.assertEqual(self.drain()["state"], "replied")
+        accepted = next(iter(self.hub.replies.values()))
+        accepted["recipient"] = "agent:other"
+        self.hub.sent_reads.clear()
+        self.assertEqual(self.drain()["reason"], "reply-mismatch")
+        self.assertEqual(self.hub.sent_reads, [(0, [accepted["id"]])])
+        self.assertEqual(self.hub.ack_calls, 1)
+        self.assertEqual(self.t3.send_calls, 1)
+        self.assertEqual(self.hub.reply_calls, 1)
+
+    def test_inbox_cursor_commit_crash_does_not_skip_unread_delivery(self):
+        self.hub.messages[0]["thread"] = "unknown"
+        self.assertEqual(self.drain()["state"], "rejected")
+        with BridgeStore(self.root / "bridge.db") as store:
+            original = store.db.execute("SELECT record FROM deliveries").fetchone()[0]
+            for message_id in range(2, 101):
+                message = inbound(message_id)
+                message["thread"] = "unknown"
+                self.hub.messages.append(message)
+                record = json.loads(original)
+                record.update(message_id=message_id, payload_digest=digest(payload_identity(message)),
+                              delivery_key=stable_key("in", [self.hub.authority, self.hub.principal, message_id]))
+                store.save(record)
+        self.hub.messages.append(inbound(101))
+        original = BridgeStore.save_inbox_after
+        def crash(store, scope, after):
+            original(store, scope, after)
+            if after == 100:
+                raise KeyboardInterrupt()
+        with patch.object(BridgeStore, "save_inbox_after", crash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.drain()
+        self.assertEqual(self.counts(), (0, 0, 0))
+        self.hub.inbox_reads.clear()
+        self.assertEqual(self.drain()["state"], "acked")
+        self.assertEqual(self.hub.inbox_reads[0], (100, True))
+        self.assertEqual(self.hub.acked, {101})
+        self.assertEqual(self.counts(), (1, 1, 1))
 
     def test_ambiguous_reasoning_wrong_run_and_oversized_results_hold(self):
         for kind in ("ambiguous", "reasoning", "wrong-run", "oversized", "stalled"):
@@ -574,9 +822,9 @@ class RelayTests(unittest.TestCase):
             self.assertIsNone(reference)
             self.assertEqual(priority, "normal")
             return self.hub.reply(message_id, body=body, client_id=client_id)
-        def sent(*, after, **kwargs):
+        def sent(*, after=0, ids=None, **kwargs):
             check(kwargs)
-            return self.hub.sent(after=after)
+            return self.hub.sent(after=after, ids=ids)
         def ack(message_id, *, timeout, **kwargs):
             check(kwargs)
             return self.hub.ack(message_id)

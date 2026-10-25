@@ -386,8 +386,8 @@ class BrigadeMessages:
         return self.client.reply(message_id, body=body, subject=None, reference=None,
                                  priority="normal", client_id=client_id, **self._kwargs)
 
-    def sent(self, *, after=0) -> dict:
-        return self.client.sent(after=after, **self._kwargs)
+    def sent(self, *, after=0, ids=None) -> dict:
+        return self.client.sent(after=after, **({"ids": ids} if ids is not None else {}), **self._kwargs)
 
     def reconcile(self):
         return self.client.flush_credential(lock_timeout=0, **self._kwargs)
@@ -509,59 +509,81 @@ class Bridge:
             raise BridgeError("hub-authority")
         return message
 
-    def _final_text(self, record: dict) -> str:
+    def _final_text(self, store: BridgeStore, record: dict) -> str:
         run_id = record["handles"]["runId"]
-        cursor = None
-        selected = []
-        seen_items = set()
-        for _ in range(MAX_PAGES):
-            self._check(record)
-            args = {"threadId": record["thread_id"], "view": "messages", "limit": 100, "maxCharsPerItem": 8000}
-            if cursor is not None:
-                args["afterPosition"] = cursor
-            page = self.t3.call("t3_thread_read", args)
-            self._thread(page)
-            if not isinstance(page.get("items"), list) or len(page["items"]) > 100:
-                raise BridgeError("result-ambiguous")
-            for item in page["items"]:
-                if not isinstance(item, dict):
+        scan = record.setdefault("timeline_scan", {"after": None, "candidate": None, "complete": False})
+        if not scan["complete"]:
+            for _ in range(MAX_PAGES):
+                self._check(record)
+                cursor = scan["after"]
+                args = {"threadId": record["thread_id"], "view": "messages", "limit": 100, "maxCharsPerItem": 8000}
+                if cursor is not None:
+                    args["afterPosition"] = cursor
+                page = self.t3.call("t3_thread_read", args)
+                self._thread(page)
+                items = page.get("items")
+                if not isinstance(items, list) or len(items) > 100:
                     raise BridgeError("result-ambiguous")
-                item_id = item.get("itemId")
-                if not isinstance(item_id, str) or item_id in seen_items:
+                previous = cursor if cursor is not None else -1
+                seen_items = set()
+                for item in items:
+                    if not isinstance(item, dict):
+                        raise BridgeError("result-ambiguous")
+                    item_id, position = item.get("itemId"), item.get("position")
+                    if (not isinstance(item_id, str) or item_id in seen_items
+                            or type(position) is not int or position <= previous):
+                        raise BridgeError("result-ambiguous")
+                    seen_items.add(item_id)
+                    previous = position
+                    if item.get("runId") == run_id and item.get("type") == "assistant_message":
+                        if scan["candidate"] is not None:
+                            raise BridgeError("result-ambiguous")
+                        scan["candidate"] = item
+                if page.get("hasMore") is False:
+                    scan["complete"] = True
+                elif (page.get("hasMore") is not True or not items
+                      or type(page.get("nextPosition")) is not int or page["nextPosition"] != previous):
                     raise BridgeError("result-ambiguous")
-                seen_items.add(item_id)
-                if item.get("runId") == run_id and item.get("type") == "assistant_message":
-                    selected.append(item)
-            if page.get("hasMore") is False:
-                break
-            next_position = page.get("nextPosition")
-            if page.get("hasMore") is not True or type(next_position) is not int or next_position <= (cursor if cursor is not None else -1):
-                raise BridgeError("result-ambiguous")
-            cursor = next_position
-        else:
-            raise BridgeError("bounded-limit")
+                scan["after"] = previous if items else cursor
+                # Save candidate and consumed position together. No output is
+                # selected until the complete timeline proves uniqueness.
+                store.save(record)
+                if scan["complete"]:
+                    break
+            else:
+                raise BridgeError("bounded-limit")
+        selected = [scan["candidate"]] if scan["candidate"] is not None else []
         if len(selected) != 1:
             raise BridgeError("result-ambiguous")
         item = selected[0]
         if (item.get("status") != "completed" or item.get("sourceThreadId") != record["thread_id"]
                 or item.get("visibility") != "local" or item.get("subagentId") is not None):
             raise BridgeError("result-ambiguous")
-        text = ""
+        units = bytearray()
         offset = 0
         for _ in range(MAX_PAGES):
             chunk = item.get("text")
             if not isinstance(chunk, str):
                 raise BridgeError("result-ambiguous")
-            text += chunk
-            if len(text.encode("utf-8")) > BODY_LIMIT:
+            # JavaScript slice can split a surrogate pair between JSON pages.
+            # Retain code units until the full sequence is available to validate.
+            chunk_units = chunk.encode("utf-16-le", errors="surrogatepass")
+            units.extend(chunk_units)
+            if len(units) > 2 * BODY_LIMIT:
                 raise BridgeError("result-oversized")
             next_offset = item.get("nextTextOffset")
             if item.get("textTruncated") is False and next_offset is None:
+                try:
+                    text = units.decode("utf-16-le")
+                except UnicodeDecodeError:
+                    raise BridgeError("result-ambiguous") from None
+                if len(text.encode("utf-8")) > BODY_LIMIT:
+                    raise BridgeError("result-oversized")
                 if not text.strip():
                     raise BridgeError("result-ambiguous")
                 return text
             # Offsets count UTF-16 code units, not Python code points.
-            expected = offset + len(chunk.encode("utf-16-le")) // 2
+            expected = offset + len(chunk_units) // 2
             if item.get("textTruncated") is not True or type(next_offset) is not int or next_offset != expected or next_offset <= offset:
                 raise BridgeError("result-ambiguous")
             self._check(record)
@@ -585,8 +607,18 @@ class Bridge:
                 or message.get("body") != record["reply_text"]):
             raise BridgeError("reply-mismatch")
 
-    def _sent_reply(self, record: dict) -> dict | None:
-        after = 0
+    def _sent_reply(self, store: BridgeStore, record: dict) -> dict | None:
+        accepted_id = record["hub_reply_id"]
+        if accepted_id is not None:
+            self._check(record)
+            rows = message_page(self.hub.sent(ids=[accepted_id]), 0)
+            if not rows:
+                return None
+            if len(rows) != 1 or rows[0]["id"] != accepted_id:
+                raise BridgeError("reply-mismatch")
+            self._reply_confirmation(rows[0], record)
+            return rows[0]
+        after = record.get("sent_cursor", 0)
         for _ in range(MAX_PAGES):
             self._check(record)
             page = self.hub.sent(after=after)
@@ -594,10 +626,15 @@ class Bridge:
             for row in rows:
                 if row.get("client_id") == record["reply_key"]:
                     self._reply_confirmation(row, record)
+                    # Do not advance past a match until replied is committed.
                     return row
+            after = page["next_cursor"]
+            # Only rows checked for this key can justify the lower bound. Hub
+            # AUTOINCREMENT IDs place later acceptances strictly above it.
+            record["sent_cursor"] = after
+            store.save(record)
             if len(rows) < 100:
                 return None
-            after = page["next_cursor"]
         raise BridgeError("bounded-limit")
 
     def _advance(self, store: BridgeStore, record: dict):
@@ -635,7 +672,7 @@ class Bridge:
                 return
             if wait.get("status") != "completed":
                 raise BridgeError("t3-protocol")
-            text = self._final_text(record)
+            text = self._final_text(store, record)
             record.update(reply_text=text, reply_digest=digest(text), state="terminal", reason="none")
             store.save(record)
         if record["state"] == "terminal":
@@ -649,7 +686,7 @@ class Bridge:
             # Inspect acceptance before retrying a lost reply response. Only the
             # captured credential's supported spool and sent APIs are used.
             self.hub.reconcile()
-            accepted = self._sent_reply(record)
+            accepted = self._sent_reply(store, record)
             if accepted is None and record["spooled"]:
                 record["reason"] = "upstream-pending"
                 store.save(record)
@@ -669,7 +706,7 @@ class Bridge:
             self._check(record)
             inbound = self._find_inbound(record)
             # Confirm the durable reply again before any acknowledgement retry.
-            accepted = self._sent_reply(record)
+            accepted = self._sent_reply(store, record)
             if accepted is None or accepted["id"] != record["hub_reply_id"]:
                 raise BridgeError("reply-mismatch")
             self._check(record)
@@ -693,7 +730,9 @@ class Bridge:
                     try:
                         self._check(record)
                         if record is None:
-                            after = 0
+                            scope = stable_key("inbox", [self.config.hub_authority, self.config.principal,
+                                                        self.config.fingerprint, self.oauth.fingerprint, self.hub.fingerprint])
+                            after = store.inbox_after(scope)
                             for _ in range(MAX_PAGES):
                                 self._check()
                                 page = self.hub.inbox(after=after, unacked=True)
@@ -705,13 +744,24 @@ class Bridge:
                                         if retained["payload_digest"] != candidate["payload_digest"]:
                                             record = retained
                                             raise BridgeError("payload-changed")
+                                        # The consumed prefix is already durable and
+                                        # its immutable content was checked again.
+                                        after = message["id"]
                                         continue
                                     record = candidate
                                     store.save(record)
                                     break
-                                if record is not None or len(rows) < 100:
+                                if record is not None:
+                                    store.save_inbox_after(scope, after)
                                     break
-                                after = page["next_cursor"]
+                                if len(rows) < 100:
+                                    # Restart a completed inspection cycle so old
+                                    # unacked tombstones are eventually revisited.
+                                    store.save_inbox_after(scope, 0)
+                                    break
+                                store.save_inbox_after(scope, after)
+                            else:
+                                return {"schema": SCHEMA, "state": "pending", "reason": "bounded-limit"}
                         if record is None:
                             return {"schema": SCHEMA, "state": "idle", "reason": "none"}
                         if record["state"] not in {"rejected", "held"}:

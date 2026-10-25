@@ -112,7 +112,11 @@ sensitive plaintext because it retains prompts and final replies.
 A drain reconciles the first retained nonterminal delivery before considering
 new inbox work. It accepts at most one new delivery. A held delivery blocks new
 intake. Rejected and acknowledged tombstones may be skipped during a bounded
-inbox scan. There is no durable inbox cursor that can skip uncommitted handling.
+inbox scan. The protected inbox checkpoint advances only over committed
+tombstones whose immutable payload digest was checked again. It never advances
+past an unread delivery. A completed inspection cycle resets the checkpoint so
+old unacknowledged tombstones are revisited. The checkpoint is scoped to the
+configured authority, principal, configuration and retained credentials.
 Unknown aliases and unauthorized senders or recipients receive no T3 turn or
 successful reply and remain unacknowledged. This slice has no rejection-ack policy.
 
@@ -144,8 +148,10 @@ timeline for that exact run, then requires exactly one local completed
 `assistant_message`. Multiple candidates, subagent output, absent results or
 inconsistent continuation metadata hold the delivery. Tool results, reasoning,
 plans and another run's text cannot supply the reply. Text continuations use
-the public API's UTF-16 offsets. Output larger than 64 KiB in UTF-8 is held
-without truncation or splitting.
+the public API's UTF-16 offsets. A surrogate pair may span JSON text pages.
+The bridge retains the code units across pages and validates the complete
+sequence before producing Unicode text. Malformed final sequences are held.
+Output larger than 64 KiB in UTF-8 is held without truncation or splitting.
 
 One reply uses the originating inbound ID and a deterministic Hub key shorter
 than the supported 64-character limit. Exact text is persisted before sending.
@@ -155,10 +161,22 @@ only the retained credential's spool and checks its sent rows. It acknowledges
 the inbound only after confirmed durable reply acceptance. An acknowledgement
 does not prove the peer has read the response.
 
+Sent-history reconciliation saves a lower bound only after checking every row
+on a page for the deterministic reply key. Monotonically increasing Hub IDs
+place later acceptances above that bound, including a reply accepted after a
+completed no-match scan whose response was lost. A matching row is validated
+before progress can pass it. Once the accepted reply ID is saved, recovery uses
+the supported `sent(ids=[accepted_id])` lookup and validates the reply again
+before any acknowledgement retry.
+
 Each invocation has a 90-second bridge deadline. T3 HTTP calls have finite
 socket waits of at most 15 seconds, responses at most 1 MiB, and exact-run waits
-of 1 second. Timeline, text and Hub page walks each stop at 32 pages. Brigade
-also applies its own bounded transport, spool batch and lock limits. An already
+of 1 second. Timeline, text and Hub page walks each stop at 32 pages. Completed
+timeline pages save the consumed zero-based position and the sole candidate
+together. Selection waits for the complete scan, including later pages that
+could prove ambiguity. Timeline, sent-history and inbox inspection continue
+from their committed checkpoints on a later drain when the page bound is reached.
+Brigade also applies its own bounded transport, spool batch and lock limits. An already
 started supported client call can finish after the bridge deadline. No timeout
 cancels a T3 run or authorizes a replacement run.
 
@@ -179,9 +197,12 @@ It recovers saved intent or handles and finishes only the remaining phases.
   then retry the acknowledgement. No new turn or reply occurs.
 - Route drift, mismatched handles, ambiguous output or reply linkage: retain a
   held record. There is no automatic reset, retry-as-new or deletion command.
-- Spool denial, missing upstream retention or bounded pagination exhaustion:
-  retain pending or held work for operator reconciliation. Never borrow another
-  principal, flush its spool or use an administrative credential.
+- A timeline, sent-history or inbox page bound: repeat the drain to continue
+  from checked progress. A bound does not prove that no matching reply exists
+  and cannot authorize a premature resend.
+- Spool denial or missing upstream retention: retain pending or held work for
+  operator reconciliation. Never borrow another principal, flush its spool or
+  use an administrative credential.
 
 An operator must investigate holds using approved private tooling. This command
 provides no permission or grant editor. Preserve the original ledger and retained
