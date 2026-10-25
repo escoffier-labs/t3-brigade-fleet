@@ -2915,6 +2915,9 @@ class T3Agent:
             return result
         if receipt is None:
             return result
+        # Receipt-bound output belongs to this observation, not a stored state
+        # returned after fencing, lock contention, or a lost observation CAS.
+        result.pop("output", None)
         try:
             # Same rule as reconcile: only a caller holding the request lock
             # may recover a crashed launch, and a live dispatcher holds it
@@ -2943,6 +2946,8 @@ class T3Agent:
             result["state"] = receipt.state
             result["needs_attention"] = receipt.state == "needs_attention"
             return self._with_handoff(receipt, result)
+        if "output" in observation and state == observation["state"] and updated.observation_applied:
+            result["output"] = observation["output"]
         self._publish_lifecycle(
             updated,
             turn_ref=turn_ref if updated.observation_applied else None,

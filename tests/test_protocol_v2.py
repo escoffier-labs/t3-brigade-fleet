@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import unittest
 from pathlib import Path
@@ -265,6 +266,106 @@ class ProtocolV2Tests(unittest.TestCase):
                     result = self.agent.handle({"action": "status", "thread_id": "thread-1", "include_output": include_output})
                     self.assertEqual(result["state"], "succeeded")
                     self.assertEqual(result.get("output"), "finished" if include_output else None)
+
+    def test_direct_status_suppresses_output_from_rejected_lifecycle_runs(self):
+        for previous in (False, True):
+            with self.subTest(previous=previous):
+                fixture = ProtocolV2Tests("runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                fixture.fixture._seed_admitted_request()
+                store = fixture.agent._target_store()
+                store.begin_turn("req-12345678", previous_turn_ref="run-1" if previous else None)
+                expected_ref = "epoch:1" if previous else "different-run"
+                if not previous:
+                    store.reconcile("req-12345678", state="running", thread_id="thread-1", turn_ref=expected_ref)
+                store.confirm_turn("req-12345678")
+                fixture.server.shell["threads"] = [thread("completed")]
+                fixture.server.projection["runs"][0]["status"] = "completed"
+                fixture.server.projection["messages"] = [{"role": "assistant", "runId": "run-1", "text": "stale", "streaming": False}]
+                result = fixture.agent.handle({"action": "status", "request_id": "req-12345678", "thread_id": "thread-1", "include_output": True})
+                self.assertEqual(result["state"], "unknown")
+                self.assertNotIn("output", result)
+                self.assertEqual(store.lookup("req-12345678").lifecycle["turn_ref"], expected_ref)
+                self.assertEqual(store.active_count(), 1)
+                self.assertEqual(fixture.server.commands, [])
+
+    def test_direct_status_suppresses_output_when_observation_is_not_applied(self):
+        for boundary in ("lost_cas", "lock_contention"):
+            with self.subTest(boundary=boundary):
+                fixture = ProtocolV2Tests("runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                fixture.fixture._seed_admitted_request()
+                agent, server = fixture.agent, fixture.server
+                store = agent._target_store()
+                server.shell["threads"] = [thread("completed")]
+                server.projection["runs"][0]["status"] = "completed"
+                server.projection["messages"] = [{"role": "assistant", "runId": "run-1", "text": "stale", "streaming": False}]
+
+                @contextlib.contextmanager
+                def advance_before_lock(request_id, *, timeout=5):
+                    # A real store update invalidates the acquired observation.
+                    self.assertEqual(request_id, "req-12345678")
+                    store.begin_turn(request_id)
+                    yield
+
+                with contextlib.ExitStack() as stack:
+                    if boundary == "lost_cas":
+                        before = store.lookup("req-12345678")
+                        stack.enter_context(patch.object(agent, "_request_lock", advance_before_lock))
+                    else:
+                        before = store.begin_turn("req-12345678")
+                        stack.enter_context(agent._request_lock("req-12345678"))
+                    result = agent.handle({"action": "status", "request_id": "req-12345678", "thread_id": "thread-1", "include_output": True})
+                after = store.lookup("req-12345678")
+                self.assertEqual(result["state"], after.state)
+                self.assertNotIn("output", result)
+                self.assertEqual(after.state, "dispatching")
+                self.assertEqual(after.lifecycle["turn_ref"], "epoch:1")
+                self.assertEqual(after.observation_version, before.observation_version + (boundary == "lost_cas"))
+                if boundary == "lock_contention":
+                    self.assertEqual(after, before)
+                self.assertEqual(store.active_count(), 1)
+                self.assertEqual(server.commands, [])
+
+    def test_direct_status_retains_accepted_and_unowned_terminal_output(self):
+        for protocol in (1, 2):
+            for ownership in ("known_receipt", "no_request_id", "no_receipt"):
+                with self.subTest(protocol=protocol, ownership=ownership):
+                    fixture = ProtocolV2Tests("runTest")
+                    fixture.setUp()
+                    self.addCleanup(fixture.doCleanups)
+                    agent, server = fixture.agent, fixture.server
+                    run_id = "turn-1" if protocol == 1 else "run-1"
+                    if protocol == 1:
+                        agent.t3 = fixture.fixture.fake_t3
+                        agent.t3.thread.update(latestTurn={"state": "completed", "turnId": run_id}, session={"status": "ready"})
+                        agent.t3.thread["messages"] = [{"role": "assistant", "text": "finished", "streaming": False}]
+                    else:
+                        server.shell["threads"] = [thread("completed")]
+                        server.projection["runs"][0]["status"] = "completed"
+                        server.projection["messages"] = [{"role": "assistant", "runId": run_id, "text": "finished", "streaming": False}]
+                    request = {"action": "status", "thread_id": "thread-1", "include_output": True}
+                    if ownership != "no_request_id":
+                        request["request_id"] = "req-12345678"
+                    if ownership == "known_receipt":
+                        fixture.fixture._seed_admitted_request()
+                        store = agent._target_store()
+                        store.begin_turn("req-12345678")
+                        store.reconcile("req-12345678", state="running", thread_id="thread-1", turn_ref=run_id)
+                        before = store.confirm_turn("req-12345678")
+                    result = agent.handle(request)
+                    self.assertEqual(result["state"], "succeeded")
+                    self.assertEqual(result["output"], "finished")
+                    self.assertFalse(result["needs_attention"])
+                    if ownership == "known_receipt":
+                        after = store.lookup("req-12345678")
+                        self.assertEqual(after.state, "succeeded")
+                        self.assertEqual(after.lifecycle["turn_ref"], run_id)
+                        self.assertEqual(after.observation_version, before.observation_version + 1)
+                        self.assertEqual(store.active_count(), 0)
+                    self.assertEqual(server.commands, [])
 
     def test_v2_thread_projection_over_one_mib_stays_controllable(self):
         # A long thread's projection outgrows the general 1 MiB response cap.
