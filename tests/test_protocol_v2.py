@@ -16,6 +16,13 @@ MODEL = {"instanceId": "codex", "model": "gpt-5.6-terra", "options": {"reasoning
 NATIVE_MODEL = {**MODEL, "options": [{"id": key, "value": value} for key, value in MODEL["options"].items()]}
 
 
+def native_thread():
+    return {"id": "thread-1", "projectId": "project-1",
+            "modelSelection": copy.deepcopy(NATIVE_MODEL), "runtimeMode": "full-access",
+            "interactionMode": "default", "branch": None, "worktreePath": None,
+            "lineage": {"parentThreadId": None, "rootThreadId": "thread-1", "relationshipToParent": None}}
+
+
 def thread(status="running"):
     return {"id": "thread-1", "projectId": "project-1", "status": status,
             "modelSelection": copy.deepcopy(NATIVE_MODEL), "runtimeMode": "full-access",
@@ -30,7 +37,7 @@ class V2Server:
         self.commands = []
         self.descriptor = {"serverVersion": "0.0.46-nightly.20261003.2623", "orchestrationProtocolVersion": 2, "capabilities": {"threadSettlement": True}}
         self.shell = {"schemaVersion": 2, "snapshotSequence": 9, "projects": [{"id": "project-1", "workspaceRoot": "/srv/repos/example"}], "threads": [thread()], "archivedThreads": []}
-        self.projection = {"thread": {**thread(), "branch": None, "worktreePath": None, "lineage": {"parentThreadId": None, "rootThreadId": "thread-1", "relationshipToParent": None}}, "runs": [{"id": "run-1", "threadId": "thread-1", "status": "running"}], "messages": [], "runtimeRequests": []}
+        self.projection = {"thread": native_thread(), "runs": [{"id": "run-1", "threadId": "thread-1", "ordinal": 1, "status": "running"}], "messages": [], "runtimeRequests": []}
 
     def __call__(self, request, timeout):
         self.requests.append(request)
@@ -244,20 +251,24 @@ class ProtocolV2Tests(unittest.TestCase):
 
     def test_v2_status_observes_terminal_output_for_current_run(self):
         self.server.shell["threads"] = [thread("completed")]
-        self.server.projection["thread"].update(thread("completed"))
         self.server.projection["runs"][0]["status"] = "completed"
         self.server.projection["messages"] = [
             {"role": "assistant", "runId": "old-run", "text": "stale", "streaming": False},
             {"role": "assistant", "runId": "run-1", "text": "finished", "streaming": False},
             {"role": "assistant", "runId": "run-1", "text": "partial", "streaming": True}]
-        result = self.agent.handle({"action": "status", "thread_id": "thread-1", "include_output": True})
-        self.assertEqual(result["state"], "succeeded")
-        self.assertEqual(result["output"], "finished")
+        current = dict(self.server.projection["runs"][0], ordinal=3)
+        older = dict(current, id="older-run", ordinal=1)
+        for runs in ([current], [older, current], [current, older]):
+            for include_output in (False, True):
+                with self.subTest(runs=runs, include_output=include_output):
+                    self.server.projection["runs"] = runs
+                    result = self.agent.handle({"action": "status", "thread_id": "thread-1", "include_output": include_output})
+                    self.assertEqual(result["state"], "succeeded")
+                    self.assertEqual(result.get("output"), "finished" if include_output else None)
 
     def test_v2_thread_projection_over_one_mib_stays_controllable(self):
         # A long thread's projection outgrows the general 1 MiB response cap.
         self.server.shell["threads"] = [thread("completed")]
-        self.server.projection["thread"].update(thread("completed"))
         self.server.projection["runs"][0]["status"] = "completed"
         history = [
             {"role": "assistant", "runId": "old-run", "text": "y" * 65_536, "streaming": False}
@@ -437,7 +448,7 @@ class ProtocolV2Tests(unittest.TestCase):
         self.assertEqual(len(self.server.commands), count)
 
     def test_interrupt_cancels_queue_and_observes_actual_state(self):
-        self.server.projection["runs"].append({"id": "run-2", "threadId": "thread-1", "status": "queued"})
+        self.server.projection["runs"].append({"id": "run-2", "threadId": "thread-1", "ordinal": 2, "status": "queued"})
         with patch("t3_fleet.t3_api.websocket_rpc", self.server.rpc):
             result = self.agent.handle({"action": "interrupt", "thread_id": "thread-1"})
         self.assertEqual([c["type"] for c in self.server.commands], ["run.interrupt", "queued-run.cancel"])
@@ -459,22 +470,27 @@ class ProtocolV2Tests(unittest.TestCase):
 
     def test_terminal_confirmation_is_independent_of_output_and_holds_capacity(self):
         base = copy.deepcopy(self.server.projection)
-        base["thread"] = dict(base["thread"], **thread("completed"))
-        base["runs"] = [{"id": "run-1", "threadId": "thread-1", "status": "completed"}]
+        base["runs"] = [{"id": "run-1", "threadId": "thread-1", "ordinal": 1, "status": "completed"}]
         base["messages"] = [
             {"role": "assistant", "runId": "run-1", "text": "done", "streaming": False}
         ]
         cases = {
             "different run": {
-                "runs": [{"id": "other", "threadId": "thread-1", "status": "completed"}]
+                "runs": [{"id": "other", "threadId": "thread-1", "ordinal": 1, "status": "completed"}]
             },
             "status mismatch": {
-                "runs": [{"id": "run-1", "threadId": "thread-1", "status": "running"}]
+                "runs": [{"id": "run-1", "threadId": "thread-1", "ordinal": 1, "status": "failed"}]
             },
             "absent run": {"runs": []},
+            "wrong run thread": {"runs": [dict(base["runs"][0], threadId="other-thread")]},
+            "missing run thread": {"runs": [{k: v for k, v in base["runs"][0].items() if k != "threadId"}]},
+            "duplicate id": {"runs": base["runs"] + [dict(base["runs"][0], ordinal=2)]},
+            "duplicate ordinal": {"runs": base["runs"] + [dict(base["runs"][0], id="other-run")]},
+            "newer terminal": {"runs": base["runs"] + [dict(base["runs"][0], id="next", ordinal=2)]},
+            "newer active": {"runs": base["runs"] + [dict(base["runs"][0], id="next", ordinal=2, status="running")]},
             "queued run": {
                 "runs": base["runs"]
-                + [{"id": "next", "threadId": "thread-1", "status": "queued"}]
+                + [{"id": "next", "threadId": "thread-1", "ordinal": 2, "status": "queued"}]
             },
             "approval": {
                 "runtimeRequests": [
@@ -514,8 +530,16 @@ class ProtocolV2Tests(unittest.TestCase):
             "node": {"nodes": [{"id": "node", "status": "running"}]},
             "subagent": {"subagents": [{"id": "sub", "status": "waiting"}]},
         }
+        for ordinal in (None, False, True, 0, -1, 1.5, "1"):
+            cases[f"malformed ordinal {ordinal!r}"] = {"runs": [dict(base["runs"][0], ordinal=ordinal)]}
+        cases["missing ordinal"] = {"runs": [{k: v for k, v in base["runs"][0].items() if k != "ordinal"}]}
+        # Malformed historical rows also make the native ordering ambiguous.
+        cases["duplicate historical id"] = {"runs": [
+            dict(base["runs"][0], ordinal=3),
+            dict(base["runs"][0], id="older", ordinal=1),
+            dict(base["runs"][0], id="older", ordinal=2),
+        ]}
         for key, value in (
-            ("latestRunId", "other"),
             ("activeRunId", "next"),
             ("activityRunStatus", "running"),
             (
@@ -527,7 +551,6 @@ class ProtocolV2Tests(unittest.TestCase):
                 },
             ),
             ("pendingBackgroundTasks", [{"taskId": "bg"}]),
-            ("status", "running"),
         ):
             cases[key] = {"thread": dict(base["thread"], **{key: value})}
         for name, changes in cases.items():
@@ -548,9 +571,10 @@ class ProtocolV2Tests(unittest.TestCase):
                             "include_output": include_output,
                         }
                     )
-                    self.assertNotIn(
-                        result["state"], {"succeeded", "failed", "interrupted"}
-                    )
+                    if "runs" in changes:
+                        self.assertEqual(result["state"], "unknown")
+                    else:
+                        self.assertNotIn(result["state"], {"succeeded", "failed", "interrupted"})
                     self.assertEqual(fixture.agent._target_store().active_count(), 1)
                     self.assertNotIn("output", result)
         # Matching terminal detail, including excluded plan nodes, frees capacity.
@@ -575,6 +599,72 @@ class ProtocolV2Tests(unittest.TestCase):
             self.assertEqual(fixture.agent._target_store().active_count(), 0)
             self.assertEqual(result.get("output"), "done" if include_output else None)
 
+    def test_passive_reconcile_corrects_blocked_native_terminal_receipt(self):
+        for expired in (False, True):
+            for status, expected in (("completed", "succeeded"), ("failed", "failed"), ("interrupted", "interrupted")):
+                with self.subTest(expired=expired, status=status):
+                    fixture = ProtocolV2Tests("runTest")
+                    fixture.setUp()
+                    self.addCleanup(fixture.doCleanups)
+                    fixture.fixture._seed_admitted_request()
+                    agent, server = fixture.agent, fixture.server
+                    store = agent._target_store()
+                    store.begin_turn("req-12345678")
+                    store.reconcile("req-12345678", state="running", thread_id="thread-1", turn_ref="run-1", launch_grace_started_at=agent._now())
+                    store.confirm_turn("req-12345678")
+                    # The real passive path creates the unresolved receipt.
+                    agent._now = lambda: "2026-07-28T01:01:00Z"
+                    store._now = agent._now
+                    server.shell["threads"] = [thread(status)]
+                    request = {"action": "reconcile", "request_id": "req-12345678", "include_output": True}
+                    blocked = agent.handle(request)
+                    self.assertEqual(blocked["state"], "unknown")
+                    self.assertIn("resolution", blocked)
+                    self.assertTrue(blocked["resolution"]["blocking"])
+                    self.assertEqual(store.active_count(), 1)
+                    if expired:
+                        agent._now = lambda: "2026-07-28T01:07:00Z"
+                        store._now = agent._now
+                        blocked = agent.handle(request)
+                        self.assertEqual(blocked["state"], "failed")
+                        self.assertTrue(blocked["resolution"]["blocking"])
+                        self.assertEqual(store.unresolved(), [blocked["resolution"]])
+                    before = store.lookup("req-12345678")
+                    server.projection["runs"][0]["status"] = status
+                    server.projection["messages"] = [{"role": "assistant", "runId": "run-1", "text": "final result", "streaming": False}]
+                    result = agent.handle(request)
+                    after = store.lookup("req-12345678")
+                    self.assertEqual(result["state"], expected)
+                    self.assertEqual(result["output"], "final result")
+                    self.assertNotIn("resolution", result)
+                    self.assertEqual(after.observation_version, before.observation_version + 1)
+                    self.assertEqual(after.lifecycle["turn_ref"], "run-1")
+                    self.assertEqual(store.active_count(), 0)
+                    self.assertEqual(server.commands, [])
+
+    def test_native_terminal_reconcile_preserves_lifecycle_identity_fences(self):
+        for previous in (False, True):
+            with self.subTest(previous=previous):
+                fixture = ProtocolV2Tests("runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                fixture.fixture._seed_admitted_request()
+                store = fixture.agent._target_store()
+                store.begin_turn("req-12345678", previous_turn_ref="run-1" if previous else None)
+                expected_ref = "epoch:1" if previous else "different-run"
+                if not previous:
+                    store.reconcile("req-12345678", state="running", thread_id="thread-1", turn_ref=expected_ref)
+                store.confirm_turn("req-12345678")
+                fixture.server.shell["threads"] = [thread("completed")]
+                fixture.server.projection["runs"][0]["status"] = "completed"
+                fixture.server.projection["messages"] = [{"role": "assistant", "runId": "run-1", "text": "stale", "streaming": False}]
+                result = fixture.agent.handle({"action": "reconcile", "request_id": "req-12345678", "include_output": True})
+                self.assertEqual(result["state"], "unknown")
+                self.assertNotIn("output", result)
+                self.assertEqual(store.lookup("req-12345678").lifecycle["turn_ref"], expected_ref)
+                self.assertEqual(store.active_count(), 1)
+                self.assertEqual(fixture.server.commands, [])
+
     def test_terminal_unreadable_detail_never_releases_capacity(self):
         self.fixture._seed_admitted_request()
         self.server.shell["threads"] = [thread("completed")]
@@ -596,6 +686,11 @@ class ProtocolV2Tests(unittest.TestCase):
                             }
                         )
                     self.assertEqual(self.agent._target_store().active_count(), 1)
+
+            with patch.dict(self.server.projection["thread"], id="other-thread"):
+                with self.assertRaises(T3HttpError):
+                    self.agent.handle({"action": "reconcile", "request_id": "req-12345678", "include_output": include_output})
+                self.assertEqual(self.agent._target_store().active_count(), 1)
 
     def test_running_without_output_does_not_fetch_detail(self):
         self.agent.handle({"action": "status", "thread_id": "thread-1"})
@@ -654,13 +749,13 @@ class ProtocolV2Tests(unittest.TestCase):
         for evidence in ("run", "runtime", "background", "node"):
             with self.subTest(evidence=evidence):
                 self.server.shell["threads"] = [thread("completed")]
-                self.server.projection["runs"] = [{"id": "run-1", "threadId": "thread-1", "status": "completed"}]
+                self.server.projection["runs"] = [{"id": "run-1", "threadId": "thread-1", "ordinal": 1, "status": "completed"}]
                 self.server.projection["runtimeRequests"] = []
                 self.server.projection["providerThreads"] = []
                 self.server.projection["nodes"] = []
                 self.server.projection["messages"] = [{"role": "assistant", "runId": "run-1", "text": "stale result", "streaming": False}]
                 if evidence == "run":
-                    self.server.projection["runs"].append({"id": "run-2", "threadId": "thread-1", "status": "queued"})
+                    self.server.projection["runs"].append({"id": "run-2", "threadId": "thread-1", "ordinal": 2, "status": "queued"})
                 elif evidence == "runtime":
                     self.server.projection["runtimeRequests"] = [{"id": "approval-2", "kind": "permission", "status": "pending", "createdAt": "2026-10-03T15:01:00Z", "responseCapability": {"type": "live", "providerSessionId": "s"}}]
                 elif evidence == "background":
@@ -680,8 +775,7 @@ class ProtocolV2Tests(unittest.TestCase):
         # completes and marks it countsForRun=false. Observed on a protocol-2 target:
         # it hid every final report from `status --include-output`.
         self.server.shell["threads"] = [thread("completed")]
-        self.server.projection["thread"].update(thread("completed"))
-        self.server.projection["runs"] = [{"id": "run-1", "threadId": "thread-1", "status": "completed"}]
+        self.server.projection["runs"] = [{"id": "run-1", "threadId": "thread-1", "ordinal": 1, "status": "completed"}]
         self.server.projection["runtimeRequests"] = []
         self.server.projection["providerThreads"] = []
         self.server.projection["nodes"] = [
