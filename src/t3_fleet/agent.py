@@ -999,6 +999,35 @@ class T3Agent:
             return bounded_pending_request(raw)
         return None
 
+    @staticmethod
+    def _latest_native_run(detail: dict[str, Any], thread_id: str) -> dict[str, Any] | None:
+        """Corroborate native run order without shell-derived thread fields."""
+        runs = detail.get("runs")
+        if not isinstance(runs, list) or not runs:
+            return None
+        ids: set[str] = set()
+        ordinals: set[int] = set()
+        latest = None
+        for run in runs:
+            if not isinstance(run, dict):
+                return None
+            run_id, ordinal = run.get("id"), run.get("ordinal")
+            if (
+                not isinstance(run_id, str) or not run_id or run_id in ids
+                or run.get("threadId") != thread_id
+                or type(ordinal) is not int or ordinal < 1 or ordinal in ordinals
+                or not isinstance(run.get("status"), str)
+                or run.get("status") not in _V2_ACTIVE | _V2_TERMINAL
+            ):
+                return None
+            ids.add(run_id)
+            ordinals.add(ordinal)
+            # Native ordinals follow submission order, not list position or
+            # timestamps. Even a newer queued run prevents terminal release.
+            if latest is None or ordinal > latest["ordinal"]:
+                latest = run
+        return latest
+
     def _status_v2(self, thread_id: str, shell: dict[str, Any], *, include_output: bool) -> dict[str, Any]:
         self._validate_readiness_shell(shell)
         matches = [t for t in shell["threads"] + shell["archivedThreads"] if t["id"] == thread_id]
@@ -1038,12 +1067,11 @@ class T3Agent:
             detail = self._thread_detail(self.t3.thread_snapshot(thread_id))
             if detail is None or detail.get("id") != thread_id:
                 raise ValidationError("T3 returned a mismatched thread projection")
-            runs = [r for r in detail.get("runs", []) if r.get("id") == thread["latestRunId"]]
+            latest = self._latest_native_run(detail, thread_id)
             if state in _TARGET_TERMINAL_STATES and (
-                len(runs) != 1
-                or runs[0].get("status") != status
-                or detail.get("latestRunId") != thread["latestRunId"]
-                or detail.get("status") != status
+                latest is None
+                or latest["id"] != thread["latestRunId"]
+                or latest["status"] != status
             ):
                 result["state"] = "unknown"
             live_runs = [r for r in detail.get("runs", []) if r.get("status") in _V2_ACTIVE]
@@ -2852,7 +2880,9 @@ class T3Agent:
             updated,
             turn_ref=turn_ref if updated.observation_applied else None,
         )
-        if "output" in result:
+        # Corroborated native output still belongs to the observed run. Do not
+        # attach it after lifecycle fencing or a lost observation CAS.
+        if "output" in result and state == result["state"] and updated.observation_applied:
             payload["output"] = result["output"]
         if updated.state == "needs_attention":
             for key in ("pending_request", "pending_runtime_request"):
@@ -2885,6 +2915,9 @@ class T3Agent:
             return result
         if receipt is None:
             return result
+        # Receipt-bound output belongs to this observation, not a stored state
+        # returned after fencing, lock contention, or a lost observation CAS.
+        result.pop("output", None)
         try:
             # Same rule as reconcile: only a caller holding the request lock
             # may recover a crashed launch, and a live dispatcher holds it
@@ -2913,6 +2946,8 @@ class T3Agent:
             result["state"] = receipt.state
             result["needs_attention"] = receipt.state == "needs_attention"
             return self._with_handoff(receipt, result)
+        if "output" in observation and state == observation["state"] and updated.observation_applied:
+            result["output"] = observation["output"]
         self._publish_lifecycle(
             updated,
             turn_ref=turn_ref if updated.observation_applied else None,
