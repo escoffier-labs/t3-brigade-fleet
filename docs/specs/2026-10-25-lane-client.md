@@ -1,7 +1,7 @@
 # Local T3 lane client
 
-The user approved all four capabilities on 2026-10-25: build-result delivery,
-prerequisite updates, context preparation before compaction, and attention summaries.
+Provide build-result delivery, prerequisite updates, context preparation before
+compaction, and attention summaries.
 Implement a local client in this existing Python package, with no dependencies,
 daemon, timers, frontend changes, or runtime installation during development.
 
@@ -15,6 +15,9 @@ the existing fleet config, not a caller-supplied URL or executable. No SSH.
 Check the configured target.db read-only for matching thread receipts before any
 mutation. Fail closed on unreadable/malformed ownership state. An absent target.db
 means there are no registered target receipts. Do not create or alter that database.
+The local host must configure agent_state_dir explicitly. Check terminal receipts
+too. Refuse mutation while any nonterminal target claim has no thread_id yet,
+closing the claim-before-attachment observation gap conservatively.
 
 Bind a thread explicitly to its environment ID, project ID and workspace path.
 Check live identity and workspace on every mutation. The client has its own
@@ -40,6 +43,8 @@ failed_checks (max 32 names), evidence_path (reference only), mode (`queue` defa
 workspace HEAD and latest run before delivery. Mismatches return `stale` without
 delivery. Do not treat a matching SHA as proof of clean-worktree verification.
 Clearly label event text as external evidence, not instructions or new authority.
+The source revision remains caller-asserted evidence. These checks establish the
+current run and current HEAD only, not a historical run-to-revision association.
 
 An event ID is scoped by environment/thread. Identical retries return the prior
 receipt without another send. Different payload with same ID is a conflict.
