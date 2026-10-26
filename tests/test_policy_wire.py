@@ -122,6 +122,10 @@ class RealWireEnvelopeTests(unittest.TestCase):
             with self.subTest(case=name):
                 parsed = normalize_policy_envelope(envelope(name))
                 self.assertEqual(parsed["sources"], case["envelope"]["sources"])
+                self.assertIs(parsed["data"]["allow_free"], False)
+                source = parsed["sources"]["data.allow_free"]
+                self.assertEqual(source["layer"], "fleet-defaults")
+                self.assertIs(source["value"], False)
 
 
 class WireStrictnessTests(unittest.TestCase):

@@ -31,6 +31,7 @@ dependencies = []
 [project.scripts]
 t3-fleet = "t3_fleet.cli:main"
 t3-fleet-agent = "t3_fleet.agent:main"
+t3-lane = "t3_fleet.lane:main"
 
 [project.urls]
 Homepage = "https://github.com/escoffier-labs/t3-brigade-fleet"

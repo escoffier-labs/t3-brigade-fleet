@@ -355,6 +355,31 @@ class T3Client:
             raise T3HttpError("invalid T3 dispatch acknowledgement")
         return result
 
+    def queue_message(self, thread_id: str, text: str, command_id: str, message_id: str) -> dict[str, Any]:
+        """Queue external evidence without changing the lane's model or modes."""
+        return self._lane_message(thread_id, text, command_id, message_id, {"type": "queue_after_active"})
+
+    def steer_message(self, thread_id: str, text: str, command_id: str, message_id: str,
+                      target_run_id: str) -> dict[str, Any]:
+        """Steer exactly one run, with no interrupt/restart fallback."""
+        if not isinstance(target_run_id, str) or not target_run_id or len(target_run_id) > 512:
+            raise T3HttpError("invalid lane target run")
+        return self._lane_message(thread_id, text, command_id, message_id,
+                                  {"type": "steer_active", "targetRunId": target_run_id})
+
+    def _lane_message(self, thread_id: str, text: str, command_id: str, message_id: str,
+                      mode: dict[str, Any]) -> dict[str, Any]:
+        if any(not isinstance(value, str) or not value or len(value) > 512
+               for value in (thread_id, command_id, message_id)):
+            raise T3HttpError("invalid lane message identity")
+        if not isinstance(text, str) or not text or len(text.encode("utf-8")) > 131072:
+            raise T3HttpError("invalid lane message text")
+        if self._orchestration_protocol() != 2:
+            raise T3HttpError("lane messages require T3 orchestration protocol 2")
+        return self._rpc_command({"type": "message.dispatch", "createdBy": "agent", "creationSource": "server",
+                                  "commandId": command_id, "threadId": thread_id, "messageId": message_id,
+                                  "text": text, "attachments": [], "dispatchMode": mode})
+
     def dispatch(self, command: dict[str, Any]) -> dict[str, Any]:
         if self._orchestration_protocol() == 1:
             return self._request("/api/orchestration/dispatch", method="POST", payload=command)
