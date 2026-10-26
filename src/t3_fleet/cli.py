@@ -29,7 +29,7 @@ _RUNTIME_MODES = ("approval-required", "auto-accept-edits", "auto", "full-access
 _INTERACTION_MODES = ("default", "plan")
 # Operator and timer commands. A JSON `invoke` is the model-facing route, so it
 # never reaches these: no model decides when threads settle or installs a timer.
-_OPERATOR_COMMANDS = frozenset({"settle-sweep", "install-settle-timer"})
+_OPERATOR_COMMANDS = frozenset({"settle-sweep", "install-settle-timer", "hub-thread-bridge"})
 
 _PUBLIC_ERROR_MESSAGES = {
     "invalid_config": "fleet configuration is invalid",
@@ -384,6 +384,10 @@ def _parser() -> _Parser:
 
     commands.add_parser("invoke")
     commands.add_parser("brigade-invoke")
+
+    bridge = commands.add_parser("hub-thread-bridge")
+    bridge.add_argument("bridge_action", choices=("drain", "status"))
+    bridge.add_argument("--bridge-config", required=True)
 
     doctor = commands.add_parser("doctor")
     doctor.add_argument("--host")
@@ -882,6 +886,17 @@ def main(
     application: _Application | None = None
     try:
         args = _parser().parse_args(argv)
+        if args.command == "hub-thread-bridge":
+            from .hub_thread_bridge import operator_command
+            result = operator_command(Path(args.bridge_config), args.bridge_action)
+            _emit(stdout, result)
+            return 0 if result["state"] not in {"blocked", "held", "rejected"} else 3
+        # Deny operator actions before opening the fleet configuration or store.
+        if args.command == "invoke":
+            text = _read_stdin(stdin)
+            if _json_request(text).get("action") in _OPERATOR_COMMANDS:
+                raise ValidationError("unsupported command")
+            stdin = io.StringIO(text)
         config_path = (
             Path(args.config).expanduser()
             if args.config
