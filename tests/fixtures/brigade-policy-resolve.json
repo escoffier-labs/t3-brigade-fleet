@@ -6,9 +6,10 @@
       "description": "No session overrides. Every leaf wins at the layer that set it and an unset leaf carries layer null with value null.",
       "envelope": {
         "ack_required": true,
-        "digest": "sha256:aca1f4dc3a2d4909f7b02eaeefdc8766562b6ef0f21fb70161b76f0d1776b1cf",
+        "digest": "sha256:2829f0b07fdfd521599f905f26f2e1564da0b574a2c1d5d754774d86d6175214",
         "effective": {
           "data": {
+            "allow_free": false,
             "allow_training": false,
             "retention": "example-retention-window"
           },
@@ -23,6 +24,32 @@
         },
         "schema": "brigade.fleet_policy.v1",
         "sources": {
+          "data.allow_free": {
+            "chain": [
+              {
+                "action": "set",
+                "layer": "fleet-defaults",
+                "value": false
+              },
+              {
+                "action": "unset",
+                "layer": "consumer:t3-fleet",
+                "value": null
+              },
+              {
+                "action": "unset",
+                "layer": "repo:github.com/example-org/example-public-repo",
+                "value": null
+              },
+              {
+                "action": "unset",
+                "layer": "session",
+                "value": null
+              }
+            ],
+            "layer": "fleet-defaults",
+            "value": false
+          },
           "data.allow_training": {
             "chain": [
               {
@@ -216,9 +243,10 @@
       "description": "A session override outranks the repository and consumer layers, and an explicit null at the session layer inherits instead of clearing.",
       "envelope": {
         "ack_required": true,
-        "digest": "sha256:aca1f4dc3a2d4909f7b02eaeefdc8766562b6ef0f21fb70161b76f0d1776b1cf",
+        "digest": "sha256:2829f0b07fdfd521599f905f26f2e1564da0b574a2c1d5d754774d86d6175214",
         "effective": {
           "data": {
+            "allow_free": false,
             "allow_training": false,
             "retention": "example-retention-window"
           },
@@ -233,6 +261,32 @@
         },
         "schema": "brigade.fleet_policy.v1",
         "sources": {
+          "data.allow_free": {
+            "chain": [
+              {
+                "action": "set",
+                "layer": "fleet-defaults",
+                "value": false
+              },
+              {
+                "action": "unset",
+                "layer": "consumer:t3-fleet",
+                "value": null
+              },
+              {
+                "action": "unset",
+                "layer": "repo:github.com/example-org/example-public-repo",
+                "value": null
+              },
+              {
+                "action": "unset",
+                "layer": "session",
+                "value": null
+              }
+            ],
+            "layer": "fleet-defaults",
+            "value": false
+          },
           "data.allow_training": {
             "chain": [
               {
@@ -426,9 +480,10 @@
       "description": "A private repository denies a session override that would enable training. The winning value is the constrained one while the chain still shows the requested override, so provenance survives denial.",
       "envelope": {
         "ack_required": true,
-        "digest": "sha256:aca1f4dc3a2d4909f7b02eaeefdc8766562b6ef0f21fb70161b76f0d1776b1cf",
+        "digest": "sha256:2829f0b07fdfd521599f905f26f2e1564da0b574a2c1d5d754774d86d6175214",
         "effective": {
           "data": {
+            "allow_free": false,
             "allow_training": false,
             "retention": "example-retention-window"
           },
@@ -443,6 +498,32 @@
         },
         "schema": "brigade.fleet_policy.v1",
         "sources": {
+          "data.allow_free": {
+            "chain": [
+              {
+                "action": "set",
+                "layer": "fleet-defaults",
+                "value": false
+              },
+              {
+                "action": "unset",
+                "layer": "consumer:t3-fleet",
+                "value": null
+              },
+              {
+                "action": "unset",
+                "layer": "repo:github.com/example-org/example-private-repo",
+                "value": null
+              },
+              {
+                "action": "unset",
+                "layer": "session",
+                "value": null
+              }
+            ],
+            "layer": "fleet-defaults",
+            "value": false
+          },
           "data.allow_training": {
             "chain": [
               {
@@ -633,12 +714,12 @@
   ],
   "provenance": {
     "brigade_source_files": {
-      "src/brigade/fleet_hub_policy_api.py": "sha256:0b8a71ed038f7947cb69ac15218d54c7b7ade5b5f99449f8363b97abc7cad706",
-      "src/brigade/fleet_policy.py": "sha256:9a5976a6c411c11e3f6162fe070d1afdad531f0a126fcc2758b7ebdc9b7e057b"
+      "src/brigade/fleet_hub_policy_api.py": "sha256:b9d965024b1f8db416eda5f07a77336453bbaa391690bd76ed474700d96196e4",
+      "src/brigade/fleet_policy.py": "sha256:18ece31a3562d3c8f2459e4343c72f517894283a6ba199d9c2f3bae357d66600"
     },
     "brigade_source_git": {
-      "branch": "t3code/fleet-hub-control-plane",
-      "commit": "ac62cc58625ada5db1cc3303d7d844f2a54f81c1"
+      "branch": "HEAD",
+      "commit": "1b7226f2166abb4909174a84057dc9bfbaebb606"
     },
     "generator": "scripts/generate-policy-wire-fixture.py",
     "note": "Generated by importing Brigade's own resolver and Hub envelope projection from the source tree below. The policy document and every identifier are generic placeholders; the revision number is a placeholder because a Hub assigns it. Regenerate with --brigade-source <path> after a root contract change."
