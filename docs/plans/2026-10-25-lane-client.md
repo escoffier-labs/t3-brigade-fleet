@@ -43,9 +43,9 @@ all public input/output contracts and failure behaviors are fixed by the spec.
 
 ## Task 2: Independent review and live proof
 
-- [ ] Review whole branch against the spec, including security and retry behavior.
+- [x] Review whole branch against the spec, including security and retry behavior.
 - [x] Fix verified defects with regression tests and rerun relevant checks.
-- [ ] Prove disposable-lane delivery, duplicate suppression and stale-run/SHA refusal.
+- [x] Prove disposable-lane delivery, duplicate suppression and stale-run/SHA refusal.
 - [ ] Write durable handoff and complete authorized in-house PR gates.
 
 ## Initial evidence
@@ -129,3 +129,25 @@ must be synced and rechecked after implementation. No historical Brigade claim.
 - Remaining finding: parent is separately adjudicating Daybreak's unverified
   provider identity race in `/compact`. This task does not resolve or redesign
   that behavior. No live lane messages were sent and no commit was made.
+
+## Review and live-proof status
+
+Astra confirmed the interrupted-compaction fix at `1e3f630`. Daybreak's second
+pass reviewed `f6bd1e2..1e3f630` and confirmed the Git-read, local-host, receipt-cap,
+and interrupted-operation fixes without a new concrete blocker. Security approval
+remains conditional on the compaction queue decision.
+
+A disposable lane acknowledged build and prerequisite events. Identical replay
+returned the original receipt. Stale run and revision events were refused. Private
+context preparation and attention worked. The inspected server recorded completed
+Codex compaction before the security fixes. A fresh delivery/context check on the
+hardened source also passed. Final wheel construction passed without dependencies
+or network access. These are local audit checks, not scoreable artifacts.
+
+Publication and installation remain held. The server snapshots model selection
+for queued runs and can restore it when they start. No expected-provider/model
+compare-and-set field exists. Explicit per-message model selection does not solve
+this because execution can update the lane's default selection. The pending
+operator choice is ordinary T3 queue semantics with that limitation documented,
+or context preparation with automatic compaction disabled. Do not treat elapsed
+time or a successful live compaction as approval of that behavior.

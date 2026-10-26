@@ -5,8 +5,8 @@ It also prepares context packets, requests Codex compaction, and lists attention
 items. Fleet-managed threads require the admitted `t3-fleet` continuation route.
 
 The client uses the existing fleet configuration and target-local session issuer.
-It requires exactly one enabled `transport = "local"` host. Its
-`expected_hostname` must match this machine's hostname without case sensitivity.
+It requires exactly one enabled `transport = "local"` host whose
+`expected_hostname` matches this machine's hostname without case sensitivity.
 The `--host` value must select that host. Configure an explicit `agent_state_dir`.
 URLs and executables come from that configuration. The client
 does not launch threads, change models or modes,
