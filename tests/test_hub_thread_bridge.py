@@ -220,6 +220,16 @@ def hold_claim(path, pipe):
             pipe.recv()
 
 
+def hold_sdk_spool(path, ready, release, finished):
+    """Bounded fixture holder only, never a background message operation."""
+    try:
+        with installed_client.fleet_client._spool_lock(Path(path), timeout=2):
+            ready.set()
+            release.wait(3)
+    finally:
+        finished.set()
+
+
 @unittest.skipUnless(os.name == "posix", "protected bridge requires POSIX")
 class RelayTests(unittest.TestCase):
     def setUp(self):
@@ -1180,6 +1190,147 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(self.t3.send_calls, 1)
         self.assertNotIn("must never", json.dumps(result))
 
+    @unittest.skipUnless(callable(getattr(installed_client, "identity", None)), "requires compatible installed Brigade reply")
+    def test_installed_reply_lock_contention_retains_intent_and_recovers_without_duplicate(self):
+        for kind in ("process", "file"):
+            with self.subTest(lock=kind), contextlib.ExitStack() as stack:
+                self.config["ledger_file"] = f"lock-{kind}.db"
+                self.write(self.config_path, self.config)
+                self.hub, self.t3 = FakeHub(), FakeT3()
+                spool_root = self.root / f"spool-{kind}"
+                spool_root.mkdir(mode=0o700)
+                client = installed_client.fleet_client
+                stack.enter_context(patch.object(client, "load_fleet_settings", return_value={"hub_url": self.hub.authority}))
+                stack.enter_context(patch.object(client, "resolve_node_id", return_value="fixture-node"))
+                stack.enter_context(patch.object(client, "spool_path", return_value=spool_root / "fixture.jsonl"))
+                adapter = BrigadeMessages(load_config(self.config_path))
+                spool = installed_client._spool_path(adapter._authority.node_id, adapter._authority.token,
+                                                     hub_url=adapter.authority)
+                ready, release, finished = (multiprocessing.Event() for _ in range(3))
+                worker_type = threading.Thread if kind == "process" else multiprocessing.Process
+                holder = worker_type(target=hold_sdk_spool, args=(str(spool), ready, release, finished))
+                acquired, requests, lock_calls = [], [], []
+                real_lock = client._spool_lock
+                main_thread = threading.get_ident()
+                @contextlib.contextmanager
+                def observed_lock(path, *, timeout=None):
+                    if threading.get_ident() == main_thread:
+                        lock_calls.append(timeout)
+                    with real_lock(path, timeout=timeout) as descriptor:
+                        yield descriptor
+                stack.enter_context(patch.object(client, "_spool_lock", observed_lock))
+                def request(hub, token, body, *, timeout=None):
+                    self.assertEqual((hub, token), (adapter.authority, self.token_path.read_text()))
+                    requests.append(copy.deepcopy(body))
+                    action = body["action"]
+                    if action == "identity":
+                        self.assertEqual(body["peers"], ["agent:peer-a"])
+                        return 200, self.hub.identity(peers=body["peers"])
+                    if action == "list":
+                        return 200, self.hub.inbox(after=body["after"], unacked=body["unacked"])
+                    if action == "sent":
+                        page = self.hub.sent(after=body.get("after", 0), ids=body.get("ids"))
+                        # Reconcile has released its lock. Another actor acquires
+                        # the same credential's lock before the first reply.
+                        if "ids" not in body and not acquired:
+                            acquired.append(True)
+                            holder.start()
+                            self.assertTrue(ready.wait(3), "fixture lock was not acquired")
+                        return 200, page
+                    if action == "reply":
+                        return 200, self.hub.reply(body["id"], body=body["body"], client_id=body["client_id"])
+                    if action == "ack":
+                        return 200, self.hub.ack(body["id"])
+                    raise AssertionError(action)
+                stack.enter_context(patch.object(installed_client, "_request", request))
+                try:
+                    result = Bridge(self.config_path, hub=adapter, t3=self.t3).drain()
+                    self.assertEqual((result["state"], result["reason"]), ("reply-intent", "upstream-pending"))
+                    self.assertFalse(finished.is_set(), "reply waited until the fixture lock was released")
+                    self.assertEqual(lock_calls, [0])
+                    self.assertEqual(self.counts(), (1, 0, 0))
+                    self.assertFalse(spool.exists(), "contended reply must not enqueue")
+                    self.assertFalse(any(body["action"] in {"reply", "ack"} for body in requests))
+                    self.assertNotIn("spool lock", json.dumps(result))
+                    with BridgeStore(self.root / self.config["ledger_file"]) as store:
+                        retained = store.pending()
+                    self.assertEqual(retained["intent"], next(iter(self.t3.sends.values()))["message"])
+                    self.assertEqual(retained["reply_text"], "Final answer")
+                finally:
+                    release.set()
+                    if holder.ident is not None:
+                        holder.join(5)
+                        if holder.is_alive() and kind == "file":
+                            holder.terminate()
+                            holder.join(2)
+                        self.assertFalse(holder.is_alive(), "fixture lock holder did not finish")
+                self.assertEqual(Bridge(self.config_path, hub=adapter, t3=self.t3).drain()["state"], "acked")
+                self.assertEqual(self.counts(), (1, 1, 1))
+                self.assertEqual((self.t3.send_calls, self.hub.reply_calls, self.hub.ack_calls), (1, 1, 1))
+                replies = [body for body in requests if body["action"] == "reply"]
+                self.assertEqual([body["client_id"] for body in replies], [retained["reply_key"]])
+                self.assertEqual(replies[0]["body"], retained["reply_text"])
+                self.assertTrue(all(timeout == 0 for timeout in lock_calls))
+                self.assertEqual(client._read_spool(spool, strict=True), [])
+                with BridgeStore(self.root / self.config["ledger_file"]) as store:
+                    saved = store.get(retained["delivery_key"])
+                for key in ("intent", "t3_key", "reply_key", "authorization", "reply_text", "reply_digest"):
+                    self.assertEqual(saved[key], retained[key])
+                # Signature validation must not turn real credential failures
+                # into a package prerequisite or expose upstream details.
+                self.write(self.token_path, "invalid-fixture-token")
+                before = len(requests)
+                denied = Bridge(self.config_path, hub=adapter, t3=self.t3).drain()
+                self.assertEqual(denied["reason"], "hub-authority")
+                self.assertEqual(len(requests), before)
+                self.write(self.token_path, "fixture-hub-token-value-000000000000")
+
+    def test_incomplete_or_unbounded_client_is_a_prerequisite_before_capture(self):
+        cases = ("authority-missing", "authority-none", "capture-missing", "capture-none", "capture-signature",
+                 "frame-none", "frame-signature", "reply-old", "reply-kwargs", "reply-required", "function-none")
+        for case in cases:
+            with self.subTest(case=case):
+                self.config["ledger_file"] = f"prerequisite-{case}.db"
+                self.write(self.config_path, self.config)
+                client = types.ModuleType("brigade.fleet_client_messages")
+                framing = types.ModuleType("brigade.untrusted")
+                package = types.ModuleType("brigade")
+                captures = []
+                def capture(token_file):
+                    captures.append(token_file)
+                    raise AssertionError("an incompatible package must not capture a credential")
+                def reply(message_id, *, body, subject, reference, priority, client_id,
+                          lock_timeout=None, authority=None, expected_scope=None):
+                    raise AssertionError("an incompatible package must not send")
+                def old_reply(message_id, *, body, subject, reference, priority, client_id,
+                              authority=None, expected_scope=None):
+                    raise AssertionError("an old reply must not send")
+                def required_reply(message_id, *, lock_timeout=None, unexpected, **kwargs):
+                    raise AssertionError("an incompatible signature must not send")
+                for name in ("identity", "list_messages", "sent", "ack", "flush_credential"):
+                    setattr(client, name, lambda **kwargs: None)
+                client.reply = reply
+                client.MessageAuthority = types.SimpleNamespace(capture=capture)
+                framing.wrap_untrusted = lambda text, *, source_kind, goal=None: text
+                if case == "authority-missing": del client.MessageAuthority
+                elif case == "authority-none": client.MessageAuthority = None
+                elif case == "capture-missing": client.MessageAuthority = types.SimpleNamespace()
+                elif case == "capture-none": client.MessageAuthority.capture = None
+                elif case == "capture-signature": client.MessageAuthority.capture = lambda: None
+                elif case == "frame-none": framing.wrap_untrusted = None
+                elif case == "frame-signature": framing.wrap_untrusted = lambda text: text
+                elif case == "reply-old": client.reply = old_reply
+                elif case == "reply-kwargs": client.reply = lambda *args, **kwargs: None
+                elif case == "reply-required": client.reply = required_reply
+                elif case == "function-none": client.sent = None
+                package.fleet_client_messages = client
+                modules = {"brigade": package, "brigade.fleet_client_messages": client, "brigade.untrusted": framing}
+                with patch.dict("sys.modules", modules):
+                    result = Bridge(self.config_path, t3=self.t3).drain()
+                self.assertEqual((result["state"], result["reason"]), ("blocked", "brigade-prerequisite"))
+                self.assertEqual(captures, [])
+                self.assertEqual(self.t3.calls, [])
+
     def test_optional_client_uses_only_captured_credential_and_supported_calls(self):
         client = types.ModuleType("brigade.fleet_client_messages")
         framing = types.ModuleType("brigade.untrusted")
@@ -1201,8 +1352,9 @@ class RelayTests(unittest.TestCase):
             check(kwargs)
             self.assertEqual(wait_ms, 0)
             return self.hub.inbox(after=after, unacked=unacked)
-        def reply(message_id, *, body, subject, reference, priority, client_id, **kwargs):
+        def reply(message_id, *, body, subject, reference, priority, client_id, lock_timeout=None, **kwargs):
             check(kwargs)
+            self.assertEqual(lock_timeout, 0)
             self.assertIsNone(subject)
             self.assertIsNone(reference)
             self.assertEqual(priority, "normal")

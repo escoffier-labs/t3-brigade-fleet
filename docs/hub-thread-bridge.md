@@ -25,6 +25,15 @@ Installing Brigade into a consumer environment belongs to the operator.
 The required capability is the extended
 `identity(peers=[...], timeout=5, authority=captured, expected_scope=captured.scope)`
 contract merged in Brigade #2071. Basic identity alone is insufficient.
+The package must also support the explicit keyword-only `reply(lock_timeout=...)`
+API. That bounded-reply SDK extension is currently an unmerged candidate.
+It must finish SDK review and merge before a production build is approved.
+The bridge checks callable `MessageAuthority.capture` and framing, their call
+signatures, all required message functions and the bounded reply signature
+before credential capture. A generic `**kwargs` parameter does not establish
+bounded reply support. An old or incomplete package fails safely with
+`brigade-prerequisite`. Real credential-file and authorization errors retain
+their existing refusal reasons.
 Selecting and installing an approved production release remains an operator
 gate, alongside independent review and a separately authorized canary. Local
 verification of a package built from that merge does not establish that an
@@ -231,7 +240,14 @@ timeline pages save the consumed zero-based position and the sole candidate
 together. Selection waits for the complete scan, including later pages that
 could prove ambiguity. Timeline, sent-history and inbox inspection continue
 from their committed checkpoints on a later drain when the page bound is reached.
-Brigade also applies its own bounded transport, spool batch and lock limits. An already
+Both reply and credential-scoped spool reconciliation use `lock_timeout=0`.
+They attempt lock acquisition without waiting. Reply contention preserves
+`reply-intent` with `upstream-pending`, without sending or enqueueing the reply.
+The saved reply key and exact body remain available for a later bounded drain.
+
+This bounds lock acquisition only. It does not impose a total operation or
+network deadline and does not cancel a call that has acquired its lock.
+Supported client transport and spool batch limits still apply. An already
 started supported client call can finish after the bridge deadline. No timeout
 cancels a T3 run or authorizes a replacement run.
 
@@ -251,6 +267,9 @@ It recovers saved intent or handles and finishes only the remaining phases.
   reusing a token does not restore the retained authorization generation.
 - Reply acceptance lost: reconcile the credential-scoped spool and sent rows,
   or retry the identical reply key and exact saved body. No new T3 turn occurs.
+- Reply spool lock busy: retain reply intent and repeat the bounded drain after
+  contention clears. Recovery rechecks authorization and acceptance before
+  retrying the saved key. No background reply or alternate credential is used.
 - Ack response lost: revalidate authority, inbound content and durable reply,
   then retry the acknowledgement. No new turn or reply occurs.
 - Route drift, mismatched handles, ambiguous output or reply linkage: retain a
@@ -282,8 +301,12 @@ installed untrusted wrapper for question, imperative and injected-control inputs
 The compatible installed identity test uses a local HTTP fixture with a
 temporary credential, real credential-scope checks, strict wire validation and
 unsupported, denied and transient responses. All requests carry the peer list.
+The installed reply test uses real SDK process and file locks with fake HTTP
+transport. It checks contention, unchanged intent and keys, empty reply queues
+on contention and exactly one accepted reply after release. Fixture holders
+always release and join within bounded test waits.
 Run these tests in the approved environment containing compatible Brigade.
-The ordinary stdlib-only environment skips those three installed-package checks.
+The ordinary stdlib-only environment skips those four installed-package checks.
 They check serialization, authorization consumption and prompt construction,
 without proving model compliance, live Hub interoperability or permission grants. The existing
 cross-repository wire test skips unless `T3_FLEET_BRIGADE_SOURCE` points at a

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 import http.client
+import inspect
 import json
 import os
 from pathlib import Path
@@ -371,14 +372,26 @@ class BrigadeMessages:
             if not all(callable(getattr(client, name, None)) for name in
                        ("identity", "list_messages", "reply", "sent", "ack", "flush_credential")):
                 raise ImportError
-        except ImportError:
+            capture = getattr(getattr(client, "MessageAuthority", None), "capture", None)
+            if not callable(capture) or not callable(wrap_untrusted):
+                raise ImportError
+            inspect.signature(capture).bind(str(config.hub_token_file))
+            inspect.signature(wrap_untrusted).bind("", source_kind="peer-message", goal=_RELAY_ANSWER_GOAL)
+            reply_signature = inspect.signature(client.reply)
+            lock_parameter = reply_signature.parameters.get("lock_timeout")
+            # A generic **kwargs surface cannot attest bounded acquisition.
+            if lock_parameter is None or lock_parameter.kind is not inspect.Parameter.KEYWORD_ONLY:
+                raise ImportError
+            reply_signature.bind(1, body="", subject=None, reference=None, priority="normal", client_id="",
+                                 lock_timeout=0, authority=None, expected_scope="")
+        except (ImportError, TypeError, ValueError):
             raise BridgeError("brigade-prerequisite") from None
         # Explicit protected token file only. MessageAuthority.validate retains
         # the captured credential for each supported operation and spool flush.
         private_read(config.hub_token_file, 4096)
         self.client = client
         self._frame = wrap_untrusted
-        self._authority = client.MessageAuthority.capture(str(config.hub_token_file))
+        self._authority = capture(str(config.hub_token_file))
         self.authority = self._authority.hub.rstrip("/")
         self.fingerprint = self._authority.scope
         self._kwargs = {"authority": self._authority, "expected_scope": self.fingerprint}
@@ -409,7 +422,7 @@ class BrigadeMessages:
 
     def reply(self, message_id, *, body, client_id) -> dict:
         return self.client.reply(message_id, body=body, subject=None, reference=None,
-                                 priority="normal", client_id=client_id, **self._kwargs)
+                                 priority="normal", client_id=client_id, lock_timeout=0, **self._kwargs)
 
     def sent(self, *, after=0, ids=None) -> dict:
         return self.client.sent(after=after, **({"ids": ids} if ids is not None else {}), **self._kwargs)
