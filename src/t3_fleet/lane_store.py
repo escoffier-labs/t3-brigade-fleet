@@ -11,6 +11,8 @@ from pathlib import Path
 
 from .errors import IdempotencyConflict, ValidationError
 
+MAX_OPERATIONS = 10000
+
 
 def private_directory(path: Path, *, create: bool = False) -> None:
     """Refuse links and shared directories instead of changing their permissions."""
@@ -101,6 +103,8 @@ class LaneStore:
                 if row['digest'] != digest:
                     raise IdempotencyConflict('operation ID has a different payload')
                 return False, json.loads(row['receipt'])
+            if db.execute('SELECT count(*) FROM operations').fetchone()[0] >= MAX_OPERATIONS:
+                raise ValidationError('lane operation limit reached')
             ids = [{'status': 'unknown' if messages == 1 else 'not_sent',
                     'command_id': str(uuid.uuid4()), 'message_id': str(uuid.uuid4())}
                    for _ in range(messages)]

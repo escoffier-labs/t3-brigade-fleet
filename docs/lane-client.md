@@ -5,8 +5,10 @@ It also prepares context packets, requests Codex compaction, and lists attention
 items. Fleet-managed threads require the admitted `t3-fleet` continuation route.
 
 The client uses the existing fleet configuration and target-local session issuer.
-Select an enabled host with `transport = "local"` and an explicit
-`agent_state_dir`. URLs and executables come from that configuration. The client
+It requires exactly one enabled `transport = "local"` host. Its
+`expected_hostname` must match this machine's hostname without case sensitivity.
+The `--host` value must select that host. Configure an explicit `agent_state_dir`.
+URLs and executables come from that configuration. The client
 does not launch threads, change models or modes,
 answer requests, run builds, or use SSH.
 
@@ -36,7 +38,9 @@ matching the live thread worktree, or the project's workspace root when the
 thread has no worktree. The client captures the live environment ID and refuses
 rebinding the same host/thread to another identity. A successful result contains
 `status: "bound"`, `thread_id`, `environment_id`, `project_id`, and `workspace`.
-There are at most 128 bindings per state database.
+There are at most 128 bindings and 10,000 durable operations per state database.
+At capacity, an existing identical replay still returns its receipt, while a
+new operation is refused. Unknown and partial rows are never pruned.
 
 Before binding, packet creation, or message delivery, the client reads the
 configured agent's `target.db` with SQLite read-only access. A matching receipt
@@ -136,6 +140,8 @@ The Markdown packet labels supplied facts as caller-provided and records live
 environment/thread/project/run identity, resolved workspace, HEAD, and dirty
 file names. It copies no conversation history, file contents, diffs, or logs.
 At most 256 dirty names and 65,536 bytes of Git status output are accepted.
+Git reads disable optional locks, configured fsmonitor programs and hooks, and
+remove inherited `GIT_*` overrides before inspecting this bound workspace.
 `context` returns `prepared`, the output path, identity, run ID, and HEAD.
 It sends no lane message.
 

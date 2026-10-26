@@ -98,3 +98,34 @@ must be synced and rechecked after implementation. No historical Brigade claim.
 - Required projection check: `20261026-025245-work-verify-af67fe`, exit 0.
 - An optional receipt-index import reported SQLITE_BUSY and retained its export.
   Receipts remain available locally. No artifact scoring is claimed.
+
+## Task 2 review-fix evidence
+
+- Review fixes A-D were reproduced before implementation in
+  `20261026-031925-work-verify-bb28dc` and passed together in
+  `20261026-032023-work-verify-ce2a65` (5 focused tests). The first invocation
+  had a missing `PYTHONPATH` (`20261026-031916-work-verify-f4103c`). It did not
+  import the test module and is not RED evidence.
+- Compaction now persists `unknown` after packet preparation and before support
+  checks or sends. The interruption regression verifies no network call,
+  `unknown` replay with both messages `not_sent`, exit 3, and attention visibility.
+- Lane Git reads disable optional locks, fsmonitor and hooks, and remove inherited
+  `GIT_*` environment overrides. A configured fsmonitor marker remains absent
+  while context preparation still reads the bound HEAD and status.
+- Lane construction now requires one case-insensitive hostname match and rejects
+  ambiguous matches or a mismatched `--host` before T3 construction or state
+  creation. A nonmatching alias with a missing alternate state database does not
+  affect the unique match.
+- The lane database now has a fixed 10,000-operation limit. Duplicate replay is
+  checked before capacity, and concurrent reservations cannot exceed the cap.
+  Bindings remain capped at 128.
+- Final verification passed. Generation receipt: `20261026-032042-work-verify-682316`.
+  Full suite receipt: `20261026-032048-work-verify-c65366` with 1,122 tests
+  and one skip. Projection check receipt: `20261026-032200-work-verify-0b876e`.
+  Vale receipt: `20261026-032216-work-verify-9c2bbc`. Diff check receipt:
+  `20261026-032224-work-verify-1c65ee`. An earlier Vale run reported one
+  semicolon in operator prose (`20261026-032206-work-verify-f7a620`). It was
+  corrected before the passing Vale run.
+- Remaining finding: parent is separately adjudicating Daybreak's unverified
+  provider identity race in `/compact`. This task does not resolve or redesign
+  that behavior. No live lane messages were sent and no commit was made.

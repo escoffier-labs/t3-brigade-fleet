@@ -5,8 +5,10 @@ import io
 import json
 import os
 import sqlite3
+import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -82,7 +84,7 @@ class LaneTests(unittest.TestCase):
             subprocess.run(['git', '-C', str(self.workspace), *args], check=True,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.sha = subprocess.check_output(['git', '-C', str(self.workspace), 'rev-parse', 'HEAD']).decode().strip()
-        host = HostConfig('local', True, 'linux', 'local', None, ('agent',), 1, 'example',
+        host = HostConfig('local', True, 'linux', 'local', None, ('agent',), 1, socket.gethostname(),
                           'http://127.0.0.1:3773', ('t3',), None, str(self.root / 'agent'))  # content-guard: allow loopback-ipv4
         self.config = FleetConfig('local', 1, None, {'local': host}, {})
         self.app = App(self.workspace)
@@ -115,6 +117,101 @@ class LaneTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             LaneClient(replace(self.config, hosts={'local': remote}), 'local', self.root / 'remote')
         self.assertEqual(self.app.calls, [])
+
+    def test_lane_requires_unique_actual_hostname_before_t3_or_state_access(self):
+        actual_hostname = socket.gethostname()
+        second = replace(self.config.hosts['local'], host_id='alias', expected_hostname=actual_hostname)
+        alternate = replace(self.config.hosts['local'], host_id='alias',
+                             expected_hostname=actual_hostname + '-alternate',
+                             agent_state_dir=str(self.root / 'missing-agent-state'))
+        wrong = replace(self.config.hosts['local'], expected_hostname=actual_hostname + '-wrong')
+        with patch('t3_fleet.lane.socket.gethostname', return_value=actual_hostname.swapcase()):
+            with patch('t3_fleet.lane.T3Client') as t3:
+                for hosts, host_id in (({'local': self.config.hosts['local'], 'alias': second}, 'local'),
+                                       ({'local': wrong}, 'local'), ({'local': alternate}, 'alias')):
+                    state = self.root / ('state-' + host_id + str(len(hosts)))
+                    with self.subTest(hosts=len(hosts), host_id=host_id):
+                        with self.assertRaises(ValidationError):
+                            LaneClient(replace(self.config, hosts=hosts), host_id, state)
+                        self.assertFalse(state.exists())
+                t3.assert_not_called()
+            unique_state = self.root / 'state-valid-host'
+            valid_config = replace(self.config, hosts={'local': self.config.hosts['local'], 'alias': alternate})
+            with patch('t3_fleet.lane.T3Client', return_value=self.app):
+                client = LaneClient(valid_config, 'local', unique_state)
+            self.assertEqual(client.host_id, 'local')
+
+    def test_git_context_disables_repo_fsmonitor_and_preserves_bound_head_status(self):
+        self.bind()
+        marker = self.root / 'fsmonitor-ran'
+        executable = self.root / 'fsmonitor'
+        executable.write_text(f'#!/bin/sh\nprintf ran > {marker}\n')
+        executable.chmod(0o700)
+        subprocess.run(['git', '-C', str(self.workspace), 'config', 'core.fsmonitor', str(executable)], check=True)
+        self.assertEqual(self.client._head(self.client._bound('thread-1')), self.sha)
+        result = self.client.context(self.packet)
+        self.assertEqual(result['head'], self.sha)
+        self.assertFalse(marker.exists())
+
+    def test_compact_interruption_after_packet_receipt_is_unknown_and_visible(self):
+        self.bind()
+        with patch.object(self.client, '_supports_compaction', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.client.compact(self.packet)
+        replay = self.make_client().compact(self.packet)
+        self.assertEqual(replay['status'], 'unknown')
+        self.assertTrue(replay['packet_prepared'])
+        self.assertEqual([message['status'] for message in replay['messages']], ['not_sent', 'not_sent'])
+        self.assertEqual(self.app.calls, [])
+        attention = self.make_client().attention()
+        self.assertTrue(attention['lanes'][0]['needs_review'])
+        self.assertEqual(attention['lanes'][0]['unknown_deliveries'][0]['status'], 'unknown')
+        with patch('t3_fleet.lane.load_config', return_value=self.config), \
+                patch('t3_fleet.lane.T3Client', return_value=self.app), \
+                patch('sys.stdin', io.StringIO(json.dumps(self.packet))), \
+                patch('sys.stdout', io.StringIO()) as output:
+            code = main(['--config', 'unused', '--host', 'local', '--state-dir', str(self.state), 'compact'])
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(output.getvalue())['status'], 'unknown')
+
+    def test_operation_capacity_is_checked_after_duplicate_lookup(self):
+        from t3_fleet.lane_store import MAX_OPERATIONS
+
+        db = self.state / 'lane.db'
+        with sqlite3.connect(db) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            conn.executemany('INSERT INTO operations VALUES (?,?,?,?,?)',
+                             [('env-x', f't-{i}', f'e-{i}', 'd', '{"status":"unknown"}')
+                              for i in range(MAX_OPERATIONS)])
+        self.assertFalse(self.client.store.claim('env-x', 't-0', 'e-0', 'd')[0])
+        with self.assertRaises(ValidationError):
+            self.client.store.claim('new-env', 'new-thread', 'new-event', 'new-digest')
+
+    def test_concurrent_new_operations_cannot_exceed_capacity(self):
+        from t3_fleet.lane_store import MAX_OPERATIONS
+
+        db = self.state / 'lane.db'
+        with sqlite3.connect(db) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            conn.executemany('INSERT INTO operations VALUES (?,?,?,?,?)',
+                             [('env-x', f't-{i}', f'e-{i}', 'd', '{"status":"unknown"}')
+                              for i in range(MAX_OPERATIONS - 1)])
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def claim(thread):
+            barrier.wait()
+            try:
+                outcomes.append(self.client.store.claim('new-env', thread, 'event', 'digest')[0])
+            except ValidationError:
+                outcomes.append(False)
+
+        workers = [threading.Thread(target=claim, args=(f'new-{i}',)) for i in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        self.assertEqual(sorted(outcomes), [False, True])
 
     def test_delivery_is_durable_and_conflicting_payload_never_sends(self):
         self.bind()

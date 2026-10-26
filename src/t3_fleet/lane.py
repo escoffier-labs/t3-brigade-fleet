@@ -9,6 +9,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import socket
 from pathlib import Path
 
 from .config import FleetConfig, load_config
@@ -27,7 +28,7 @@ _TERMINAL = {'completed', 'failed', 'interrupted', 'cancelled', 'rolled_back'}
 
 # Only fixed local guard messages can select a public diagnostic reason.
 _GUARD_REASONS = {
-    'lane client requires an enabled local host': 'local_host_required',
+    'lane client requires a unique local host matching this machine': 'local_host_required',
     'lane client requires explicit agent_state_dir': 'agent_state_dir_required',
     'lane must be explicitly bound first': 'binding_required',
     'bound lane identity or workspace changed': 'binding_changed',
@@ -76,6 +77,12 @@ def _digest(value):
 
 class LaneClient:
     def __init__(self, config: FleetConfig, host_id: str, state_dir: Path):
+        hostname = socket.gethostname().casefold()
+        matches = [host for host in config.hosts.values()
+                   if host.enabled and host.transport == 'local'
+                   and host.expected_hostname.casefold() == hostname]
+        if len(matches) != 1 or matches[0].host_id != host_id:
+            raise ValidationError('lane client requires a unique local host matching this machine')
         host = config.hosts.get(host_id)
         if host is None or not host.enabled or host.transport != 'local':
             raise ValidationError('lane client requires an enabled local host')
@@ -189,8 +196,11 @@ class LaneClient:
 
     def _git(self, workspace, *args):
         try:
-            result = subprocess.run(['git', '-C', workspace, *args], stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False)
+            env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+            result = subprocess.run(['git', '--no-optional-locks', '-c', 'core.fsmonitor=false',
+                                     '-c', f'core.hooksPath={os.devnull}', '-C', workspace, *args],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, timeout=10, check=False, env=env)
         except (OSError, subprocess.SubprocessError):
             raise ValidationError('workspace Git state is unavailable') from None
         if result.returncode or len(result.stdout) > 65536:
@@ -334,7 +344,7 @@ class LaneClient:
         if not claimed:
             return receipt
         packet = self._prepare(value, live)
-        receipt.update(packet_prepared=True, output_path=packet['output_path'], status='prepared')
+        receipt.update(packet_prepared=True, output_path=packet['output_path'], status='unknown')
         self.store.finish(live['environment_id'], value['thread_id'], event, receipt)
         if not self._supports_compaction(live):
             receipt['status'] = 'unsupported'
