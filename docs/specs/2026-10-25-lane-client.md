@@ -11,7 +11,7 @@ Add `t3-lane`, a separate operator CLI for local app threads. It never launches
 threads, changes provider/model/permission settings, executes builds, or approves
 requests. Fleet-managed threads must use the existing admitted fleet continuation
 route and are refused for lane mutations. Resolve the configured local host using
-the existing fleet config, not a caller-supplied URL or executable. No SSH.
+the existing fleet config. Caller-supplied URLs, executables, and SSH are disallowed.
 Check the configured target.db read-only for matching thread receipts before any
 mutation. Fail closed on unreadable/malformed ownership state. An absent target.db
 means there are no registered target receipts. Do not create or alter that database.
@@ -42,9 +42,9 @@ failed_checks (max 32 names), evidence_path (reference only), mode (`queue` defa
 `steer` explicit). The event belongs to the original run and revision. Compare
 workspace HEAD and latest run before delivery. Mismatches return `stale` without
 delivery. Do not treat a matching SHA as proof of clean-worktree verification.
-Clearly label event text as external evidence, not instructions or new authority.
+Label event text as external evidence. Event text grants no execution authority.
 The source revision remains caller-asserted evidence. These checks establish the
-current run and current HEAD only, not a historical run-to-revision association.
+current run and current HEAD only. They cannot establish historical provenance.
 
 An event ID is scoped by environment/thread. Identical retries return the prior
 receipt without another send. Different payload with same ID is a conflict.
@@ -52,22 +52,22 @@ Reserve before network I/O, persist stable command/message IDs, reject concurren
 duplicate attempts, and retain `unknown` after uncertain acceptance. No automatic
 retry of an uncertain mutation. Print accepted sequence and IDs, not a claim that
 the agent consumed the event or that a build passed. Queue uses the verified v2
-`message.dispatch` with `dispatchMode.type=queue_after_active`; steer uses
+`message.dispatch` with `dispatchMode.type=queue_after_active`. steer uses
 `steer_active` and the exact targetRunId. Never restart or silently fall back.
 
 `context`: thread_id, objective, decisions (list), verification (list of evidence
 references), next_action, output_path. Write an exclusive owner-only Markdown
 packet containing supplied facts, live thread/run IDs, workspace HEAD and dirty
 file names. Do not copy raw history, diffs or logs. Do not overwrite an existing
-packet. Label supplied fields as caller-provided, not inferred from the thread.
+packet. Label supplied fields as caller-provided.
 
 `compact`: prepares that packet first, then queues the exact `/compact` message
 with no attachments on Codex only, through the existing v2 message dispatch seam.
 The installed T3 binary contains `/compact` handling and Codex
-`thread/compact/start`; verify the adapter path before implementing the trigger.
+`thread/compact/start`. verify the adapter path before implementing the trigger.
 Reject other drivers and unsupported server versions, while retaining the packet.
 Also queue a bounded handoff reference before `/compact`, so the prepared context
-is represented in the conversation, not only on disk. Persist operation identity
+is represented in the conversation. Persist operation identity
 for both messages and report partial/unknown delivery honestly. Do not compact the
 parent or another active human lane in testing. Preparation is useful even when
 compaction cannot be requested. Accepted compaction is not completed compaction.
@@ -75,8 +75,8 @@ compaction cannot be requested. Accepted compaction is not completed compaction.
 `attention`: read-only, scoped to explicitly bound lanes. Summarize pending
 questions/permissions (without answering), failed runs, unknown deliveries and
 terminal results that need review. Never mark results as acknowledged merely by
-listing them. Bound output; do not print full prompts, tokens, private log text.
-Report unavailable lanes separately rather than presenting them as healthy.
+listing them. Bound output. do not print full prompts, tokens, private log text.
+Report unavailable lanes explicitly.
 
 ## Verification and review
 

@@ -27,10 +27,10 @@
 Follow src/t3_fleet/t3_api.py for bounded error/session behavior and
 tests/test_t3_api.py for transport contract fixtures. Follow existing config loading.
 
-Interfaces: LaneStore(path) owns bind/get/claim/finish state; LaneClient(config,
+Interfaces: LaneStore(path) owns bind/get/claim/finish state. LaneClient(config,
 host_id,state_dir) owns bind(payload), deliver(payload), context(payload),
 compact(payload), attention(). CLI main(argv=None) returns an exit code and prints
-one bounded JSON result. Actual helper signatures may follow existing house style;
+one bounded JSON result. Actual helper signatures may follow existing house style.
 all public input/output contracts and failure behaviors are fixed by the spec.
 
 - [ ] Write tests before each behavior and observe its expected missing-feature failure.
