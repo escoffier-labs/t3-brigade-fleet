@@ -8,8 +8,12 @@ daemon, timers, frontend changes, or runtime installation during development.
 ## Boundary and defaults
 
 Add `t3-lane`, a separate operator CLI for local app threads. It never launches
-threads, changes provider/model/permission settings, executes builds, or approves
-requests. Fleet-managed threads must use the existing admitted fleet continuation
+threads, issues provider/model/permission configuration commands, executes builds,
+or approves requests. Native T3 queue semantics apply: queued work snapshots its
+model selection and can restore that selection when it starts, including after
+an intervening lane switch. This behavior is accepted for the client. There is
+no atomic expected-selection guard, and the client does not promise one.
+Fleet-managed threads must use the existing admitted fleet continuation
 route and are refused for lane mutations. Resolve the configured local host using
 the existing fleet config. Caller-supplied URLs, executables, and SSH are disallowed.
 Check the configured target.db read-only for matching thread receipts before any

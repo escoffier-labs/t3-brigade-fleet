@@ -9,8 +9,15 @@ It requires exactly one enabled `transport = "local"` host whose
 `expected_hostname` matches this machine's hostname without case sensitivity.
 The `--host` value must select that host. Configure an explicit `agent_state_dir`.
 URLs and executables come from that configuration. The client
-does not launch threads, change models or modes,
+does not launch threads, issue model or mode configuration commands,
 answer requests, run builds, or use SSH.
+
+T3 snapshots a queued message's model selection and can restore it when that
+message runs, even after an intervening lane switch. The client uses this normal
+queue behavior for evidence delivery and compaction. Its identity checks happen
+before dispatch. The API has no atomic expected-model or expected-provider guard.
+Avoid switching a bound lane's model while its queued client work is pending if
+you want that switch to remain in effect.
 
 ## Commands
 

@@ -135,7 +135,7 @@ must be synced and rechecked after implementation. No historical Brigade claim.
 Astra confirmed the interrupted-compaction fix at `1e3f630`. Daybreak's second
 pass reviewed `f6bd1e2..1e3f630` and confirmed the Git-read, local-host, receipt-cap,
 and interrupted-operation fixes without a new concrete blocker. Security approval
-remains conditional on the compaction queue decision.
+was conditional on the compaction queue decision, now accepted as described below.
 
 A disposable lane acknowledged build and prerequisite events. Identical replay
 returned the original receipt. Stale run and revision events were refused. Private
@@ -144,10 +144,9 @@ Codex compaction before the security fixes. A fresh delivery/context check on th
 hardened source also passed. Final wheel construction passed without dependencies
 or network access. These are local audit checks, not scoreable artifacts.
 
-Publication and installation remain held. The server snapshots model selection
-for queued runs and can restore it when they start. No expected-provider/model
-compare-and-set field exists. Explicit per-message model selection does not solve
-this because execution can update the lane's default selection. The pending
-operator choice is ordinary T3 queue semantics with that limitation documented,
-or context preparation with automatic compaction disabled. Do not treat elapsed
-time or a successful live compaction as approval of that behavior.
+The operator explicitly accepted ordinary T3 queue semantics on 2026-10-26,
+with the limitation documented. The server snapshots model selection for queued
+runs and can restore it when they start. No expected-provider/model compare-and-set
+field exists. This is an accepted platform limitation, not a resolved atomicity
+guarantee. The client issues no model or permission configuration commands.
+The queue-related publication and installation hold is lifted.
