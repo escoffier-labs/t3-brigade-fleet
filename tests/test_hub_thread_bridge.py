@@ -24,9 +24,17 @@ from t3_fleet.hub_thread_store import BridgeStore
 
 try:
     from brigade import fleet_hub_messages as installed_messages
+    from brigade import fleet_client_messages as installed_client
     from brigade.untrusted import wrap_untrusted as installed_wrap_untrusted
 except ImportError:
-    installed_messages = installed_wrap_untrusted = None
+    installed_messages = installed_wrap_untrusted = installed_client = None
+
+
+def authorization(peers=("agent:peer-a",)):
+    return dict(schema="brigade.message_authorization.v1", principal="agent:consumer-a",
+                enrollment_epoch="caller-enrollment-0001", grant_epoch="caller-grant-0001",
+                peers=[dict(principal=peer, authorized=True, enrollment_epoch=f"peer-enrollment-{i:04d}",
+                            grant_epoch=f"peer-grant-{i:08d}") for i, peer in enumerate(peers)])
 
 
 def inbound(message_id=1):
@@ -69,11 +77,18 @@ class FakeHub:
         self.sent_reads = []
         self.inbox_reads = []
         self.before_reply_rows = 0
+        self.authorization = authorization()
+        self.identity_reads = []
 
-    def identity(self):
+    def identity(self, *, peers=None):
         if self.revoked:
             raise BridgeError("hub-authority")
-        return self.principal
+        if peers is None:
+            return self.principal
+        self.identity_reads.append(list(peers))
+        result = copy.deepcopy(self.authorization)
+        result["principal"] = self.principal
+        return result
 
     def inbox(self, *, after=0, unacked=False):
         self.inbox_reads.append((after, unacked))
@@ -241,6 +256,236 @@ class RelayTests(unittest.TestCase):
 
     def counts(self):
         return len(self.t3.sends), len(self.hub.replies), len(self.hub.acked)
+
+    def test_intake_pins_four_public_epochs_and_status_does_not_disclose_them(self):
+        original = BridgeStore.save
+        def crash(store, record):
+            original(store, record)
+            if record["state"] == "received":
+                raise KeyboardInterrupt()
+        with patch.object(BridgeStore, "save", crash), self.assertRaises(KeyboardInterrupt):
+            self.drain()
+        with BridgeStore(self.root / "bridge.db") as store:
+            record = store.pending()
+        self.assertEqual(record["authorization"], {
+            "enrollment_epoch": "caller-enrollment-0001", "grant_epoch": "caller-grant-0001",
+            "peer_enrollment_epoch": "peer-enrollment-0000", "peer_grant_epoch": "peer-grant-00000000"})
+        status = json.dumps(Bridge(self.config_path).status())
+        for epoch in record["authorization"].values():
+            self.assertNotIn(epoch, status)
+        self.assertEqual(self.counts(), (0, 0, 0))
+        self.assertEqual(self.drain()["state"], "acked")
+        self.assertEqual(self.counts(), (1, 1, 1))
+
+    def test_epoch_drift_or_missing_pins_holds_every_recovery_phase_without_repin(self):
+        for state in ("received", "dispatch-intent", "dispatched", "terminal", "reply-intent", "replied"):
+            for change in ("caller-enrollment", "caller-grant", "peer-enrollment", "peer-grant", "legacy"):
+                with self.subTest(state=state, change=change):
+                    self.config["ledger_file"] = f"{state}-{change}.db"
+                    self.write(self.config_path, self.config)
+                    self.hub, self.t3 = FakeHub(), FakeT3()
+                    original = BridgeStore.save
+                    def crash(store, record):
+                        original(store, record)
+                        if record["state"] == state:
+                            raise KeyboardInterrupt()
+                    with patch.object(BridgeStore, "save", crash), self.assertRaises(KeyboardInterrupt):
+                        self.drain()
+                    path = self.root / self.config["ledger_file"]
+                    with BridgeStore(path) as store:
+                        record = store.pending()
+                        pinned = copy.deepcopy(record.get("authorization"))
+                        if change == "legacy":
+                            record.pop("authorization", None)
+                            store.save(record)
+                    if change != "legacy":
+                        target = self.hub.authorization if change.startswith("caller") else self.hub.authorization["peers"][0]
+                        target["enrollment_epoch" if change.endswith("enrollment") else "grant_epoch"] = "replacement-epoch-0001"
+                    before = (self.counts(), len(self.t3.calls), self.hub.reply_calls, self.hub.ack_calls,
+                              self.hub.flush_calls, len(self.hub.inbox_reads), len(self.hub.sent_reads))
+                    result = self.drain()
+                    self.assertEqual((result["state"], result["reason"]), ("held", "hub-authority"))
+                    self.assertEqual(before, (self.counts(), len(self.t3.calls), self.hub.reply_calls, self.hub.ack_calls,
+                                             self.hub.flush_calls, len(self.hub.inbox_reads), len(self.hub.sent_reads)))
+                    with BridgeStore(path) as store:
+                        saved = store.pending()
+                    self.assertEqual(saved.get("authorization"), None if change == "legacy" else pinned)
+                    self.hub.authorization = authorization()
+                    self.assertEqual(self.drain()["state"], "held")
+                    self.assertEqual(self.counts(), before[0])
+
+    def test_fresh_authorization_between_transport_boundaries(self):
+        # Revocation occurs after a successful boundary, before the next one.
+        # Fakes deliberately do not enforce grants, so a missing relay check leaks an effect.
+        phases = ("intake", "inbound", "environment", "snapshot", "resume-snapshot", "send", "wait",
+                  "timeline", "text", "reconcile", "sent-page", "reply", "accepted-id")
+        for phase in phases:
+            with self.subTest(phase=phase):
+                self.config["ledger_file"] = f"boundary-{phase}.db"
+                self.write(self.config_path, self.config)
+                self.hub, self.t3 = FakeHub(), FakeT3()
+                events, tripped, snapshots = [], [], []
+                def observed(label):
+                    events.append(label)
+                    if label == phase and not tripped:
+                        tripped.append(len(events))
+                        self.hub.authorization["peers"][0]["grant_epoch"] = "new-peer-grant-0001"
+                call = self.t3.call
+                def t3_call(name, args):
+                    result = call(name, args)
+                    if name == "t3_thread_read":
+                        if args.get("maxCharsPerItem") == 1:
+                            snapshots.append(True)
+                            label = "snapshot" if len(snapshots) == 1 else "resume-snapshot"
+                        else:
+                            label = "text" if "itemId" in args else "timeline"
+                    else:
+                        label = {"t3_environment_read": "environment", "t3_thread_send": "send", "t3_thread_wait": "wait"}[name]
+                    observed(label)
+                    return result
+                self.t3.call = t3_call
+                if phase == "timeline":
+                    item = self.t3.item()
+                    self.t3.pages = {0: dict(thread=self.t3.thread, items=[item], hasMore=True, nextPosition=0)}
+                if phase == "text":
+                    item = self.t3.item()
+                    item.update(text="First", textTruncated=True, nextTextOffset=5)
+                    tail = copy.deepcopy(item)
+                    tail.update(text=" tail", textTruncated=True, nextTextOffset=10)
+                    final = copy.deepcopy(item)
+                    final.update(text=" end", textTruncated=False, nextTextOffset=None)
+                    self.t3.pages = {0: dict(thread=self.t3.thread, items=[item], hasMore=False, nextPosition=None)}
+                    self.t3.chunks = {5: [tail], 10: [final]}
+                for method in ("inbox", "reconcile", "sent", "reply", "ack"):
+                    original_method = getattr(self.hub, method)
+                    def wrapped(*args, method=method, original_method=original_method, **kwargs):
+                        result = original_method(*args, **kwargs)
+                        label = method
+                        if method == "inbox":
+                            label = "intake-read" if kwargs.get("unacked") else "inbound"
+                        if method == "sent":
+                            label = "accepted-id" if kwargs.get("ids") else "sent-page"
+                        observed(label)
+                        return result
+                    setattr(self.hub, method, wrapped)
+                save = BridgeStore.save
+                def intake(store, record):
+                    save(store, record)
+                    if record["state"] == "received":
+                        observed("intake")
+                with patch.object(BridgeStore, "save", intake):
+                    result = self.drain()
+                self.assertTrue(tripped, events)
+                self.assertEqual((result["state"], result["reason"]), ("held", "hub-authority"))
+                self.assertEqual(events[tripped[0]:], [], events)
+                # The reply boundary may already have accepted one response.
+                self.assertEqual(len(self.hub.acked), 0)
+
+    def test_denied_caller_and_invalid_authorization_never_dispatch(self):
+        cases = ("denied", "caller", "schema", "extra", "missing", "local-null", "local-short",
+                 "peer-null", "peer-short", "peer-newline", "integer-bool", "false-epochs",
+                 "wrong-peer", "duplicate-peer", "missing-peer", "peer-extra", "basic")
+        for case in cases:
+            with self.subTest(case=case):
+                self.config["ledger_file"] = f"invalid-{case}.db"
+                self.write(self.config_path, self.config)
+                self.hub, self.t3 = FakeHub(), FakeT3()
+                value = self.hub.authorization
+                peer = value["peers"][0]
+                if case == "denied": peer.update(authorized=False, enrollment_epoch=None, grant_epoch=None)
+                elif case == "caller": self.hub.principal = "agent:other"
+                elif case == "schema": value["schema"] = "brigade.message_authorization.v0"
+                elif case == "extra": value["extra"] = True
+                elif case == "missing": del value["grant_epoch"]
+                elif case == "local-null": value["enrollment_epoch"] = None
+                elif case == "local-short": value["grant_epoch"] = "short"
+                elif case == "peer-null": peer["enrollment_epoch"] = None
+                elif case == "peer-short": peer["grant_epoch"] = "short"
+                elif case == "peer-newline": peer["grant_epoch"] += "\n"
+                elif case == "integer-bool": peer["authorized"] = 1
+                elif case == "false-epochs": peer["authorized"] = False
+                elif case == "wrong-peer": peer["principal"] = "agent:other"
+                elif case == "duplicate-peer": value["peers"].append(copy.deepcopy(peer))
+                elif case == "missing-peer": value["peers"] = []
+                elif case == "peer-extra": peer["extra"] = True
+                elif case == "basic": self.hub.identity = lambda **kwargs: {"principal": self.hub.principal}
+                result = self.drain()
+                self.assertIn(result["state"], {"held", "blocked"})
+                self.assertIn(result["reason"], {"hub-authority", "brigade-prerequisite"})
+                self.assertEqual(self.counts(), (0, 0, 0))
+                self.assertEqual(self.t3.calls, [])
+
+    def test_equal_empty_restored_grants_and_reused_token_enrollment_do_not_resume(self):
+        for operation in ("equal-grants", "empty-grants", "restored-grants", "reenroll-same-token"):
+            with self.subTest(operation=operation):
+                self.config["ledger_file"] = f"operation-{operation}.db"
+                self.write(self.config_path, self.config)
+                self.hub, self.t3 = FakeHub(), FakeT3()
+                self.t3.lose_send = True
+                self.assertEqual(self.drain()["state"], "dispatch-intent")
+                peer = self.hub.authorization["peers"][0]
+                if operation == "empty-grants":
+                    peer.update(authorized=False, enrollment_epoch=None, grant_epoch=None)
+                elif operation == "reenroll-same-token":
+                    peer.update(enrollment_epoch="re-enrollment-0001", grant_epoch="re-enrolled-grant-0001")
+                else:
+                    peer["grant_epoch"] = "replacement-grant-0001"
+                self.assertEqual(self.drain()["state"], "held")
+                peer.update(authorized=True, enrollment_epoch="peer-enrollment-0000", grant_epoch="restored-grant-0001")
+                self.assertEqual(self.drain()["state"], "held")
+                self.assertEqual(self.t3.send_calls, 1)
+                self.assertEqual(self.counts(), (1, 0, 0))
+
+    @unittest.skipUnless(callable(getattr(installed_client, "identity", None)), "requires compatible installed Brigade identity")
+    def test_installed_identity_boundary_uses_exact_scope_and_never_falls_back(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MessageIdentityServer)  # content-guard: allow loopback-ipv4
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        origin = f"http://127.0.0.1:{server.server_port}"  # content-guard: allow loopback-ipv4
+        self.config["hub_authority"] = origin
+        cases = ((200, None, "none"), (400, "invalid_argument", "brigade-prerequisite"),
+                 (403, "message_identity_peers_unsupported", "brigade-prerequisite"),
+                 (401, None, "hub-authority"), (403, "message_sender_inactive", "hub-authority"),
+                 (503, "hub_unavailable", "upstream-pending"), (200, "malformed", "hub-authority"),
+                 (200, "basic-client", "brigade-prerequisite"))
+        for index, (status, code, reason) in enumerate(cases):
+            with self.subTest(status=status, code=code), contextlib.ExitStack() as stack:
+                self.config["ledger_file"] = f"installed-{index}.db"
+                self.write(self.config_path, self.config)
+                self.hub, self.t3 = FakeHub(), FakeT3()
+                server.seen, server.status = [], status
+                server.payload = authorization() if status == 200 else {"error": "private upstream detail", "code": code}
+                if code == "malformed": server.payload["peers"][0]["authorized"] = 1
+                stack.enter_context(patch.object(installed_client.fleet_client, "load_fleet_settings", return_value={"hub_url": origin}))
+                stack.enter_context(patch.object(installed_client.fleet_client, "resolve_node_id", return_value="fixture-node"))
+                identity = stack.enter_context(patch.object(installed_client, "identity", wraps=installed_client.identity))
+                if code == "basic-client":
+                    identity.side_effect = TypeError("fixture old client does not accept peers")
+                # Other supported message operations stay offline fakes; identity
+                # captures and validates the real fixture credential and uses HTTP.
+                for method in ("inbox", "reply", "sent", "reconcile", "ack"):
+                    stack.enter_context(patch.object(BrigadeMessages, method, getattr(self.hub, method)))
+                result = Bridge(self.config_path, t3=self.t3).drain()
+                self.assertEqual(result["reason"], reason)
+                self.assertNotIn("private upstream", json.dumps(result))
+                if reason == "none":
+                    self.assertEqual(result["state"], "acked")
+                    self.assertEqual(self.counts(), (1, 1, 1))
+                else:
+                    self.assertEqual(self.counts(), (0, 0, 0))
+                    self.assertEqual(len(server.seen), 0 if code == "basic-client" else 1)
+                for call in identity.call_args_list:
+                    self.assertEqual(call.kwargs["peers"], ["agent:peer-a"])
+                    self.assertEqual(call.kwargs["timeout"], 5)
+                    captured = call.kwargs["authority"]
+                    self.assertEqual(captured.token_file, str(self.token_path))
+                    self.assertEqual(call.kwargs["expected_scope"], captured.scope)
+                self.assertEqual(bool(server.seen), code != "basic-client")
+                self.assertTrue(all(request == ("/messages", {"action": "identity", "peers": ["agent:peer-a"]})
+                                    for request in server.seen))
 
     def test_one_new_delivery_and_safe_status(self):
         self.hub.messages.append(inbound(2))
@@ -494,7 +739,8 @@ class RelayTests(unittest.TestCase):
     @unittest.skipUnless(installed_messages is not None, "requires the optional installed Brigade serializer")
     def test_installed_serializer_matches_byte_budget_fixture(self):
         keys = ("id", "sender", "recipient", "subject", "body", "ref", "priority", "client_id", "reply_to",
-                "created_at", "acked_at", "acked_by", "sender_label", "thread", "kind")
+                "created_at", "acked_at", "acked_by", "sender_label", "thread", "kind",
+                "envelope", "envelope_bytes", "content_state")
         messages = []
         for message_id in range(1, 81):
             message = inbound(message_id)
@@ -504,7 +750,7 @@ class RelayTests(unittest.TestCase):
         for after, count in ((0, 37), (37, 37), (74, 6), (80, 0)):
             with self.subTest(after=after):
                 rows = [message for message in messages if message["id"] > after]
-                actual = installed_messages._message_page([tuple(row[key] for key in keys) for row in rows], after=after)
+                actual = installed_messages._message_page([tuple(row.get(key) for key in keys) for row in rows], after=after)
                 self.assertEqual(len(actual["messages"]), count)
                 self.assertEqual(fixture_message_page(rows, after=after), actual)
 
@@ -781,6 +1027,9 @@ class RelayTests(unittest.TestCase):
 
     def test_strict_protected_config_and_oauth(self):
         for field, value in (("unknown", "value"), ("peers", ["*"]),
+                             ("peers", [f"agent:peer-{i}" for i in range(17)]),
+                             ("peers", ["00000000-0000-0000-0000-000000000001"]),
+                             ("principal", "00000000-0000-0000-0000-000000000002"),
                              ("routes", {"a": "thread-a", "b": "thread-b"}),
                              ("hub_token_file", "oauth.json"),
                              ("oauth_file", "bridge.db-journal"),
@@ -944,10 +1193,10 @@ class RelayTests(unittest.TestCase):
         def check(kwargs):
             self.assertIs(kwargs["authority"], authority)
             self.assertEqual(kwargs["expected_scope"], "captured-fixture-scope")
-        def identity(*, timeout, **kwargs):
+        def identity(*, peers=None, timeout, **kwargs):
             check(kwargs)
             calls.append("identity")
-            return {"principal": self.hub.identity()}
+            return self.hub.identity(peers=peers) if peers is not None else {"principal": self.hub.identity()}
         def list_messages(*, after, unacked, wait_ms, timeout, **kwargs):
             check(kwargs)
             self.assertEqual(wait_ms, 0)
@@ -1038,6 +1287,13 @@ class MCPServer(http.server.BaseHTTPRequestHandler):
                 self.respond(("event: message\ndata: " + json.dumps(value) + "\n\n").encode(), "text/event-stream")
             else:
                 self.respond(value)
+
+
+class MessageIdentityServer(MCPServer):
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.seen.append((self.path, request))
+        self.respond(self.server.payload, status=self.server.status)
 
 
 @unittest.skipUnless(os.name == "posix", "protected bridge requires POSIX")

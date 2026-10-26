@@ -32,7 +32,8 @@ BODY_LIMIT = 64 * 1024
 MAX_PAGES = 32
 DRAIN_SECONDS = 90
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
-_PRINCIPAL = re.compile(r"agent:[a-z][a-z0-9._-]{0,62}|[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
+_PRINCIPAL = re.compile(r"agent:[a-z][a-z0-9._-]{0,62}")
+_EPOCH = re.compile(r"[A-Za-z0-9_-]{16,128}")
 _RUNTIME = {"approval-required", "auto-accept-edits", "auto", "full-access"}
 _PENDING = {"idle", "preparing", "queued", "starting", "running", "waiting"}
 _FAILED = {"cancelled", "failed", "interrupted", "rolled_back"}
@@ -102,7 +103,7 @@ def load_config(path: Path) -> Config:
             raise BridgeError("invalid-config")
         routes = data["routes"]
         peers = data["peers"]
-        if not isinstance(routes, dict) or len(routes) != 1 or not isinstance(peers, list) or not 1 <= len(peers) <= 32:
+        if not isinstance(routes, dict) or len(routes) != 1 or not isinstance(peers, list) or not 1 <= len(peers) <= 16:
             raise BridgeError("invalid-config")
         alias, thread_id = next(iter(routes.items()))
         for value in (alias, thread_id, data["environment_id"], data["project_id"], data["map_version"]):
@@ -385,8 +386,23 @@ class BrigadeMessages:
     def frame(self, text: str) -> str:
         return self._frame(text, source_kind="peer-message", goal=_RELAY_ANSWER_GOAL)
 
-    def identity(self) -> str:
-        return self.client.identity(timeout=5, **self._kwargs)["principal"]
+    def identity(self, *, peers: list[str]) -> dict:
+        try:
+            return self.client.identity(peers=peers, timeout=5, **self._kwargs)
+        except Exception as error:
+            # Only structured fields classify SDK failures. Never fall back to
+            # basic identity, another endpoint or another credential.
+            status, code = getattr(error, "status", None), getattr(error, "code", None)
+            if (isinstance(error, TypeError) or code == "message_identity_peers_unsupported"
+                    or status in (400, 404, 405, 501)):
+                raise BridgeError("brigade-prerequisite") from None
+            if status in (401, 403) or code == "message_authorization_unavailable":
+                raise BridgeError("hub-authority") from None
+            if (isinstance(error, OSError) or code == "hub_unavailable" or status in (408, 425, 429)
+                    or type(status) is int and 500 <= status <= 599):
+                raise BridgeError("upstream-pending") from None
+            # Includes the supported client's strict wire-validation failures.
+            raise BridgeError("hub-authority") from None
 
     def inbox(self, *, after=0, unacked=False) -> dict:
         return self.client.list_messages(after=after, unacked=unacked, wait_ms=0, timeout=5, **self._kwargs)
@@ -425,6 +441,35 @@ def payload_identity(message: dict) -> dict:
     return {k: v for k, v in message.items() if k not in {"acked_at", "acked_by"}}
 
 
+def message_authorization(value: dict, principal: str, peers: tuple[str, ...]) -> dict:
+    """Validate injected clients too; return independent four-epoch peer pins."""
+    if isinstance(value, dict) and set(value) == {"principal"}:
+        raise BridgeError("brigade-prerequisite")
+    if (not isinstance(value, dict)
+            or set(value) != {"schema", "principal", "enrollment_epoch", "grant_epoch", "peers"}
+            or value["schema"] != "brigade.message_authorization.v1" or value["principal"] != principal
+            or any(not isinstance(value[k], str) or _EPOCH.fullmatch(value[k]) is None
+                   for k in ("enrollment_epoch", "grant_epoch"))
+            or not isinstance(value["peers"], list) or len(value["peers"]) != len(peers)):
+        raise BridgeError("hub-authority")
+    result = {}
+    for expected, peer in zip(peers, value["peers"]):
+        if (not isinstance(peer, dict) or set(peer) != {"principal", "authorized", "enrollment_epoch", "grant_epoch"}
+                or peer["principal"] != expected or type(peer["authorized"]) is not bool):
+            raise BridgeError("hub-authority")
+        if peer["authorized"]:
+            if any(not isinstance(peer[k], str) or _EPOCH.fullmatch(peer[k]) is None
+                   for k in ("enrollment_epoch", "grant_epoch")):
+                raise BridgeError("hub-authority")
+            result[expected] = {"enrollment_epoch": value["enrollment_epoch"], "grant_epoch": value["grant_epoch"],
+                                "peer_enrollment_epoch": peer["enrollment_epoch"], "peer_grant_epoch": peer["grant_epoch"]}
+        else:
+            if peer["enrollment_epoch"] is not None or peer["grant_epoch"] is not None:
+                raise BridgeError("hub-authority")
+            result[expected] = None
+    return result
+
+
 class Bridge:
     def __init__(self, config_path: Path, *, hub=None, t3=None):
         self.config = load_config(config_path)
@@ -451,20 +496,29 @@ class Bridge:
         self.oauth = oauth
         if self.hub is None:
             self.hub = BrigadeMessages(current)
-        if self.hub.authority != current.hub_authority or self.hub.identity() != current.principal:
+        if self.hub.authority != current.hub_authority:
             raise BridgeError("hub-authority")
+        authorization = message_authorization(self.hub.identity(peers=list(current.peers)), current.principal, current.peers)
         if record is not None:
             if record["config_fingerprint"] != current.fingerprint:
                 raise BridgeError("config-drift")
             if record["oauth_fingerprint"] != oauth.fingerprint or record["hub_fingerprint"] != self.hub.fingerprint:
                 raise BridgeError("credential-changed")
+            pinned = authorization.get(record["sender"])
+            if pinned is None or record.get("authorization") != pinned:
+                # A legacy record has no pins. Never adopt today's authority
+                # for retained work, even if tokens and grant values match.
+                raise BridgeError("hub-authority")
+        return authorization
 
-    def _t3_identity(self):
+    def _t3_identity(self, record: dict):
         if self.t3 is None:
             self.t3 = PublicMCP(self.oauth, thread_id=self.config.thread_id, deadline=self.deadline)
+        self._check(record)
         identity = self.t3.call("t3_environment_read", {})
         if identity.get("environmentId") != self.config.environment_id:
             raise BridgeError("t3-identity")
+        self._check(record)
         snapshot = self.t3.call("t3_thread_read", {"threadId": self.config.thread_id, "limit": 1,
                                                   "runLimit": 1, "maxCharsPerItem": 1})
         self._thread(snapshot)
@@ -499,6 +553,11 @@ class Bridge:
                   "reason": reason, "intent": None, "handles": None, "reply_text": None,
                   "reply_digest": None, "hub_reply_id": None, "spooled": False, "ack": False}
         if reason == "none":
+            pins = self._check()[message["sender"]]
+            if pins is None:
+                record.update(state="held", reason="hub-authority")
+                return record
+            record["authorization"] = pins
             structural = {key: message.get(key) for key in ("id", "sender", "recipient", "reply_to", "created_at")}
             peer = {key: value for key, value in message.items() if key not in {*structural, "acked_at", "acked_by"}}
             record["intent"] = ("Hub relay delivery: " + canonical(structural).decode("ascii") + "\n"
@@ -507,6 +566,7 @@ class Bridge:
         return record
 
     def _find_inbound(self, record: dict) -> dict:
+        self._check(record)
         after = record["message_id"] - 1
         rows = message_page(self.hub.inbox(after=after, unacked=False), after)
         if not rows or rows[0]["id"] != record["message_id"]:
@@ -656,7 +716,7 @@ class Bridge:
             store.save(record)
         if record["state"] == "dispatch-intent":
             self._check(record)
-            self._t3_identity()
+            self._t3_identity(record)
             self._check(record)
             handles = self.t3.call("t3_thread_send", {"threadId": record["thread_id"], "message": record["intent"],
                                                      "mode": "queue", "clientRequestId": record["t3_key"]})
@@ -669,7 +729,8 @@ class Bridge:
             store.save(record)
         if record["state"] == "dispatched":
             self._check(record)
-            self._t3_identity()
+            self._t3_identity(record)
+            self._check(record)
             wait = self.t3.call("t3_thread_wait", {"threadId": record["thread_id"], "runId": record["handles"]["runId"], "timeoutMs": 1000})
             if wait.get("threadId") != record["thread_id"] or wait.get("runId") != record["handles"]["runId"] or type(wait.get("timedOut")) is not bool:
                 raise BridgeError("t3-protocol")
@@ -694,6 +755,7 @@ class Bridge:
                 raise BridgeError("ledger-invalid")
             # Inspect acceptance before retrying a lost reply response. Only the
             # captured credential's supported spool and sent APIs are used.
+            self._check(record)
             self.hub.reconcile()
             accepted = self._sent_reply(store, record)
             if accepted is None and record["spooled"]:

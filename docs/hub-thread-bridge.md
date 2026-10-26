@@ -17,24 +17,51 @@ Review and enable the integration separately from installing this package.
 The consumer needs a protected, dedicated OAuth store and its own Hub message
 credential. This command never provisions credentials, enrolls principals,
 refreshes OAuth, changes grants or selects another credential. Missing Brigade
-or an unavailable supported identity helper returns `brigade-prerequisite`.
+or an incompatible client or identity endpoint returns `brigade-prerequisite`.
 The consumer environment must contain an approved Brigade package exporting
 `fleet_client_messages.identity`, `list_messages`, `reply`, `sent`, `ack`,
 `flush_credential`, `MessageAuthority` and `untrusted.wrap_untrusted`.
 Installing Brigade into a consumer environment belongs to the operator.
-A released authenticated identity and current-grant contract remains an unresolved
-deployment prerequisite. Keep live operation disabled until that dependency
-and independent reviews are resolved. No substitute identity or grant inference
-is supplied by this slice.
+The required capability is the extended
+`identity(peers=[...], timeout=5, authority=captured, expected_scope=captured.scope)`
+contract merged in Brigade #2071. Basic identity alone is insufficient.
+Selecting and installing an approved production release remains an operator
+gate, alongside independent review and a separately authorized canary. Local
+verification of a package built from that merge does not establish that an
+approved release is installed in the consumer environment.
 
 The existing Brigade settings select the Hub connection. The bridge compares
 that captured authority with `hub_authority` and authenticates the exact
-configured principal through the supported identity operation. Each subsequent
-operation retains that credential scope. Configure exact reciprocal peer grants
-separately. Hub operations enforce current authentication and send grants.
-The identity operation proves an active principal. It does not expose a grant
-snapshot or guarantee a peer remains authorized for a later reply. Grant denial
-cannot produce an acknowledgement or a successful result.
+configured principal through that supported operation. Every request retains
+the captured credential scope. Configure exact reciprocal peer grants separately.
+The response must have schema `brigade.message_authorization.v1`, the exact
+configured caller, valid caller enrollment and grant epochs, and exactly the
+requested peers in order. The selected sender must have `authorized: true`
+and valid enrollment and grant epochs. Unknown, revoked, unilateral or invalid
+peer metadata is denied with `authorized: false` and null peer epochs. The
+bridge validates injected responses too and never falls back to basic identity,
+inbox metadata, another endpoint or another credential.
+
+At accepted intake the private ledger pins all four public epoch values:
+caller enrollment, caller grants, sender enrollment and sender grants. Fresh
+mutual authorization must match those pins before dispatch, every recovery
+action, each T3 environment, thread, wait or output-page read, credential-scoped
+spool reconciliation, sent-history reads, reply and acknowledgement. A denied
+sender, mismatched caller, epoch drift or legacy pending record without pins
+holds retained work. A held record never acquires replacement pins.
+
+An explicit grant replacement changes its epoch even when the grant set is
+equal, empty again or restored to earlier values. Reenrollment changes epochs
+even when the token is reused. Checking token scope alone cannot detect these
+changes. Epochs are compared independently, without deriving them from tokens
+or grant values. They are retained privately and omitted from status.
+
+These are point-in-time observations with a check/use race. Revocation can
+occur after a successful check. The bridge cannot undo previously dispatched
+actions, cancel a queued T3 turn or provide atomic revocation. A held delivery
+can therefore have an already accepted external action. Transport failures
+remain pending for bounded retry, while malformed authorization and grant or
+credential denials fail closed. No exception text enters public results.
 
 Use `approval-required` for the T3 target and OAuth ceiling. The target's
 runtime must exactly match the configured ceiling. `full-access` is a high-risk,
@@ -52,6 +79,8 @@ duplicate JSON keys, wildcard peers, multiple routes, self-peering and colliding
 file references, including SQLite sidecar names, are refused. Paths resolve relative to the configuration file,
 without environment expansion or symlink resolution. Do not use home shortcuts.
 The command never creates or overwrites configuration or changes permissions.
+The caller and peers must be external `agent:` principals. Configure 1 to 16
+distinct peers. Node UUIDs cannot use the mutual-authorization contract.
 
 ```json
 {
@@ -130,8 +159,9 @@ A nonblocking process lock protects a transactional SQLite drainer claim.
 Process death releases the lock. No SQLite transaction spans network I/O.
 The ledger retains the inbound authority, recipient and message identity,
 immutable payload digest, routing identity, OAuth and Hub credential
-fingerprints, deterministic keys, saved dispatch intent, T3 handles, exact
-reply text and digest, accepted Hub reply ID and acknowledgement state.
+fingerprints, four immutable authorization epochs, deterministic keys, saved
+dispatch intent, T3 handles, exact reply text and digest, accepted Hub reply ID
+and acknowledgement state.
 Tombstones are retained indefinitely. There is no garbage collector.
 
 The state sequence is:
@@ -216,6 +246,9 @@ It recovers saved intent or handles and finishes only the remaining phases.
 - OAuth renewal or Hub credential rotation: hold pending work. A new OAuth
   session has a new request namespace. Never clear the ledger, change the key
   or resend the same logical delivery under that namespace.
+- Grant or enrollment epoch drift, denied mutual authorization or missing
+  legacy pins: hold without repinning or resending. Restoring grant values or
+  reusing a token does not restore the retained authorization generation.
 - Reply acceptance lost: reconcile the credential-scoped spool and sent rows,
   or retry the identical reply key and exact saved body. No new T3 turn occurs.
 - Ack response lost: revalidate authority, inbound content and durable reply,
@@ -246,10 +279,13 @@ Offline tests use standard-library fakes and local HTTP servers. The Hub fixture
 models the inspected serializer's byte budget and row cap. Optional contract
 tests compare it with the installed Brigade serializer and exercise the exact
 installed untrusted wrapper for question, imperative and injected-control inputs.
-Run those tests in the approved environment containing Brigade. The ordinary
-stdlib-only environment explicitly skips those two installed-package checks.
-They check serialization and prompt construction, without proving model
-compliance, live Hub interoperability or permission grants. The existing
+The compatible installed identity test uses a local HTTP fixture with a
+temporary credential, real credential-scope checks, strict wire validation and
+unsupported, denied and transient responses. All requests carry the peer list.
+Run these tests in the approved environment containing compatible Brigade.
+The ordinary stdlib-only environment skips those three installed-package checks.
+They check serialization, authorization consumption and prompt construction,
+without proving model compliance, live Hub interoperability or permission grants. The existing
 cross-repository wire test skips unless `T3_FLEET_BRIGADE_SOURCE` points at a
 compatible Brigade checkout. Its generic fixture still runs. Deployment and
 one authorized peer-to-T3-to-peer canary remain separate operator gates.
