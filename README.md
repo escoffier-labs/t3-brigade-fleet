@@ -198,6 +198,7 @@ T3 Brigade Fleet is not a hosted control plane, a model provider, or a replaceme
 
 - [Architecture](docs/architecture.md)
 - [Quickstart](docs/quickstart.md)
+- [Local lane client](docs/lane-client.md)
 - [Security model](docs/security-model.md)
 - [Recovery](docs/recovery.md)
 - [Deployment and upgrades](docs/deployment.md)
