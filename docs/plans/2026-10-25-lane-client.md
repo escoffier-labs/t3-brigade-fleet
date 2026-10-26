@@ -44,7 +44,7 @@ all public input/output contracts and failure behaviors are fixed by the spec.
 ## Task 2: Independent review and live proof
 
 - [ ] Review whole branch against the spec, including security and retry behavior.
-- [ ] Fix verified defects with regression tests and rerun relevant checks.
+- [x] Fix verified defects with regression tests and rerun relevant checks.
 - [ ] Prove disposable-lane delivery, duplicate suppression and stale-run/SHA refusal.
 - [ ] Write durable handoff and complete authorized in-house PR gates.
 

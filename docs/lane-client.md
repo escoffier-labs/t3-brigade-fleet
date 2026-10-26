@@ -5,8 +5,9 @@ It also prepares context packets, requests Codex compaction, and lists attention
 items. Fleet-managed threads require the admitted `t3-fleet` continuation route.
 
 The client uses the existing fleet configuration and target-local session issuer.
-Select an enabled host with `transport = "local"`. URLs and executables come from
-that configuration. The client does not launch threads, change models or modes,
+Select an enabled host with `transport = "local"` and an explicit
+`agent_state_dir`. URLs and executables come from that configuration. The client
+does not launch threads, change models or modes,
 answer requests, run builds, or use SSH.
 
 ## Commands
@@ -41,9 +42,16 @@ Before binding, packet creation, or message delivery, the client reads the
 configured agent's `target.db` with SQLite read-only access. A matching receipt
 refuses the operation, including a terminal fleet receipt. Missing `target.db`
 means no registered receipts. Unreadable or malformed ownership state refuses
-work. The client never initializes or migrates that database. Its location uses
-`agent_state_dir`, or the existing platform agent-state default and host ID,
-including the existing `T3_FLEET_AGENT_STATE` override.
+work. The client also refuses work while any nonterminal target claim has a
+NULL `thread_id`, because attachment may still be in progress. It validates the
+`state` and `thread_id` schema and stored types, and refuses unknown states.
+The known target states are `preflight`, `dispatching`, `running`,
+`needs_attention`, `unknown`, `succeeded`, `failed`, and `interrupted`.
+Only the last three are terminal.
+The client never initializes or migrates that database. The local host must
+configure `agent_state_dir` explicitly. No platform default or environment
+variable supplies a fallback. Ownership reads use bounded schema results and
+existence queries without a whole-database integrity scan.
 
 ## Deliver
 
@@ -136,9 +144,17 @@ and the exact `/compact` text with no attachments. Both use the narrow v2 queue
 method. The installed build's root-run slash handler selects `compactThread`
 for that exact message, and the Codex adapter calls `thread/compact/start`.
 The trigger is restricted to Codex identified by the bound root provider-thread
-record, and to the inspected server build `0.0.46-nightly.20261007.2787` with
-protocol 2. Other drivers or builds return `unsupported` after preparation when
-the live identity can be read. Unsupported read protocols cannot prepare a
+record, and to these exact inspected server builds with protocol 2:
+
+- `0.0.46-nightly.20261007.2787`
+- `0.1.1-nightly.20261017.3238`
+
+The latter artifact's SHA256 is
+`1834effecd2d7255d89849ed97525156cb83b9568c45aa3a4e2ae501476502fe`.
+Its embedded dispatch schema supports `queue_after_active` and `steer_active`
+with `targetRunId`. Inspection confirmed the exact slash-command path and Codex
+adapter call described above. Other drivers or builds return `unsupported` after
+preparation when the live identity can be read. Unsupported read protocols cannot prepare a
 verified packet. Future builds need adapter verification before admission.
 
 Compaction identity is the output path scoped by environment/thread. Changing
@@ -147,6 +163,13 @@ without overwriting the packet or sending messages again. Each of the two
 messages has persisted `command_id`, `message_id`, and delivery status. An
 accepted message also has `sequence`. The first message may advance the latest
 run, so the second checks binding identity without requiring the old run ID.
+Immediately before each message, the client rechecks the server build, protocol,
+and current root Codex provider record against the thread's model selection.
+The model selection and active provider-thread ID must also match the initial
+operation snapshot. Provider or model drift refuses that message. If the reference was
+accepted, the result is `partial` with the second message `refused` and no
+`/compact` dispatch. Both message identities and the first acknowledgement remain
+in the durable receipt.
 
 The operation result includes `packet_prepared`, `output_path` after successful
 preparation, and a `messages` array in reference/compaction order:
@@ -191,3 +214,19 @@ Exit 3 covers `stale`, `unsupported`, `partial`, and `unknown` operation results
 Error envelopes contain `status: "error"` and a stable `code`. Validation/config
 errors use exit 2, identity conflicts use exit 4, and transport errors use the
 existing fleet error codes. Private exception details are omitted.
+
+Known local guard errors also include an optional fixed `reason`:
+
+| Reason | Action |
+| --- | --- |
+| `local_host_required` | Select an enabled local host. |
+| `agent_state_dir_required` | Configure the local host's `agent_state_dir`. |
+| `binding_required` | Bind the intended thread before using it. |
+| `binding_changed` | Inspect the live identity and workspace. |
+| `ownership_unavailable` | Check access to the configured agent state. |
+| `ownership_malformed` | Inspect the target ownership schema and records. |
+| `fleet_ownership_refused` | Use the admitted fleet continuation route. |
+| `packet_path_unavailable` | Select an unused path in an existing private directory. |
+
+Reasons never contain supplied input, transport exception text, tokens, or URLs.
+Other errors retain their stable code without a reason.

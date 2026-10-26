@@ -23,6 +23,7 @@ from tests.test_t3_api import FakeRunner
 from tests.test_protocol_v2 import V2Server
 
 VERSION = '0.0.46-nightly.20261007.2787'
+ACTIVE_VERSION = '0.1.1-nightly.20261017.3238'
 
 
 class App:
@@ -157,8 +158,8 @@ class LaneTests(unittest.TestCase):
                     db.parent.mkdir(exist_ok=True)
                     if change == 'ownership':
                         with sqlite3.connect(db) as conn:
-                            conn.execute('CREATE TABLE target_requests(thread_id TEXT)')
-                            conn.execute("INSERT INTO target_requests VALUES ('thread-1')")
+                            conn.execute('CREATE TABLE target_requests(thread_id TEXT, state TEXT)')
+                            conn.execute("INSERT INTO target_requests VALUES ('thread-1', 'succeeded')")
                     else:
                         db.write_text('broken')
                 with self.assertRaises(ValidationError):
@@ -166,6 +167,73 @@ class LaneTests(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     self.client.context(self.packet)
                 self.assertEqual(self.app.calls, [])
+
+    def test_agent_state_path_must_be_explicit_before_creating_local_state(self):
+        for path in (None, '', '   '):
+            with self.subTest(path=path):
+                host = replace(self.config.hosts['local'], agent_state_dir=path)
+                state = self.root / 'unconfigured-state'
+                with self.assertRaises(ValidationError):
+                    LaneClient(replace(self.config, hosts={'local': host}), 'local', state)
+                self.assertFalse(state.exists())
+        self.assertFalse((self.root / 'agent').exists())
+
+    def test_ownership_refuses_pending_claims_and_terminal_matches_without_mutation(self):
+        self.bind()
+        db = self.root / 'agent' / 'target.db'
+        db.parent.mkdir()
+        cases = [(None, state) for state in ('preflight', 'dispatching', 'running',
+                                             'needs_attention', 'unknown')]
+        cases += [('thread-1', state) for state in ('succeeded', 'failed', 'interrupted')]
+        for thread, state in cases:
+            with self.subTest(thread=thread, state=state):
+                if db.exists():
+                    db.unlink()
+                with sqlite3.connect(db) as conn:
+                    conn.execute('CREATE TABLE target_requests(thread_id TEXT, state TEXT)')
+                    conn.execute('INSERT INTO target_requests VALUES (?, ?)', (thread, state))
+                before = {p.name: p.read_bytes() for p in db.parent.iterdir()}
+                for operation, payload in ((self.client.bind, self.binding),
+                                           (self.client.deliver, self.event),
+                                           (self.client.context, self.packet),
+                                           (self.client.compact, self.packet)):
+                    with self.assertRaises(ValidationError):
+                        operation(payload)
+                self.assertEqual({p.name: p.read_bytes() for p in db.parent.iterdir()}, before)
+                self.assertFalse(Path(self.packet['output_path']).exists())
+                self.assertEqual(self.app.calls, [])
+
+    def test_ownership_accepts_unrelated_valid_receipts_and_refuses_malformed_state(self):
+        db = self.root / 'agent' / 'target.db'
+        db.parent.mkdir()
+        cases = [
+            ('thread_id TEXT, state TEXT', [('other', 'running'), (None, 'failed')], True),
+            ('thread_id TEXT, state TEXT', [('other', 'future-state')], False),
+            ('thread_id TEXT, state TEXT', [('other', None)], False),
+            ('thread_id TEXT, state TEXT', [('other', b'running')], False),
+            ('thread_id TEXT, state TEXT', [(b'thread-1', 'running')], False),
+            ('thread_id TEXT, state TEXT', [('', 'running')], False),
+            ('thread_id TEXT', [], False),
+            ('state TEXT', [], False),
+            ('thread_id INTEGER, state TEXT', [], False),
+            ('thread_id TEXT, state INTEGER', [], False),
+        ]
+        for schema, rows, allowed in cases:
+            with self.subTest(schema=schema, rows=rows):
+                if db.exists():
+                    db.unlink()
+                with sqlite3.connect(db) as conn:
+                    conn.execute(f'CREATE TABLE target_requests({schema})')
+                    if rows:
+                        conn.executemany('INSERT INTO target_requests VALUES (?, ?)', rows)
+                before = {p.name: p.read_bytes() for p in db.parent.iterdir()}
+                if allowed:
+                    self.assertEqual(self.bind()['status'], 'bound')
+                else:
+                    with self.assertRaises(ValidationError):
+                        self.bind()
+                self.assertEqual({p.name: p.read_bytes() for p in db.parent.iterdir()}, before)
+        self.assertEqual(self.app.calls, [])
 
     def test_uncertain_acceptance_survives_restart_without_retry(self):
         self.bind()
@@ -229,15 +297,77 @@ class LaneTests(unittest.TestCase):
 
     def test_compact_queues_reference_then_exact_slash_with_durable_ids(self):
         self.bind()
-        receipt = self.client.compact(self.packet)
-        self.assertEqual(receipt['status'], 'accepted')
-        self.assertTrue(receipt['packet_prepared'])
-        self.assertEqual(len(receipt['messages']), 2)
-        self.assertIn(self.packet['output_path'], self.app.calls[0][1])
-        self.assertEqual(self.app.calls[1][1], '/compact')
-        self.assertIsNone(self.app.calls[1][-1])
-        self.assertEqual(self.make_client().compact(self.packet), receipt)
-        self.assertEqual(len(self.app.calls), 2)
+        for version in (VERSION, ACTIVE_VERSION):
+            with self.subTest(version=version):
+                self.app.desc['serverVersion'] = version
+                self.app.calls.clear()
+                payload = {**self.packet, 'output_path': str(self.root / f'{version}.md')}
+                receipt = self.client.compact(payload)
+                self.assertEqual(receipt['status'], 'accepted')
+                self.assertTrue(receipt['packet_prepared'])
+                self.assertEqual(len(receipt['messages']), 2)
+                self.assertIn(payload['output_path'], self.app.calls[0][1])
+                self.assertEqual(self.app.calls[1][1], '/compact')
+                self.assertIsNone(self.app.calls[1][-1])
+                self.assertEqual(self.make_client().compact(payload), receipt)
+                self.assertEqual(len(self.app.calls), 2)
+
+    def test_compaction_rechecks_codex_and_protocol_at_each_message_edge(self):
+        self.bind()
+        for edge in (0, 1):
+            for drift in ('driver', 'model', 'model_name', 'provider', 'codex_replacement',
+                          'owner', 'app', 'duplicate', 'version', 'protocol'):
+                with self.subTest(edge=edge, drift=drift):
+                    self.app = App(self.workspace)
+                    self.client = self.make_client()
+                    original = self.client.store.finish
+                    reserved = []
+                    def changed(environment, thread, event, receipt):
+                        result = original(environment, thread, event, receipt)
+                        if receipt['messages'][edge]['status'] == 'unknown' and not reserved:
+                            reserved.append((event, copy.deepcopy(receipt)))
+                            provider = self.app.thread['providerThreads'][0]
+                            if drift == 'driver':
+                                provider['driver'] = 'claude'
+                            elif drift == 'model':
+                                self.app.thread['modelSelection']['instanceId'] = 'another-provider'
+                            elif drift == 'model_name':
+                                self.app.thread['modelSelection']['model'] = 'another-model'
+                            elif drift == 'provider':
+                                self.app.thread['activeProviderThreadId'] = 'another-thread'
+                            elif drift == 'codex_replacement':
+                                self.app.thread['activeProviderThreadId'] = 'another-thread'
+                                provider['id'] = 'another-thread'
+                                self.app.thread['modelSelection']['instanceId'] = 'another-codex'
+                                provider['providerInstanceId'] = 'another-codex'
+                            elif drift == 'owner':
+                                provider['ownerNodeId'] = 'child-node'
+                            elif drift == 'app':
+                                provider['appThreadId'] = 'another-app'
+                            elif drift == 'duplicate':
+                                self.app.thread['providerThreads'].append(copy.deepcopy(provider))
+                            elif drift == 'version':
+                                self.app.desc['serverVersion'] = '0.1.2'
+                            else:
+                                self.app.desc['orchestrationProtocolVersion'] = 3
+                        return result
+                    payload = {**self.packet, 'output_path': str(self.root / f'{edge}-{drift}.md')}
+                    with patch.object(self.client.store, 'finish', side_effect=changed):
+                        result = self.client.compact(payload)
+                    self.assertEqual(len(self.app.calls), edge)
+                    self.assertEqual(result['status'], 'partial' if edge else 'unknown')
+                    self.assertEqual([m['status'] for m in result['messages']],
+                                     ['accepted', 'refused'] if edge else ['refused', 'not_sent'])
+                    self.assertTrue(result['packet_prepared'])
+                    self.assertEqual(self.client.store.unknown('env-1', 'thread-1')[0]['operation_id'],
+                                     reserved[0][0])
+                    for message, identity in zip(result['messages'], reserved[0][1]['messages']):
+                        for key in ('command_id', 'message_id'):
+                            self.assertEqual(message[key], identity[key])
+                    if edge:
+                        self.assertEqual(result['messages'][0]['sequence'], 1)
+                    self.assertEqual(self.make_client().compact(payload), result)
+                    self.assertEqual(len(self.app.calls), edge)
 
     def test_compact_allows_its_queued_reference_to_advance_latest_run(self):
         self.bind()
@@ -283,10 +413,11 @@ class LaneTests(unittest.TestCase):
 
     def test_unsupported_compaction_retains_packet_without_sending(self):
         self.bind()
-        for driver, version in [('claude', VERSION), ('codex', '0.0.45')]:
+        for driver, version in [('claude', VERSION), ('codex', '0.0.45'),
+                                ('codex', '0.1.1'), ('codex', '0.1.2-nightly.20261018.3239')]:
             self.app.thread['providerThreads'][0]['driver'] = driver
             self.app.desc['serverVersion'] = version
-            payload = {**self.packet, 'output_path': str(self.root / f'{driver}.md')}
+            payload = {**self.packet, 'output_path': str(self.root / f'{driver}-{version}.md')}
             result = self.client.compact(payload)
             self.assertEqual(result['status'], 'unsupported')
             self.assertTrue(Path(payload['output_path']).exists())
@@ -402,13 +533,46 @@ class LaneTests(unittest.TestCase):
             db = self.root / 'agent' / 'target.db'
             db.parent.mkdir()
             with sqlite3.connect(db) as conn:
-                conn.execute('CREATE TABLE target_requests(thread_id TEXT)')
-                conn.execute("INSERT INTO target_requests VALUES ('thread-1')")
+                conn.execute('CREATE TABLE target_requests(thread_id TEXT, state TEXT)')
+                conn.execute("INSERT INTO target_requests VALUES ('thread-1', 'succeeded')")
             return result
         with patch.object(self.client, '_head', side_effect=claimed):
             with self.assertRaises(ValidationError):
                 self.client.context(self.packet)
         self.assertFalse(Path(self.packet['output_path']).exists())
+
+    def test_cli_reports_fixed_local_guard_reasons_without_private_details(self):
+        host = replace(self.config.hosts['local'], agent_state_dir=None)
+        cases = [
+            (replace(self.config, hosts={'local': host}), None, 'agent_state_dir_required'),
+            (self.config, ValidationError('lane must be explicitly bound first'), 'binding_required'),
+            (self.config, ValidationError('fleet ownership state is unavailable or malformed'),
+             'ownership_unavailable'),
+            (self.config, ValidationError('fleet ownership state is malformed'), 'ownership_malformed'),
+            (self.config, ValidationError('fleet-managed lane requires admitted fleet continuation'),
+             'fleet_ownership_refused'),
+            (self.config, ValidationError('bound lane identity or workspace changed'), 'binding_changed'),
+            (self.config, ValidationError('context packet path is unavailable or already exists'),
+             'packet_path_unavailable'),
+            (self.config, T3HttpError('private transport token https://private.invalid/secret'), None),
+            (self.config, ValidationError('private input token https://private.invalid/secret'), None),
+            (self.config, T3HttpError('fleet ownership state is malformed'), None),
+        ]
+        for config, error, reason in cases:
+            with self.subTest(reason=reason, error=type(error).__name__):
+                with patch('sys.stdin', io.StringIO(json.dumps(self.binding))), \
+                     patch('sys.stdout', new_callable=io.StringIO) as out, \
+                     patch('t3_fleet.lane.load_config', return_value=config), \
+                     patch.object(LaneClient, 'bind', side_effect=error):
+                    code = main(['--config', 'fleet.toml', '--host', 'local',
+                                 '--state-dir', str(self.state), 'bind'])
+                result = json.loads(out.getvalue())
+                self.assertEqual(result, {'status': 'error',
+                                         'code': error.code if error else 'invalid_request',
+                                         **({'reason': reason} if reason else {})})
+                self.assertEqual(code, error.exit_code if error else 2)
+                self.assertNotIn('private', out.getvalue())
+        self.assertEqual(self.app.calls, [])
 
     def test_cli_rejects_oversized_stdin_before_constructing_client(self):
         with patch('sys.stdin', io.StringIO('x' * 70000)), patch('sys.stdout', new_callable=io.StringIO) as out, \

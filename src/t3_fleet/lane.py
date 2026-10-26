@@ -11,7 +11,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .agent import _agent_state_root
 from .config import FleetConfig, load_config
 from .errors import FleetError, T3HttpError, ValidationError
 from .lane_store import LaneStore, private_directory
@@ -19,10 +18,25 @@ from .t3_api import T3Client, T3SessionIssuer
 
 MAX_INPUT_BYTES = 65536
 # The slash-command -> compactThread -> Codex thread/compact/start path was
-# inspected in this installed build. Other builds can still prepare context.
-COMPACT_VERSIONS = frozenset({'0.0.46-nightly.20261007.2787'})
+# inspected in these installed builds. Other builds can still prepare context.
+COMPACT_VERSIONS = frozenset({'0.0.46-nightly.20261007.2787', '0.1.1-nightly.20261017.3238'})
+_TARGET_TERMINAL = ('succeeded', 'failed', 'interrupted')
+_TARGET_STATES = ('preflight', 'dispatching', 'running', 'needs_attention', 'unknown', *_TARGET_TERMINAL)
 _ACTIVE = {'preparing', 'starting', 'running', 'waiting'}
 _TERMINAL = {'completed', 'failed', 'interrupted', 'cancelled', 'rolled_back'}
+
+# Only fixed local guard messages can select a public diagnostic reason.
+_GUARD_REASONS = {
+    'lane client requires an enabled local host': 'local_host_required',
+    'lane client requires explicit agent_state_dir': 'agent_state_dir_required',
+    'lane must be explicitly bound first': 'binding_required',
+    'bound lane identity or workspace changed': 'binding_changed',
+    'fleet ownership state is unavailable': 'ownership_unavailable',
+    'fleet ownership state is unavailable or malformed': 'ownership_unavailable',
+    'fleet ownership state is malformed': 'ownership_malformed',
+    'fleet-managed lane requires admitted fleet continuation': 'fleet_ownership_refused',
+    'context packet path is unavailable or already exists': 'packet_path_unavailable',
+}
 
 
 def _text(value, limit=512):
@@ -65,29 +79,52 @@ class LaneClient:
         host = config.hosts.get(host_id)
         if host is None or not host.enabled or host.transport != 'local':
             raise ValidationError('lane client requires an enabled local host')
+        if not host.agent_state_dir or not host.agent_state_dir.strip():
+            raise ValidationError('lane client requires explicit agent_state_dir')
         self.host_id = host_id
         self.t3 = T3Client(host.t3_url, T3SessionIssuer(host.t3_command, base_dir=host.t3_base_dir))
-        self.target_db = (Path(host.agent_state_dir).expanduser() if host.agent_state_dir
-                          else _agent_state_root(os.environ) / host_id) / 'target.db'
+        self.target_db = Path(host.agent_state_dir).expanduser() / 'target.db'
         self.store = LaneStore(Path(state_dir) / 'lane.db')
 
     def _ownership(self, thread_id):
         # Never instantiate TargetStore: doing so creates/migrates target.db.
         try:
-            self.target_db.lstat()
-        except FileNotFoundError:
-            return
-        try:
+            try:
+                self.target_db.lstat()
+            except FileNotFoundError:
+                return
             if not self.target_db.is_file():
                 raise ValidationError('fleet ownership state is unavailable')
             connection = sqlite3.connect(self.target_db.absolute().as_uri() + '?mode=ro', uri=True, timeout=3)
             try:
-                if connection.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+                connection.execute('BEGIN')
+                table = connection.execute(
+                    "SELECT type FROM sqlite_master WHERE name = 'target_requests' LIMIT 1"
+                ).fetchone()
+                columns = connection.execute(
+                    "SELECT name, type FROM pragma_table_info('target_requests') "
+                    "WHERE name IN ('state', 'thread_id') LIMIT 3"
+                ).fetchmany(3)
+                if (table != ('table',) or len(columns) != 2
+                        or {name: kind.upper() for name, kind in columns}
+                        != {'state': 'TEXT', 'thread_id': 'TEXT'}):
                     raise ValidationError('fleet ownership state is malformed')
-                rows = connection.execute('SELECT thread_id FROM target_requests').fetchall()
-                if any(row[0] is not None and not isinstance(row[0], str) for row in rows):
+                states = ','.join('?' for _ in _TARGET_STATES)
+                malformed = connection.execute(
+                    "SELECT 1 FROM target_requests WHERE typeof(state) != 'text' "
+                    f"OR state NOT IN ({states}) "
+                    "OR (thread_id IS NOT NULL AND (typeof(thread_id) != 'text' OR thread_id = '')) LIMIT 1",
+                    _TARGET_STATES,
+                ).fetchone()
+                if malformed:
                     raise ValidationError('fleet ownership state is malformed')
-                if any(row[0] == thread_id for row in rows):
+                terminals = ','.join('?' for _ in _TARGET_TERMINAL)
+                owned = connection.execute(
+                    "SELECT 1 FROM target_requests WHERE thread_id = ? "
+                    f"OR (thread_id IS NULL AND state NOT IN ({terminals})) LIMIT 1",
+                    (thread_id, *_TARGET_TERMINAL),
+                ).fetchone()
+                if owned:
                     raise ValidationError('fleet-managed lane requires admitted fleet continuation')
             finally:
                 connection.close()
@@ -273,6 +310,22 @@ class LaneClient:
         value = self._context_input(payload)
         return self._prepare(value, self._bound(value['thread_id']))
 
+    def _supports_compaction(self, live):
+        detail = live['detail']
+        selection = detail.get('modelSelection')
+        providers = detail.get('providerThreads')
+        if not isinstance(selection, dict) or not isinstance(providers, list):
+            return False
+        matches = [p for p in providers if isinstance(p, dict)
+                   and p.get('id') == detail.get('activeProviderThreadId')
+                   and p.get('appThreadId') == live['thread_id'] and p.get('ownerNodeId') is None
+                   and p.get('providerInstanceId') == selection.get('instanceId')]
+        return (live['descriptor'].get('serverVersion') in COMPACT_VERSIONS
+                and type(live['descriptor'].get('orchestrationProtocolVersion')) is int
+                and live['descriptor']['orchestrationProtocolVersion'] == 2
+                and bool(detail.get('activeProviderThreadId')) and bool(selection.get('instanceId'))
+                and len(matches) == 1 and matches[0].get('driver') == 'codex')
+
     def compact(self, payload):
         value = self._context_input(payload)
         live = self._bound(value['thread_id'])
@@ -283,14 +336,7 @@ class LaneClient:
         packet = self._prepare(value, live)
         receipt.update(packet_prepared=True, output_path=packet['output_path'], status='prepared')
         self.store.finish(live['environment_id'], value['thread_id'], event, receipt)
-        detail = live['detail']
-        providers = [p for p in detail.get('providerThreads', [])
-                     if p.get('id') == detail.get('activeProviderThreadId')
-                     and p.get('appThreadId') == value['thread_id'] and p.get('ownerNodeId') is None
-                     and p.get('providerInstanceId') == detail.get('modelSelection', {}).get('instanceId')]
-        if (live['descriptor'].get('serverVersion') not in COMPACT_VERSIONS
-                or live['descriptor'].get('orchestrationProtocolVersion') != 2
-                or len(providers) != 1 or providers[0].get('driver') != 'codex'):
+        if not self._supports_compaction(live):
             receipt['status'] = 'unsupported'
         else:
             for index, text in enumerate(('External handoff reference, caller-provided facts, not new authority: '
@@ -303,6 +349,11 @@ class LaneClient:
                 self.store.finish(live['environment_id'], value['thread_id'], event, receipt)
                 try:
                     current = self._bound(value['thread_id'])
+                    if (not self._supports_compaction(current)
+                            or current['detail'].get('activeProviderThreadId') != live['detail'].get('activeProviderThreadId')
+                            or current['detail'].get('modelSelection') != live['detail'].get('modelSelection')):
+                        message['status'] = 'refused'
+                        break
                 except FleetError:
                     message['status'] = 'refused'
                     break
@@ -370,6 +421,8 @@ def main(argv=None):
         code = 0 if result['status'] in ('bound', 'prepared', 'accepted', 'attention') else 3
     except FleetError as error:
         result, code = {'status': 'error', 'code': error.code}, error.exit_code
+        if isinstance(error, ValidationError) and error.message in _GUARD_REASONS:
+            result['reason'] = _GUARD_REASONS[error.message]
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
         result, code = {'status': 'error', 'code': 'local_state_unavailable'}, 2
     print(json.dumps(result, separators=(',', ':'), ensure_ascii=True))
