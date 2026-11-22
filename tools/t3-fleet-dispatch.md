@@ -110,14 +110,20 @@ Limits worth knowing before scripting against it:
   a live run and releases only on its own durable terminal outcome. The
   controller relays status and records what the target reported. An `unknown`
   state or a transport failure keeps the reservation counted.
+- The target records reservation state `refused` after an `auth-failed` release,
+  stops retrying the release, and lets the Hub lease expire. It reports that
+  refusal on later reads. The controller exposes bounded settlement diagnoses
+  as `fleet_refusal` in results such as `status` and `wait`. The diagnostic
+  `status` names the failure class, including retryable failures. Only
+  `fleet_reservation.state == "refused"` on the target receipt means release
+  retries have stopped.
 - `followup`, `approve`, and `answer` are admitted again before they resume
   anything. The target revalidates its own durable policy receipt, the current
   canonical policy version and digest, the same routing decision, and the live
   reservation, and only a granted renewal admits the action. A reservation that
-  was released, expired, or never recorded fails closed. Resuming then needs a
-  newly negotiated reservation, which this client does not invent. An
-  unreachable helper keeps the reservation held and still refuses to resume.
-  `interrupt`, `status`, and `wait` are unchanged.
+  was released, marked `refused`, expired, or never recorded fails closed.
+  Resuming then needs a newly negotiated reservation. An unreachable helper
+  keeps the reservation held and refuses to resume.
 - The target acknowledges the session only after the canonical rules and the
   locally selected model are applied to the thread, and takes the launch
   admission only after that.

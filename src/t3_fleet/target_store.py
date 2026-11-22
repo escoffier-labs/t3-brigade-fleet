@@ -72,8 +72,22 @@ class TargetReceipt:
     lifecycle: dict[str, Any] | None = None
 
 
+def reservation_payload(receipt: TargetReceipt) -> dict[str, Any] | None:
+    policy = receipt.policy
+    if policy is None:
+        return None
+    payload: dict[str, Any] = {
+        "reservation_id": policy["reservation_id"],
+        "decision_id": policy["decision_id"],
+        "state": receipt.reservation_state,
+    }
+    if receipt.reservation_state == "refused":
+        payload["refused"] = {"status": "refused", "reason": "auth-failed"}
+    return payload
+
+
 def receipt_payload(receipt: TargetReceipt) -> dict[str, Any]:
-    return {
+    payload = {
         "schema": "t3-fleet.agent-result.v1",
         "request_id": receipt.request_id,
         "target_id": receipt.target_id,
@@ -97,6 +111,11 @@ def receipt_payload(receipt: TargetReceipt) -> dict[str, Any]:
         **({"resolution": receipt.lifecycle["resolution"]}
            if (receipt.lifecycle or {}).get("resolution") else {}),
     }
+    if receipt.reservation_state == "refused":
+        reservation = reservation_payload(receipt)
+        if reservation is not None:
+            payload["fleet_reservation"] = reservation
+    return payload
 
 
 class TargetStore:

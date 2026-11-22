@@ -954,6 +954,9 @@ class ReservationLifecycleTests(unittest.TestCase):
         for verb, code, exit_code in (
             ("release", "auth-failed", 1),
             ("renew", "invalid-request", 2),
+            ("renew", "invalid-request", 4),
+            ("release", "invalid-request", 2),
+            ("release", "invalid-request", 4),
             ("release", "reservation_denied", 3),
         ):
             with self.subTest(verb=verb, code=code):

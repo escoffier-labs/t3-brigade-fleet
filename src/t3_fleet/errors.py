@@ -137,8 +137,10 @@ POLICY_REASONS = frozenset(
 )
 
 
-# Definitive denials from reservation routes. Revision conflicts can be retried.
-HUB_REFUSAL_CODES = frozenset({"auth-failed", "invalid-request"})
+# The helper also uses invalid-request for local errors and ambiguous HTTP
+# failures. Only auth-failed ends release retries.
+DEFINITIVE_RELEASE_REFUSAL_CODES = frozenset({"auth-failed"})
+HUB_REFUSAL_CODES = DEFINITIVE_RELEASE_REFUSAL_CODES | {"invalid-request"}
 
 
 class PolicyRejected(FleetError):

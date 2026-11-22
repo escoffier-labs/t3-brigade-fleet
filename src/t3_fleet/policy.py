@@ -175,6 +175,7 @@ class FleetPolicyProtocol(Protocol):
         reservation_id: str,
         decision_id: str,
         session_id: str,
+        report_refusal: bool = True,
     ) -> dict[str, Any]: ...
 
     def release_reservation(
@@ -1483,9 +1484,13 @@ class BrigadeFleetPolicy:
         reservation_id: str,
         decision_id: str,
         session_id: str,
+        report_refusal: bool = True,
     ) -> dict[str, Any]:
-        """Extend the current reservation generation; never resurrect an expired one."""
-        return self._reservation("renew", reservation_id, decision_id, session_id)
+        """Extend the reservation, optionally preserving the helper error classes."""
+        return self._reservation(
+            "renew", reservation_id, decision_id, session_id,
+            report_refusal=report_refusal,
+        )
 
     def release_reservation(
         self,
@@ -1503,6 +1508,8 @@ class BrigadeFleetPolicy:
         reservation_id: str,
         decision_id: str,
         session_id: str,
+        *,
+        report_refusal: bool = True,
     ) -> dict[str, Any]:
         reservation_id = _identifier(reservation_id, "reservation id", _DECISION_ID)
         decision_id = _identifier(decision_id, "decision id", _DECISION_ID)
@@ -1521,7 +1528,8 @@ class BrigadeFleetPolicy:
             session_id,
             "--json",
         ]
-        response = self._invoke(argv, refusal_codes=HUB_REFUSAL_CODES)
+        refusal_codes = HUB_REFUSAL_CODES if report_refusal else frozenset()
+        response = self._invoke(argv, refusal_codes=refusal_codes)
         try:
             return normalize_reservation(
                 response,

@@ -27,7 +27,7 @@ from .config import (
 )
 from .errors import (
     BLOCK_REASONS,
-    HUB_REFUSAL_CODES,
+    DEFINITIVE_RELEASE_REFUSAL_CODES,
     UNCONFIRMED_TERMINAL_SECONDS,
     bounded_target_error,
     POLICY_REASONS,
@@ -72,6 +72,7 @@ from .target_store import (
     TargetReceipt,
     TargetStore,
     receipt_payload,
+    reservation_payload,
 )
 from .transport import (
     BrigadeModelAdmission,
@@ -1794,15 +1795,9 @@ class T3Agent:
         releases. A definitive release refusal ends local retries and leaves
         the Hub lease to expire.
         """
+        held = reservation_payload(receipt)
         policy = receipt.policy
-        if policy is None:
-            return None
-        held = {
-            "reservation_id": policy["reservation_id"],
-            "decision_id": policy["decision_id"],
-            "state": receipt.reservation_state,
-        }
-        if receipt.reservation_state != "active":
+        if held is None or policy is None or receipt.reservation_state != "active":
             return held
         resolution = (receipt.lifecycle or {}).get("resolution")
         blocking = resolution is not None and resolution.get("blocking", True)
@@ -1820,7 +1815,7 @@ class T3Agent:
                 session_id=policy["session_id"],
             )
         except PolicyRejected as error:
-            if releasing and error.hub_code in HUB_REFUSAL_CODES:
+            if releasing and error.hub_code in DEFINITIVE_RELEASE_REFUSAL_CODES:
                 stored = self._target_store().set_reservation_state(
                     receipt.request_id, "refused"
                 )
@@ -2293,6 +2288,7 @@ class T3Agent:
                 reservation_id=policy["reservation_id"],
                 decision_id=policy["decision_id"],
                 session_id=policy["session_id"],
+                report_refusal=False,
             )
             normalize_reservation(
                 reply,
@@ -2963,6 +2959,10 @@ class T3Agent:
         except UnknownState:
             result["state"] = receipt.state
             result["needs_attention"] = receipt.state == "needs_attention"
+            if receipt.reservation_state == "refused":
+                reservation = reservation_payload(receipt)
+                if reservation is not None:
+                    result["fleet_reservation"] = reservation
             return self._with_handoff(receipt, result)
         if "output" in observation and state == observation["state"] and updated.observation_applied:
             result["output"] = observation["output"]

@@ -614,6 +614,7 @@
           "type": "string"
         },
         "reservation_state": {
+          "description": "The target's recorded reservation state. The value refused means a release was definitively denied and the target stopped retrying it.",
           "type": "string",
           "enum": [
             "active",
@@ -818,7 +819,7 @@
       }
     },
     "fleet_refusal": {
-      "description": "The status and reason of a fleet reservation settlement failure reported by the target.",
+      "description": "The status class and reason of a fleet reservation settlement failure reported by the target. Only fleet_reservation.state equal to refused on the target receipt means the target stopped retrying.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -827,6 +828,7 @@
       ],
       "properties": {
         "status": {
+          "description": "The class of failure. Refused includes failures that are eligible for retry.",
           "enum": [
             "refused",
             "unavailable"
