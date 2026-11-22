@@ -203,6 +203,9 @@
     },
     "target_error": {
       "$ref": "#/$defs/target_error"
+    },
+    "fleet_refusal": {
+      "$ref": "#/$defs/fleet_refusal"
     }
   },
   "$defs": {
@@ -614,7 +617,8 @@
           "type": "string",
           "enum": [
             "active",
-            "released"
+            "released",
+            "refused"
           ]
         },
         "renewed": {
@@ -812,6 +816,32 @@
           "maxLength": 512
         }
       }
+    },
+    "fleet_refusal": {
+      "description": "The status and reason of a fleet reservation settlement failure reported by the target.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "reason"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "refused",
+            "unavailable"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "auth-failed",
+            "invalid-request",
+            "revision-conflict",
+            "helper-unreachable",
+            "hub-denied"
+          ]
+        }
+      }
     }
   },
   "oneOf": [
@@ -897,6 +927,9 @@
         },
         "target_error": {
           "$ref": "#/$defs/target_error"
+        },
+        "fleet_refusal": {
+          "$ref": "#/$defs/fleet_refusal"
         }
       },
       "dependentRequired": {

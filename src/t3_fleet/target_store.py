@@ -921,13 +921,12 @@ class TargetStore:
         return receipt
 
     def set_reservation_state(self, request_id: str, state: str) -> TargetReceipt:
-        """Record the Hub reservation generation this target still holds.
+        """Record settlement progress for the Hub reservation.
 
-        A released reservation is never resurrected here: the target only ever
-        moves it forward, so an ambiguous later reading cannot re-take capacity
-        the fleet already handed back.
+        A refused release ends retries. A confirmed release can supersede a
+        refusal if another settlement call was already in flight.
         """
-        if state not in {"active", "released"}:
+        if state not in {"active", "released", "refused"}:
             raise ValidationError(f"unsupported reservation state: {state}")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -937,7 +936,8 @@ class TargetStore:
             ).fetchone()
             if row is None:
                 raise ValidationError(f"unknown request id: {request_id}")
-            if row["reservation_state"] != "released":
+            current = row["reservation_state"]
+            if current == "active" or (current == "refused" and state == "released"):
                 connection.execute(
                     """
                     UPDATE target_requests

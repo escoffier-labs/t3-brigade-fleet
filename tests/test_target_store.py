@@ -60,6 +60,21 @@ class TargetStoreTests(unittest.TestCase):
         })
         self.assertEqual(first.active_count(), 1)
 
+    def test_existing_active_row_can_record_a_terminal_refusal(self) -> None:
+        store = TargetStore(self.path)
+        claim = self.claim("target-a-controller-a-12345678-1234-1234-1234-123456789abc")
+        store.claim(claim, active_limit=1, reservation_ttl=30)
+        store.reconcile(claim.request_id, state="failed", thread_id=None)
+
+        reopened = TargetStore(self.path)
+        self.assertEqual(reopened.lookup(claim.request_id).reservation_state, "active")
+        receipt = reopened.set_reservation_state(claim.request_id, "refused")
+        self.assertEqual(receipt.reservation_state, "refused")
+        receipt = reopened.set_reservation_state(claim.request_id, "active")
+        self.assertEqual(receipt.reservation_state, "refused")
+        stored = TargetStore(self.path).lookup(claim.request_id)
+        self.assertEqual(stored.reservation_state, "refused")
+
     def test_claim_rejects_capacity_and_repository_conflicts(self) -> None:
         store = TargetStore(self.path)
         store.claim(self.claim("linux-worker-controller-a-12345678-1234-1234-1234-123456789abc"), active_limit=1, reservation_ttl=30)

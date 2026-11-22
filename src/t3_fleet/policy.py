@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Protocol
 
 from .errors import (
+    HUB_REFUSAL_CODES,
     HostUnavailable,
     PolicyRejected,
     PolicyRevisionConflict,
@@ -1520,7 +1521,7 @@ class BrigadeFleetPolicy:
             session_id,
             "--json",
         ]
-        response = self._invoke(argv)
+        response = self._invoke(argv, refusal_codes=HUB_REFUSAL_CODES)
         try:
             return normalize_reservation(
                 response,
@@ -1534,7 +1535,9 @@ class BrigadeFleetPolicy:
                 "fleet reservation adapter returned an invalid reply"
             ) from error
 
-    def _invoke(self, argv: list[str]) -> dict[str, Any]:
+    def _invoke(
+        self, argv: list[str], *, refusal_codes: frozenset[str] = frozenset()
+    ) -> dict[str, Any]:
         try:
             if self._runner is None:
                 completed = _bounded_run(argv, timeout=self._timeout)
@@ -1553,7 +1556,7 @@ class BrigadeFleetPolicy:
             raise HostUnavailable("fleet policy adapter response exceeds the size limit")
         payload = self._payload(completed.stdout)
         if completed.returncode != 0:
-            raise self._failure(completed.returncode, payload)
+            raise self._failure(completed.returncode, payload, refusal_codes=refusal_codes)
         if payload is None:
             raise HostUnavailable("fleet policy adapter returned invalid JSON")
         return payload
@@ -1567,12 +1570,19 @@ class BrigadeFleetPolicy:
         return value if isinstance(value, dict) else None
 
     @staticmethod
-    def _failure(returncode: int, payload: dict[str, Any] | None) -> Exception:
+    def _failure(
+        returncode: int,
+        payload: dict[str, Any] | None,
+        *,
+        refusal_codes: frozenset[str] = frozenset(),
+    ) -> Exception:
         code = None
         if isinstance(payload, dict):
             error = payload.get("error")
             if isinstance(error, dict) and isinstance(error.get("code"), str):
                 code = error["code"]
+        if code is not None and code in refusal_codes:
+            return PolicyRejected("Fleet Hub policy denied the request", hub_code=code)
         if code in _DENIAL_CODES or returncode == 3:
             return PolicyRejected("Fleet Hub policy denied the request")
         if code in _CONFLICT_CODES or returncode == 4:

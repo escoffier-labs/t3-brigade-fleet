@@ -12,6 +12,7 @@ from typing import Any, Callable, NoReturn, Protocol
 from .config import FleetConfig, HostConfig, RepositoryConfig
 from .errors import (
     MISSING_RECEIPT_GRACE_SECONDS,
+    bounded_settlement_refusal,
     bounded_target_error,
     FleetError,
     HostUnavailable,
@@ -245,6 +246,12 @@ class FleetController:
         for key in ("updated_at", "output", "sequence"):
             if key in response:
                 result[key] = response[key]
+        settlement = response.get("fleet_reservation")
+        refusal = bounded_settlement_refusal(
+            settlement.get("refused") if isinstance(settlement, dict) else None
+        )
+        if refusal is not None:
+            result["fleet_refusal"] = refusal
         if record.state == "needs_attention":
             # What `answer` (input_id) or `approve` (approval_id) needs. Rebuilt
             # and re-bounded here rather than relayed, so a target can never

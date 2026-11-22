@@ -950,6 +950,24 @@ class ReservationLifecycleTests(unittest.TestCase):
     client refuses to believe about the reply it gets back.
     """
 
+    def test_reservation_refusals_carry_only_recognized_hub_codes(self) -> None:
+        for verb, code, exit_code in (
+            ("release", "auth-failed", 1),
+            ("renew", "invalid-request", 2),
+            ("release", "reservation_denied", 3),
+        ):
+            with self.subTest(verb=verb, code=code):
+                policy, _ = adapter((
+                    exit_code,
+                    json.dumps({"error": {"code": code, "message": "opaque Hub error"}}),
+                ))
+                call = policy.release_reservation if verb == "release" else policy.renew_reservation
+                with self.assertRaises(PolicyRejected) as raised:
+                    call(reservation_id="reservation-1", decision_id="decision-1", session_id=SESSION)
+                expected = code if code != "reservation_denied" else None
+                self.assertEqual(raised.exception.hub_code, expected)
+                self.assertNotIn("opaque Hub error", str(raised.exception))
+
     def test_renew_builds_the_documented_argv(self) -> None:
         policy, runner = adapter((0, json.dumps(RESERVATION)))
         record = policy.renew_reservation(

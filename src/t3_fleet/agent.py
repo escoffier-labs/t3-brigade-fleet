@@ -27,6 +27,7 @@ from .config import (
 )
 from .errors import (
     BLOCK_REASONS,
+    HUB_REFUSAL_CODES,
     UNCONFIRMED_TERMINAL_SECONDS,
     bounded_target_error,
     POLICY_REASONS,
@@ -1789,10 +1790,9 @@ class T3Agent:
 
         Only the machine that holds the work may move its reservation, and it
         moves it from durable local state: the receipt has already been written
-        before this runs. A live run renews; a durable terminal outcome releases
-        exactly once. An unknown state, an unreachable helper, or a refusal all
-        leave the capacity reserved, because the fleet must never free capacity
-        it cannot prove was returned.
+        before this runs. Live work renews and a durable terminal outcome
+        releases. A definitive release refusal ends local retries and leaves
+        the Hub lease to expire.
         """
         policy = receipt.policy
         if policy is None:
@@ -1805,11 +1805,11 @@ class T3Agent:
         if receipt.reservation_state != "active":
             return held
         resolution = (receipt.lifecycle or {}).get("resolution")
-        if resolution is not None and resolution.get("blocking", True):
-            call = self._fleet_policy.renew_reservation
-        elif state in _TARGET_TERMINAL_STATES:
+        blocking = resolution is not None and resolution.get("blocking", True)
+        releasing = not blocking and state in _TARGET_TERMINAL_STATES
+        if releasing:
             call = self._fleet_policy.release_reservation
-        elif state in {"running", "needs_attention"}:
+        elif blocking or state in {"running", "needs_attention"}:
             call = self._fleet_policy.renew_reservation
         else:
             return held
@@ -1819,8 +1819,26 @@ class T3Agent:
                 decision_id=policy["decision_id"],
                 session_id=policy["session_id"],
             )
-        except (HostUnavailable, PolicyRejected, PolicyRevisionConflict):
-            return held
+        except PolicyRejected as error:
+            if releasing and error.hub_code in HUB_REFUSAL_CODES:
+                stored = self._target_store().set_reservation_state(
+                    receipt.request_id, "refused"
+                )
+                held["state"] = stored.reservation_state
+            return {
+                **held,
+                "refused": {"status": "refused", "reason": error.hub_code or "hub-denied"},
+            }
+        except PolicyRevisionConflict:
+            return {
+                **held,
+                "refused": {"status": "refused", "reason": "revision-conflict"},
+            }
+        except HostUnavailable:
+            return {
+                **held,
+                "refused": {"status": "unavailable", "reason": "helper-unreachable"},
+            }
         if reply.get("state") != "released":
             return held
         self._target_store().set_reservation_state(receipt.request_id, "released")
@@ -3757,13 +3775,26 @@ class T3Agent:
                 results.append(
                     {"request_id": receipt.request_id, "reporting": "unavailable"}
                 )
-        return {
+        summary = {
             "schema": "t3-fleet.agent-result.v1",
             "action": "observe",
             "examined": len(results),
             "results": results,
             "truncated": len(candidates) > len(results),
         }
+        refused = unavailable = 0
+        for result in results:
+            settlement = result.get("fleet_reservation", {})
+            status = settlement.get("refused", {}).get("status")
+            if status == "refused":
+                refused += 1
+            elif status == "unavailable":
+                unavailable += 1
+        if refused:
+            summary["refused"] = refused
+        if unavailable:
+            summary["settlement_unavailable"] = unavailable
+        return summary
 
     def _observe_receipt(
         self, receipt: TargetReceipt, shell: dict[str, Any], observed_at: str
@@ -3776,6 +3807,7 @@ class T3Agent:
                 or current.observation_version != receipt.observation_version
             ):
                 return {"request_id": receipt.request_id, "reporting": "superseded"}
+            receipt = current
             store.mark_observed(receipt.request_id, observed_at)
             turn_ref = None
             updated = receipt
@@ -3812,12 +3844,20 @@ class T3Agent:
         reporting = self._publish_lifecycle(
             updated, turn_ref=turn_ref, observed_at=observed_at
         )
-        self._settle_reservation(updated, updated.state)
-        return {
+        settlement = self._settle_reservation(updated, updated.state)
+        entry: dict[str, Any] = {
             "request_id": receipt.request_id,
             "state": updated.state,
             "reporting": reporting,
         }
+        if settlement is not None:
+            entry["fleet_reservation"] = settlement
+            if (
+                reporting == "unchanged"
+                and settlement.get("refused", {}).get("status") == "refused"
+            ):
+                entry["reporting"] = "refused"
+        return entry
 
     @contextlib.contextmanager
     def _request_lock(self, request_id: str, *, timeout: float = 5) -> Iterator[None]:

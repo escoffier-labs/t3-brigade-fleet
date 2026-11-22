@@ -6,6 +6,12 @@ This project is pre-1.0. Before 1.0, minor versions may include breaking changes
 
 ## [Unreleased]
 
+### Fixed
+
+- Report bounded Hub reservation refusals in observation and controller
+  results. Stop retrying a definitively refused release for a terminal request
+  while the Hub lease runs to expiry.
+
 ## [0.2.0] - Unreleased
 
 Public candidate. No registry release has been cut.
