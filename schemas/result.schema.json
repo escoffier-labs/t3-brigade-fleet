@@ -203,6 +203,9 @@
     },
     "target_error": {
       "$ref": "#/$defs/target_error"
+    },
+    "fleet_refusal": {
+      "$ref": "#/$defs/fleet_refusal"
     }
   },
   "$defs": {
@@ -611,10 +614,12 @@
           "type": "string"
         },
         "reservation_state": {
+          "description": "The target's recorded reservation state. The value refused means a release was definitively denied and the target stopped retrying it.",
           "type": "string",
           "enum": [
             "active",
-            "released"
+            "released",
+            "refused"
           ]
         },
         "renewed": {
@@ -812,6 +817,33 @@
           "maxLength": 512
         }
       }
+    },
+    "fleet_refusal": {
+      "description": "The status class and reason of a fleet reservation settlement failure reported by the target. Only fleet_reservation.state equal to refused on the target receipt means the target stopped retrying.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "reason"
+      ],
+      "properties": {
+        "status": {
+          "description": "The class of failure. Refused includes failures that are eligible for retry.",
+          "enum": [
+            "refused",
+            "unavailable"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "auth-failed",
+            "invalid-request",
+            "revision-conflict",
+            "helper-unreachable",
+            "hub-denied"
+          ]
+        }
+      }
     }
   },
   "oneOf": [
@@ -897,6 +929,9 @@
         },
         "target_error": {
           "$ref": "#/$defs/target_error"
+        },
+        "fleet_refusal": {
+          "$ref": "#/$defs/fleet_refusal"
         }
       },
       "dependentRequired": {

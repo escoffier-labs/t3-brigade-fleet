@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from t3_fleet.errors import POLICY_REASONS
+from t3_fleet.errors import POLICY_REASONS, SETTLEMENT_REASONS, SETTLEMENT_STATUSES
 from t3_fleet.models import JOB_STATES
 
 
@@ -277,11 +277,16 @@ class SchemaTests(unittest.TestCase):
 
     def test_reconciliation_diagnostics_are_closed_and_bounded(self) -> None:
         schema = json.loads((Path(__file__).resolve().parents[1] / "schemas" / "result.schema.json").read_text())
-        for key in ("resolution", "target_error"):
+        for key in ("resolution", "target_error", "fleet_refusal"):
             self.assertFalse(schema["$defs"][key]["additionalProperties"])
             self.assertIn(key, schema["properties"])
             self.assertIn(key, schema["oneOf"][0]["properties"])
         self.assertEqual(schema["$defs"]["target_error"]["properties"]["detail"]["maxLength"], 512)
+        refusal = schema["$defs"]["fleet_refusal"]
+        self.assertEqual(set(refusal["required"]), {"status", "reason"})
+        self.assertEqual(set(refusal["properties"]), {"status", "reason"})
+        self.assertEqual(set(refusal["properties"]["status"]["enum"]), SETTLEMENT_STATUSES)
+        self.assertEqual(set(refusal["properties"]["reason"]["enum"]), SETTLEMENT_REASONS)
         for branch in schema["oneOf"][1:3]:
             self.assertIn("resolution", branch["properties"]["hosts"]["items"]["properties"])
 

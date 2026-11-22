@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
+from unittest.mock import Mock, patch
 
 from t3_fleet.agent import AgentPolicy, RepositoryPolicy, T3Agent, _agent_error
 from t3_fleet.errors import (
@@ -2721,6 +2722,162 @@ class TargetReservationLifecycleTests(_AgentPolicyFixture, unittest.TestCase):
         store = self.agent._target_store()
         self.assertEqual(store.lookup(PEER_REQUEST_ID).reservation_state, "active")
 
+    def test_observe_reports_a_release_refusal_and_stops_retrying(self) -> None:
+        with patch("t3_fleet.agent.report_event", return_value="delivered"):
+            self.claim()
+            self.policy.release_error = HostUnavailable("opaque helper error")
+            self.fake_t3.thread["latestTurn"] = {"state": "completed", "turnId": "turn-1"}
+            self.fake_t3.thread["session"] = {"status": "idle"}
+            self.reconcile()  # Acknowledge the terminal event before the refusal.
+            self.policy.release_calls.clear()
+            self.policy.release_error = PolicyRejected(
+                "opaque Hub error", hub_code="auth-failed"
+            )
+            first = self.agent.handle({"action": "observe", "max": 5})
+            second = self.agent.handle({"action": "observe", "max": 5})
+
+        entry = first["results"][0]
+        self.assertEqual(entry["state"], "succeeded")
+        self.assertEqual(entry["reporting"], "refused")
+        self.assertEqual(first["refused"], 1)
+        self.assertEqual(entry["fleet_reservation"]["state"], "refused")
+        self.assertEqual(
+            entry["fleet_reservation"]["refused"],
+            {"status": "refused", "reason": "auth-failed"},
+        )
+        self.assertNotIn("opaque Hub error", json.dumps(first))
+        self.assertEqual(second["results"], [])
+        self.assertEqual(len(self.policy.release_calls), 1)
+        self.assertEqual(
+            self.agent._target_store().lookup(PEER_REQUEST_ID).reservation_state, "refused"
+        )
+
+    def test_status_relays_a_stored_release_refusal_without_another_call(self) -> None:
+        from test_controller import peer_config
+
+        from t3_fleet.controller import FleetController
+        from t3_fleet.store import FleetStore
+
+        with patch("t3_fleet.agent.report_event", return_value="delivered"):
+            self.claim()
+            self.fake_t3.thread["latestTurn"] = {"state": "completed", "turnId": "turn-1"}
+            self.fake_t3.thread["session"] = {"status": "idle"}
+            self.policy.release_error = PolicyRejected("opaque", hub_code="auth-failed")
+            self.agent.handle({"action": "observe", "max": 5})
+
+            # Reopen the target and discover its stored receipt on the controller.
+            self.agent = self.build()
+            transport = Mock()
+            transport.call.side_effect = lambda host, request: self.agent.handle(request)
+            store = FleetStore(Path(self.directory.name) / "controller.db")
+            controller = FleetController(peer_config(), store, transport)
+            lookup = self.agent.handle({"action": "lookup", "request_id": PEER_REQUEST_ID})
+            status = controller.status(PEER_REQUEST_ID)
+
+        expected = {"status": "refused", "reason": "auth-failed"}
+        self.assertEqual(lookup["fleet_reservation"]["state"], "refused")
+        self.assertEqual(lookup["fleet_reservation"]["refused"], expected)
+        self.assertEqual(status["state"], "succeeded")
+        self.assertEqual(status["fleet_refusal"], expected)
+        self.assertEqual(len(self.policy.release_calls), 1)
+
+    def test_observe_reports_and_retries_an_invalid_request_release(self) -> None:
+        with patch("t3_fleet.agent.report_event", return_value="delivered"):
+            self.claim()
+            self.fake_t3.thread["latestTurn"] = {"state": "completed", "turnId": "turn-1"}
+            self.fake_t3.thread["session"] = {"status": "idle"}
+            self.policy.release_error = PolicyRejected("opaque", hub_code="invalid-request")
+            first = self.agent.handle({"action": "observe", "max": 5})
+
+            settlement = first["results"][0]["fleet_reservation"]
+            self.assertEqual(
+                settlement["refused"],
+                {"status": "refused", "reason": "invalid-request"},
+            )
+            self.assertEqual(settlement["state"], "active")
+            receipt = self.agent._target_store().lookup(PEER_REQUEST_ID)
+            self.assertEqual(receipt.reservation_state, "active")
+
+            self.policy.release_error = None
+            second = self.agent.handle({"action": "observe", "max": 5})
+        self.assertEqual(second["results"][0]["fleet_reservation"]["state"], "released")
+        self.assertEqual(len(self.policy.release_calls), 2)
+
+    def test_observe_preserves_lifecycle_failure_after_a_refused_release(self) -> None:
+        self.claim()
+        self.fake_t3.thread["latestTurn"] = {"state": "completed", "turnId": "turn-1"}
+        self.fake_t3.thread["session"] = {"status": "idle"}
+        self.policy.release_error = PolicyRejected("opaque", hub_code="auth-failed")
+
+        first = self.agent.handle({"action": "observe", "max": 5})
+        second = self.agent.handle({"action": "observe", "max": 5})
+
+        self.assertEqual(first["results"][0]["reporting"], "unavailable")
+        self.assertEqual(first["refused"], 1)
+        self.assertEqual(second["examined"], 1)  # The lifecycle event is still pending.
+        self.assertEqual(second["results"][0]["reporting"], "unavailable")
+        self.assertEqual(len(self.policy.release_calls), 1)
+
+    def test_observe_retries_release_after_transient_or_unclassified_errors(self) -> None:
+        with patch("t3_fleet.agent.report_event", return_value="delivered"):
+            self.claim()
+            self.fake_t3.thread["latestTurn"] = {"state": "completed", "turnId": "turn-1"}
+            self.fake_t3.thread["session"] = {"status": "idle"}
+            failures = (
+                (
+                    HostUnavailable("opaque"), "unavailable", "helper-unreachable",
+                    "settlement_unavailable",
+                ),
+                (
+                    PolicyRevisionConflict("opaque"), "refused", "revision-conflict",
+                    "refused",
+                ),
+                (
+                    PolicyRejected("opaque", hub_code="unknown"), "refused", "hub-denied",
+                    "refused",
+                ),
+                (
+                    PolicyRejected("opaque", hub_code="invalid-request"), "refused",
+                    "invalid-request", "refused",
+                ),
+            )
+            for attempt, (error, status, reason, counter) in enumerate(failures, start=1):
+                with self.subTest(reason=reason):
+                    self.policy.release_error = error
+                    result = self.agent.handle({"action": "observe", "max": 5})
+                    entry = result["results"][0]
+                    expected_reporting = "delivered" if attempt == 1 else "refused"
+                    self.assertEqual(entry["reporting"], expected_reporting)
+                    self.assertEqual(result[counter], 1)
+                    self.assertEqual(
+                        entry["fleet_reservation"]["refused"],
+                        {"status": status, "reason": reason},
+                    )
+                    self.assertEqual(len(self.policy.release_calls), attempt)
+                    self.assertEqual(
+                        self.agent._target_store().lookup(PEER_REQUEST_ID).reservation_state,
+                        "active",
+                    )
+            self.policy.release_error = None
+            result = self.agent.handle({"action": "observe", "max": 5})
+        self.assertEqual(result["results"][0]["fleet_reservation"]["state"], "released")
+        self.assertEqual(len(self.policy.release_calls), len(failures) + 1)
+
+    def test_a_refused_renew_keeps_the_reservation_active(self) -> None:
+        self.claim()
+        self.policy.renew_error = PolicyRejected("opaque", hub_code="auth-failed")
+        result = self.reconcile()
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(
+            result["fleet_reservation"]["refused"],
+            {"status": "refused", "reason": "auth-failed"},
+        )
+        self.assertEqual(
+            self.agent._target_store().lookup(PEER_REQUEST_ID).reservation_state, "active"
+        )
+        self.assertEqual(len(self.policy.renew_calls), 1)
+        self.assertEqual(self.policy.release_calls, [])
+
     def test_the_legacy_single_controller_path_settles_from_its_receipt(self) -> None:
         self.agent.handle(self.submit_request)
         result = self.agent.handle(
@@ -3153,6 +3310,19 @@ class TargetContinuationAdmissionTests(_AgentPolicyFixture, unittest.TestCase):
         with self.assertRaises(PolicyRejected) as caught:
             self.followup()
         self.assertEqual(caught.exception.reason, "continuation-admission-required")
+
+    def test_continuation_renew_preserves_the_helper_error_class(self) -> None:
+        from test_policy import adapter
+
+        for exit_code, error_class in ((2, ValidationError), (4, PolicyRevisionConflict)):
+            with self.subTest(exit_code=exit_code):
+                policy, _ = adapter((
+                    exit_code, json.dumps({"error": {"code": "invalid-request"}})
+                ))
+                with patch.object(self.policy, "renew_reservation", policy.renew_reservation):
+                    with self.assertRaises(error_class):
+                        self.followup()
+                self.assert_no_side_effect()
 
     def test_the_continuation_marker_is_a_typed_reason_not_only_a_message(self) -> None:
         self.policy.renew_error = PolicyRejected("reservation is gone")

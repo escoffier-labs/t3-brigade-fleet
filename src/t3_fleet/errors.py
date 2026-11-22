@@ -137,8 +137,14 @@ POLICY_REASONS = frozenset(
 )
 
 
+# The helper also uses invalid-request for local errors and ambiguous HTTP
+# failures. Only auth-failed ends release retries.
+DEFINITIVE_RELEASE_REFUSAL_CODES = frozenset({"auth-failed"})
+HUB_REFUSAL_CODES = DEFINITIVE_RELEASE_REFUSAL_CODES | {"invalid-request"}
+
+
 class PolicyRejected(FleetError):
-    """The authoritative fleet roster denied a model admission."""
+    """The authoritative fleet policy denied an operation."""
 
     code = "policy_rejected"
     exit_code = 3
@@ -148,6 +154,7 @@ class PolicyRejected(FleetError):
         message: str,
         *,
         reason: str | None = None,
+        hub_code: str | None = None,
         detail: str | None = None,
     ) -> None:
         super().__init__(message, detail=detail)
@@ -155,6 +162,11 @@ class PolicyRejected(FleetError):
         # must never turn a denial into a different failure, and must never be
         # forwarded on the assumption that some other layer will filter it.
         self.reason = reason if reason in POLICY_REASONS else None
+        self.hub_code = (
+            hub_code
+            if isinstance(hub_code, str) and hub_code in HUB_REFUSAL_CODES
+            else None
+        )
 
 
 class UnknownState(FleetError):
@@ -190,6 +202,34 @@ TARGET_ERROR_CODES = frozenset({
     "invalid_config", "invalid_request", "host_unavailable", "t3_auth_failed",
     "t3_http_failed", "internal_error", "policy_rejected", "policy_revision_conflict",
 })
+
+
+# Fixed vocabulary for settlement failures reported to callers.
+SETTLEMENT_STATUSES = frozenset({"refused", "unavailable"})
+SETTLEMENT_REASONS = frozenset(
+    {
+        *HUB_REFUSAL_CODES,
+        "revision-conflict",
+        "helper-unreachable",
+        "hub-denied",
+    }
+)
+
+
+def bounded_settlement_refusal(value: object) -> dict[str, str] | None:
+    """Revalidate a target's settlement refusal before a controller relays it."""
+    if not isinstance(value, dict):
+        return None
+    status = value.get("status")
+    reason = value.get("reason")
+    if (
+        not isinstance(status, str)
+        or status not in SETTLEMENT_STATUSES
+        or not isinstance(reason, str)
+        or reason not in SETTLEMENT_REASONS
+    ):
+        return None
+    return {"status": status, "reason": reason}
 
 
 def bounded_target_error(value: object) -> dict[str, str] | None:

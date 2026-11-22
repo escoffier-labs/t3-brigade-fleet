@@ -2125,6 +2125,21 @@ class FleetReservationRelayTests(_FleetPolicyFixture, unittest.TestCase):
         self.assertEqual(result["state"], "running")
         self.assertEqual(self.session().reservation_state, "active")
 
+    def test_status_relays_only_the_bounded_settlement_refusal(self) -> None:
+        self.running()
+        self.transport.status_state = "succeeded"
+        self.reservation(
+            "refused", refused={"status": "refused", "reason": "auth-failed", "detail": "opaque"}
+        )
+        result = self.controller.status("req-12345678")
+        self.assertEqual(result["fleet_refusal"], {"status": "refused", "reason": "auth-failed"})
+        self.assertNotIn("fleet_reservation", result)
+        self.assertEqual(self.session().reservation_state, "active")
+        for status, reason in (("refused", "opaque"), (["refused"], "auth-failed")):
+            with self.subTest(status=status, reason=reason):
+                self.reservation("refused", refused={"status": status, "reason": reason})
+                self.assertNotIn("fleet_refusal", self.controller.status("req-12345678"))
+
     def test_a_release_reported_by_the_target_is_recorded(self) -> None:
         self.running()
         self.transport.status_state = "succeeded"

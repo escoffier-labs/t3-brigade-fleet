@@ -6,6 +6,22 @@ This project is pre-1.0. Before 1.0, minor versions may include breaking changes
 
 ## [Unreleased]
 
+### Fixed
+
+- Report bounded reservation settlement failures in observation results and
+  expose them as `fleet_refusal` in controller results. The diagnostic
+  `status` names the failure class. Only `fleet_reservation.state == "refused"`
+  on a target receipt means the agent has stopped retrying. The target records
+  that state for an `auth-failed` release on a terminal request, reports the
+  diagnosis on later reads, and leaves the Hub lease to expire.
+- Classify an `invalid-request` helper response during settlement release or
+  renew, and during `tick` renewal, as a retryable policy rejection (class exit
+  3). It previously mapped to validation (exit 2) or revision conflict (exit
+  4) when the helper returned those codes. Observation and status report the
+  diagnosis alongside the request result. Continuation renewals for
+  `followup`, `approve`, and `answer` retain the helper's original validation
+  and revision conflict classifications.
+
 ## [0.2.0] - Unreleased
 
 Public candidate. No registry release has been cut.

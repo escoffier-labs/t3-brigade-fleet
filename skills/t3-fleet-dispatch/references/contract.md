@@ -198,8 +198,14 @@ Limits:
   decision id, and session id. It renews while it observes a live run and
   releases only on its own durable terminal outcome. The controller relays
   status and records the state the target reported. An `unknown` state, a
-  transport failure, or a refused helper all keep the reservation counted, and
-  a released reservation is never resurrected.
+  transport failure, or a refused helper all keep the reservation counted.
+- An `auth-failed` release records reservation state `refused`. The target stops
+  retrying the release, lets the Hub lease expire, and reports the refusal on
+  later reads. The controller exposes settlement diagnoses as `fleet_refusal`
+  with a bounded `status` and `reason`. The diagnostic `status` names the
+  failure class, including retryable failures. Only
+  `fleet_reservation.state == "refused"` on the target receipt means release
+  retries have stopped.
 - The target acknowledges the session only after the canonical rules and the
   locally selected model are applied, and takes the launch admission only after
   that. See "Planning, preparing, launching" below.
@@ -209,12 +215,11 @@ Limits:
   reservation first, and only then re-takes the launch admission under this
   request's own id. Only a granted renewal admits the action. A continuation resolves
   under the recorded decision id, exactly as a first dispatch does, and never
-  re-resolves on origin alone. A released, expired, or missing reservation fails
-  closed, and resuming then needs a newly negotiated reservation rather than a
-  revived one. A policy receipt written before canonical identity existed cannot
-  prove which repository it was admitted for, so it fails closed too. An
-  unreachable helper leaves the reservation held and still refuses. `interrupt`,
-  `status`, and `wait` keep their existing behavior.
+  re-resolves on origin alone. A released, refused, expired, or missing
+  reservation fails closed. Resuming then needs a newly negotiated reservation.
+  A policy receipt written before canonical identity existed cannot prove which
+  repository it was admitted for, so it fails closed too. An unreachable helper
+  leaves the reservation held and refuses to resume.
 
 ### Adopting a parent delegation
 
@@ -435,11 +440,9 @@ Lifecycle:
   revalidates the current policy, target, and live reservation, then re-takes
   the launch admission under the same request id. It never claims a second
   launch and never takes a second reservation.
-- Once the reservation is terminal, released, or expired, a new follow-up is
-  `continuation-admission-required` until a fresh affinity protocol exists.
-  **This is a known limitation.** This client does not invent a resurrection
-  path for capacity the fleet has already taken back.
-- `interrupt`, `status`, and `wait` are unchanged.
+- Once the reservation is released, refused, or expired, a new follow-up
+  returns `continuation-admission-required` until a fresh affinity protocol
+  exists. `status` and `wait` relay any reported `fleet_refusal`.
 
 Server-side enforcement is Brigade's: a launch requires a current acknowledged
 exact selection plus an active target-owned reservation, and an older client
