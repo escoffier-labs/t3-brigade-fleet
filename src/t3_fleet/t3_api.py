@@ -15,7 +15,10 @@ from .t3_rpc import websocket_rpc
 from .t3_origin import validate_t3_origin
 
 MAX_RESPONSE_BYTES = 1024 * 1024
-MAX_SHELL_RESPONSE_BYTES = 16 * 1024 * 1024
+# The shell snapshot lists every thread and project, so it grows with history.
+# A long-lived host with ~6,700 threads returned 19 MB, which tripped a 16 MiB
+# cap and made doctor report the host offline.
+MAX_SHELL_RESPONSE_BYTES = 64 * 1024 * 1024
 # One thread's projection carries its whole message, run, and activity history,
 # so a long thread outgrows the general 1 MiB cap long before the shell does.
 MAX_THREAD_RESPONSE_BYTES = 16 * 1024 * 1024

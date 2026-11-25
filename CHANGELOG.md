@@ -8,6 +8,10 @@ This project is pre-1.0. Before 1.0, minor versions may include breaking changes
 
 ### Fixed
 
+- Raise the `/api/orchestration/shell` response cap from 16 MiB to 64 MiB.
+  The shell snapshot grows with thread history, and a host with ~6,700
+  threads returned 19 MB. `doctor` then reported the host `blocked_offline`,
+  which blocked dispatch and any update gate that relies on doctor.
 - Report bounded reservation settlement failures in observation results and
   expose them as `fleet_refusal` in controller results. The diagnostic
   `status` names the failure class. Only `fleet_reservation.state == "refused"`
