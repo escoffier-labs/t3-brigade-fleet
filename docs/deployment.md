@@ -153,6 +153,8 @@ declares `t3-lane`, prepare and verify a separate install before switching the
 operator's launcher paths. In-place pin upgrades currently support the POSIX
 source-wrapper layout. Migrated wrappers load from the
 approved source root in an isolated interpreter with site processing disabled. Follow the saved transaction to roll back one
-verified edge at a time. A new upgrade validates up to 16 preceding upgrade
+verified edge at a time. A schema-2 record with legacy launchers needs an
+explicit upgrade to a new reviewed pin. Finalize any outstanding cleanup before
+starting a new transaction. A new upgrade validates up to 16 preceding upgrade
 records. Keep the preceding artifacts, records, and backups available while
 any later transaction depends on them.

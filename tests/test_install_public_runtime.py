@@ -3200,6 +3200,62 @@ if __name__ == "__main__":
         self.assertFalse(self.hash_record.exists())
         self.assertEqual(self.policy.read_bytes(), maintained_policy)
 
+    def seed_verified_legacy_record(self):
+        launchers = {path: path.read_bytes() for path in self.launchers}
+        self.assertEqual(self.call("apply", ["--apply"])[0], 0)
+        record_path = self.purelib / self.adapter.RECOVERY
+        record = json.loads(record_path.read_bytes())
+        inventory_path = self.transaction() / "inventory.json"
+        inventory = json.loads(inventory_path.read_bytes())
+        for path, data in launchers.items():
+            path.write_bytes(data)
+            record["after"].pop(str(path))
+        for entry in inventory["inputs"]:
+            if entry["category"] == "entrypoint":
+                entry["runtime"] = False
+        inventory_path.write_text(json.dumps(inventory, sort_keys=True, indent=2) + "\n")
+        record["inventory_sha256"] = hashlib.sha256(inventory_path.read_bytes()).hexdigest()
+        record_path.write_bytes(self.adapter.record_bytes(record))
+        self.assertEqual(len(record["after"]), 2)
+        return launchers, record_path.read_bytes()
+
+    def test_legacy_launcher_snapshot_supports_plan_and_rollback_after_migration(self):
+        launchers, predecessor_record = self.seed_verified_legacy_record()
+        self.select_successor()
+        backup = self.backups / ("transaction-" + uuid.uuid4().hex)
+        code, output = self.call("upgrade", ["--backup", str(backup), "--apply"])
+        self.assertEqual(code, 0, output)
+        self.assertNotEqual({path: path.read_bytes() for path in launchers}, launchers)
+        code, output = self.call()
+        self.assertEqual(code, 0, output)
+        code, output = self.call("rollback", ["--backup", str(backup), "--apply"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual({path: path.read_bytes() for path in launchers}, launchers)
+        self.assertEqual((self.purelib / self.adapter.RECOVERY).read_bytes(), predecessor_record)
+
+    def test_interrupted_legacy_launcher_migration_restores_both_wrappers(self):
+        launchers, predecessor_record = self.seed_verified_legacy_record()
+        self.select_successor()
+        backup = self.backups / ("transaction-" + uuid.uuid4().hex)
+        migrate = self.adapter.migrate_source_wrapper
+        migrated = []
+
+        def interrupt_second(path, *args):
+            if migrated:
+                raise KeyboardInterrupt
+            result = migrate(path, *args)
+            migrated.append(path)
+            return result
+
+        with patch.object(self.adapter, "migrate_source_wrapper", side_effect=interrupt_second):
+            with self.assertRaises(KeyboardInterrupt):
+                self.call("upgrade", ["--backup", str(backup), "--apply"])
+        self.assertEqual(len(migrated), 1)
+        code, output = self.call("rollback", ["--backup", str(backup), "--apply"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual({path: path.read_bytes() for path in launchers}, launchers)
+        self.assertEqual((self.purelib / self.adapter.RECOVERY).read_bytes(), predecessor_record)
+
     def test_schema2_predecessor_upgrades_to_new_pin_and_rolls_back_two_edges(self):
         self.assertEqual(self.call("apply", ["--apply"])[0], 0)
         a_package = self.adapter.fingerprint(self.purelib / "t3_fleet")
@@ -3274,6 +3330,9 @@ if __name__ == "__main__":
             code, output = self.call("rollback", ["--backup", str(successor["backup"]), "--apply"])
             self.assertEqual(code, 0, output)
             self.assertEqual(json.loads(output)["status"], "rolled-back")
+            code, output = self.call("rollback", ["--backup", str(successor["backup"]), "--apply"])
+            self.assertEqual(code, 0, output)
+            self.assertEqual(json.loads(output)["status"], "unchanged")
             self.assertEqual((self.purelib / self.adapter.RECOVERY).read_bytes(),
                              predecessor["record_bytes"])
             self.assertEqual(self.adapter.fingerprint(self.purelib / "t3_fleet"),
@@ -3281,6 +3340,19 @@ if __name__ == "__main__":
             self.argv[self.argv.index("--artifact-dir") + 1] = str(predecessor["artifact"])
             self.argv[self.argv.index("--public-source") + 1] = str(predecessor["source"])
             self.set_pin(predecessor["pin_file"])
+
+    def test_three_script_pin_refuses_unsupported_layout_before_opening_artifacts(self):
+        self.adapter.load_builder()
+        pin = json.loads(Path(self.argv[self.argv.index("--pin") + 1]).read_text())
+        pin["package"]["console_scripts"]["t3-lane"] = "t3_fleet.lane:main"
+        for layout in ("venv", "windows-user-site"):
+            with self.subTest(layout=layout):
+                args = self.options()
+                args.layout = layout
+                with patch.object(self.adapter, "git_objects") as git_objects:
+                    with self.assertRaisesRegex(ValueError, "managed launcher set"):
+                        self.adapter.validate_artifact(args, pin=pin)
+                    git_objects.assert_not_called()
 
     def test_schema2_rollback_retries_after_interruption(self):
         self.assertEqual(self.call("apply", ["--apply"])[0], 0)

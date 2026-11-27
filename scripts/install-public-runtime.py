@@ -629,6 +629,10 @@ def git_objects(source: Path, pin: dict) -> dict[str, bytes]:
 
 def validate_artifact(args, *, pin: dict | None = None) -> dict:
     pin = BUILDER["load_pin"](args.pin) if pin is None else validate_pin(pin)
+    if args.layout != "source-wrapper" and set(pin["package"]["console_scripts"]) != {
+        "t3-fleet", "t3-fleet-agent",
+    }:
+        raise ValueError("console scripts exceed the managed launcher set")
     source = checked_path(args.public_source, exists=True)
     artifact = checked_path(args.artifact_dir, exists=True)
     for item in artifact.rglob("*"):
@@ -1769,8 +1773,29 @@ def validate_inventory_descriptors(args, inputs: list[dict]) -> None:
             raise ValueError("backup inventory descriptor mismatch")
 
 
+def saved_launcher_fingerprints(inventory: dict) -> dict:
+    return {entry["destination"]: entry["before"] for entry in inventory["inputs"]
+            if entry["category"] in {"entrypoint", "outer-wrapper"}}
+
+
+def validate_predecessor_launchers(inventory: dict, record: dict, saved: dict | None) -> None:
+    for destination, before in saved_launcher_fingerprints(inventory).items():
+        expected = record["after"].get(destination, before)
+        actual = fingerprint(Path(destination)) if saved is None else saved.get(destination)
+        if actual != expected:
+            raise ValueError("predecessor launcher bytes changed")
+
+
+def validate_preserved_outer_wrappers(inventory: dict) -> None:
+    for entry in inventory["inputs"]:
+        if (entry["category"] == "outer-wrapper"
+                and fingerprint(Path(entry["destination"])) != entry["before"]):
+            raise ValueError("outer wrapper bytes changed")
+
+
 def validate_schema2_predecessor(
     args, raw: bytes, record: dict, *, identity_bytes: bytes, remaining_edges: int,
+    saved_launchers: dict | None,
 ) -> dict:
     """Authenticate a verified upgrade record and its preserved rollback chain."""
     if remaining_edges <= 0:
@@ -1792,6 +1817,9 @@ def validate_schema2_predecessor(
     # without requiring the live runtime to still be B. During C rollback the
     # live runtime is C until the staged predecessor is published.
     backup, inventory = validate_upgrade_backup(old, record)
+    if any(fingerprint(Path(path))["kind"] != "absent" for path in record["owned"]):
+        raise ValueError("predecessor staging cleanup is incomplete")
+    validate_predecessor_launchers(inventory, record, saved_launchers)
     identity = next(entry for entry in inventory["inputs"] if entry["category"] == "hash-record")
     expected_identity = record["after"].get(identity["destination"])
     if (not isinstance(expected_identity, dict) or expected_identity.get("kind") != "file"
@@ -1807,6 +1835,7 @@ def validate_schema2_predecessor(
     predecessor = validate_predecessor(
         old, predecessor_raw, predecessor_record, identity_bytes=predecessor_identity,
         remaining_edges=remaining_edges - 1,
+        saved_launchers=saved_launcher_fingerprints(inventory),
     )
     expected_predecessor, expected_successor = upgrade_identity_blocks(predecessor, artifact)
     if (record["predecessor"] != expected_predecessor
@@ -1819,13 +1848,14 @@ def validate_schema2_predecessor(
 
 def validate_predecessor(
     args, raw: bytes, record: dict, *, identity_bytes: bytes,
-    remaining_edges: int = MAX_PREDECESSOR_EDGES,
+    remaining_edges: int = MAX_PREDECESSOR_EDGES, saved_launchers: dict | None = None,
 ) -> dict:
     if not isinstance(raw, bytes) or json.loads(raw) != record:
         raise ValueError("predecessor record bytes mismatch")
     if isinstance(record, dict) and record.get("schema") == 2:
         return validate_schema2_predecessor(
             args, raw, record, identity_bytes=identity_bytes, remaining_edges=remaining_edges,
+            saved_launchers=saved_launchers,
         )
     if (not isinstance(record, dict)
             or set(record) != {"schema", "phase", "backup", "binding", "inventory_sha256",
@@ -1866,16 +1896,7 @@ def validate_predecessor(
         raise ValueError("predecessor owned path set mismatch")
     if any(fingerprint(Path(path))["kind"] != "absent" for path in record["owned"]):
         raise ValueError("predecessor staging cleanup is incomplete")
-    for entry in inventory["inputs"]:
-        if entry["category"] in {"entrypoint", "outer-wrapper"}:
-            expected = entry["before"]
-            if (entry["category"] == "entrypoint" and entry["runtime"]
-                    and entry["destination"] in record["after"]):
-                # A verified record may have migrated a legacy wrapper; compare
-                # the live launcher with its verified post-install fingerprint.
-                expected = record["after"][entry["destination"]]
-            if fingerprint(Path(entry["destination"])) != expected:
-                raise ValueError("predecessor launcher bytes changed")
+    validate_predecessor_launchers(inventory, record, saved_launchers)
     return {"args": old, "backup": backup, "inventory": inventory, "artifact": artifact,
             "record": record,
             "manifest": manifest, "pin": pin,
@@ -1909,6 +1930,9 @@ def plan_upgrade(args) -> dict:
             args._code = "recovery-required"
             raise ValueError("unfinished upgrade requires explicit rollback")
         if successor["manifest"] == record["successor"]["manifest"]:
+            if inspect_layout(args)["wrapper_migration"]:
+                args._code = "legacy-wrapper-new-pin-required"
+                raise ValueError("migrating legacy wrappers requires a new reviewed pin")
             state = validate_upgrade_state(args, raw, record, successor=successor)
             transaction = checked_path(args.backup, exists=True)
             if transaction != state["backup"]:
@@ -2074,13 +2098,16 @@ def validate_upgrade_state(args, raw: bytes, record: dict, *, successor: dict | 
         raise ValueError("active upgrade successor differs from the reviewed pin")
     backup, inventory = validate_upgrade_backup(args, record)
     check_boundaries(args, inventory["inputs"])
+    validate_preserved_outer_wrappers(inventory)
     identity_entry = next(entry for entry in inventory["inputs"]
                           if entry["category"] == "hash-record")
     protected_identity = (backup / identity_entry["label"] / "data").read_bytes()
     predecessor_raw = (backup / "predecessor-record.json").read_bytes()
     predecessor_record = json.loads(predecessor_raw)
     predecessor = validate_predecessor(
-        args, predecessor_raw, predecessor_record, identity_bytes=protected_identity)
+        args, predecessor_raw, predecessor_record, identity_bytes=protected_identity,
+        saved_launchers=saved_launcher_fingerprints(inventory),
+    )
     if (record["predecessor"] != upgrade_identity_blocks(predecessor, successor)[0]
             or record["successor"] != upgrade_identity_blocks(predecessor, successor)[1]):
         raise ValueError("upgrade identity chain changed")
@@ -2265,6 +2292,9 @@ def plan(args) -> dict:
             raise ValueError("unfinished upgrade requires explicit rollback")
         if artifact["manifest"] != record["successor"]["manifest"]:
             raise ValueError("a new pin requires the explicit upgrade action")
+        if inspect_layout(args)["wrapper_migration"]:
+            args._code = "legacy-wrapper-new-pin-required"
+            raise ValueError("migrating legacy wrappers requires a new reviewed pin")
         return validate_upgrade_state(args, raw, record, successor=artifact)
     if record and record["phase"] not in {"verified", "rolled-back"}:
         args._code = "recovery-required"
@@ -3597,9 +3627,12 @@ def validate_upgrade_ready(args, backup: Path, record: dict | None) -> dict:
     predecessor_record = json.loads(predecessor_raw)
     identity_entry = next(entry for entry in inventory["inputs"]
                           if entry["category"] == "hash-record")
+    validate_preserved_outer_wrappers(inventory)
     predecessor = validate_predecessor(
         args, predecessor_raw, predecessor_record,
-        identity_bytes=(validated_backup / identity_entry["label"] / "data").read_bytes())
+        identity_bytes=(validated_backup / identity_entry["label"] / "data").read_bytes(),
+        saved_launchers=saved_launcher_fingerprints(inventory),
+    )
     expected_runtime = {entry["destination"]: entry["before"]
                         for entry in inventory["inputs"] if entry["runtime"]}
     if receipt["runtime"] != expected_runtime:
@@ -3661,9 +3694,12 @@ def rollback_upgrade(args, record: dict | None = None) -> str:
     backup = checked_path(args.backup, exists=True)
     if record is None:
         record = read_record(args.purelib)
-    if record and record.get("schema") == 1:
+    if record and (record.get("schema") == 1 or (
+        record.get("schema") == 2 and record.get("backup") != str(backup)
+        and (backup / "rollback-ready.json").is_file()
+    )):
         args._code = "recovery-invalid"
-        validate_upgrade_ready(args, backup, record)
+        validate_upgrade_ready(args, backup, None)
         fsync_directory(args.purelib)
         return "unchanged"
     if not record or record.get("schema") != 2 or record.get("backup") != str(backup):
