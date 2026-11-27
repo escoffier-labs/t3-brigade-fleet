@@ -15,12 +15,13 @@ pipx install git+https://github.com/escoffier-labs/t3-brigade-fleet.git
 
 - `t3-fleet` is the controller CLI for dispatch, status, and recovery.
 - `t3-fleet-agent` talks to T3 Code on the target.
-- `t3-lane` is the [local lane client](docs/lane-client.md) for inspecting and
-  operating a T3 Code thread.
+- `t3-lane` is the [local lane client](docs/lane-client.md) for binding a
+  thread and delivering evidence or context.
 
-For deployment, use a reviewed commit and an operator-owned pin. The
-[pinned runtime builder](scripts/build-public-runtime.py) builds and verifies a
-wheel against the pin's Git commit, tree, and package contract. The
+The project is pre-1.0. For deployment, use a reviewed commit and an
+operator-owned pin. The [pinned runtime builder](scripts/build-public-runtime.py)
+builds and verifies a wheel against the pin's Git commit, tree, and package
+contract. The
 [installer](scripts/install-public-runtime.py) can plan and verify changes
 against an existing layout. In-place pin upgrades support POSIX source wrappers
 and retain a transaction record for rollback. The installer expects two
@@ -52,16 +53,18 @@ For a live target, follow the
 
 ![The dispatch skill guides the controller. The controller exchanges requests and results with the target agent over a local process or SSH. On the target, the agent reads local T3 Code and updates the request receipt.](docs/assets/dispatch-flow.svg)
 
-The controller checks policy and capacity, obtains Brigade authority, and
-passes the request to the target agent. The agent talks to T3 Code over
-loopback, and T3 Code runs the session. The target records a receipt keyed to
-the request so later commands can match the correct work.
+The controller checks policy and capacity before it sends the request to the
+target agent. For enrolled dispatch, the controller obtains a model plan and
+the target obtains launch admission. The agent talks to T3 Code over loopback.
+The target records a receipt keyed to the request so later commands can match
+the correct session.
 
-The target agent's observer checks T3 Code snapshots and refreshes receipts
-and reservation status. If a transport failure leaves a dispatch outcome
-unknown, `t3-fleet recover` uses target evidence to reconcile the existing
-request without replaying the prompt. The
-[recovery guide](docs/recovery.md) explains when capacity remains reserved.
+Run `t3-fleet-agent observe` on the target to check T3 Code snapshots and
+refresh receipts and reservation status. If a transport failure leaves a
+dispatch outcome unknown, an operator can authorize `t3-fleet recover` to
+reconcile the existing request from target evidence without replaying the
+prompt. See the [recovery guide](docs/recovery.md) for containment and when
+capacity remains reserved.
 
 The [shared dispatch skill](skills/t3-fleet-dispatch/SKILL.md) guides agents
 through choosing a route, checking readiness, and handling approvals and
@@ -83,9 +86,10 @@ protected storage. See [deployment](docs/deployment.md) and the
 
 ## BrigadeStack integration
 
-[BrigadeStack](https://github.com/escoffier-labs/brigadestack) calls an external
-`t3-fleet` client for configured fleet work. The client calls the external
-`brigade` CLI for model admission and enrolled reservation operations.
+When fleet routing sends a `brigade run` seat to another machine,
+[BrigadeStack](https://github.com/escoffier-labs/brigadestack) can call an external
+`t3-fleet` client. In turn, the client uses the external `brigade` CLI for
+model admission and enrolled reservation operations.
 
 ## Reference
 

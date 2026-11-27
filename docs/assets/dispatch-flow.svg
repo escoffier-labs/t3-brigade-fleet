@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="560" height="452" viewBox="0 0 560 452" role="img" aria-labelledby="title desc">
   <title id="title">T3 Brigade Fleet request flow</title>
-  <desc id="desc">The dispatch skill guides the controller. A local process or SSH carries requests and results to and from the target agent. The agent calls local T3 Code and observes or reconciles target receipts.</desc>
+  <desc id="desc">The dispatch skill guides controller use. A local process or SSH carries requests and results to and from the target agent. The agent calls local T3 Code and observes or reconciles target receipts.</desc>
   <style>
     svg { color-scheme: light dark; }
     .surface { fill: #f6f8fa; stroke: #818b98; }
