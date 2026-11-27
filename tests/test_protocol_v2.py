@@ -90,6 +90,66 @@ class ProtocolV2Tests(unittest.TestCase):
         (worktree / "retained.txt").write_text("retained work", encoding="utf-8")
         return worktree
 
+    def test_observer_fails_aged_idle_no_turn_and_stops_heartbeating(self):
+        self._seed_idle_no_turn_with_worktree()
+        events = []
+        with patch(
+            "t3_fleet.agent.report_event",
+            side_effect=lambda event: events.append(event) or "delivered",
+        ):
+            self.agent.handle({"action": "observe"})
+            self.agent._now = lambda: "2026-07-28T01:05:00Z"
+            result = self.agent.handle({"action": "observe"})
+            self.agent._now = lambda: "2026-07-28T01:10:00Z"
+            later = self.agent.handle({"action": "observe"})
+
+        self.assertEqual(result["results"][0]["state"], "failed")
+        store = self.agent._target_store()
+        receipt = store.lookup("req-12345678")
+        if receipt is None:
+            self.fail("observer removed the target receipt")
+        self.assertEqual(receipt.state, "failed")
+        self.assertEqual(store.active_count(), 0)
+        self.assertEqual(later["examined"], 0)
+        self.assertEqual(
+            [event["state"] for event in events],
+            ["external.unknown", "external.failed"],
+        )
+
+    def test_observer_preserves_young_idle_no_turn(self):
+        self._seed_idle_no_turn_with_worktree()
+        self.agent._now = lambda: "2026-07-28T01:00:29Z"
+
+        with patch("t3_fleet.agent.report_event", return_value="delivered"):
+            result = self.agent.handle({"action": "observe"})
+
+        self.assertEqual(result["results"][0]["state"], "unknown")
+        self.assertEqual(self.agent._target_store().active_count(), 1)
+
+    def test_observer_respects_launch_deadline_and_request_lock(self):
+        self._seed_idle_no_turn_with_worktree()
+        store = self.agent._target_store()
+        request_id = "req-12345678"
+        with patch.object(store, "_now", return_value="2026-07-28T01:05:00Z"):
+            store.reconcile(
+                request_id, state="unknown", thread_id="thread-1", dispatch_finished=True
+            )
+
+        with patch("t3_fleet.agent.report_event", return_value="delivered"):
+            self.agent._now = lambda: "2026-07-28T01:05:29Z"
+            result = self.agent.handle({"action": "observe"})
+            self.assertEqual(result["results"][0]["state"], "unknown")
+            self.assertEqual(store.active_count(), 1)
+
+            self.agent._now = lambda: "2026-07-28T01:05:30Z"
+            with self.agent._request_lock(request_id):
+                result = self.agent.handle({"action": "observe"})
+            self.assertEqual(result["results"][0]["reporting"], "busy")
+            self.assertEqual(store.active_count(), 1)
+
+            result = self.agent.handle({"action": "observe"})
+            self.assertEqual(result["results"][0]["state"], "failed")
+
     def test_reconcile_old_idle_no_turn_fails_without_touching_worktree(self):
         worktree = self._seed_idle_no_turn_with_worktree()
         self.agent._now = lambda: "2026-07-29T01:00:00Z"

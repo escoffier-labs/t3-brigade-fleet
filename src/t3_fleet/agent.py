@@ -826,12 +826,15 @@ class T3Agent:
                    for key in ("nodes", "subagents") for node in detail.get(key, []))
         )
 
-    @staticmethod
-    def _explicit_no_turn_observation(result: dict[str, Any]) -> bool:
-        return bool(result.get("_explicit_no_turn") or (
-            result.get("run_status") == "idle"
-            and result.get("latest_run_id") is None and result.get("active_run_id") is None
-        ))
+    def _confirmed_no_turn(self, thread_id: str, result: dict[str, Any]) -> bool:
+        return (
+            bool(result.get("_explicit_no_turn") or (
+                result.get("run_status") == "idle"
+                and result.get("latest_run_id") is None
+                and result.get("active_run_id") is None
+            ))
+            and self._thread_has_no_turn(thread_id)
+        )
 
     def _thread_has_no_turn(self, thread_id: str) -> bool:
         detail = self._thread_detail(self.t3.thread_snapshot(thread_id))
@@ -2862,8 +2865,7 @@ class T3Agent:
                     and self._age_seconds(receipt.created_at, self._now()) >= _STALE_NO_TURN_SECONDS
                 )
             )
-            and self._explicit_no_turn_observation(result)
-            and self._thread_has_no_turn(receipt.thread_id)
+            and self._confirmed_no_turn(receipt.thread_id, result)
         ):
             result["state"] = "failed"
         try:
@@ -3820,6 +3822,23 @@ class T3Agent:
                         if receipt.thread_id
                         else {"state": "unknown"}
                     )
+                    lifecycle = receipt.lifecycle or {}
+                    launch_deadline = lifecycle.get("launch_deadline")
+                    if (
+                        result["state"] == "unknown"
+                        and receipt.thread_id
+                        and not lifecycle.get("reserved_followup")
+                        and not lifecycle.get("waiting_for_previous_turn")
+                        and self._age_seconds(receipt.created_at, observed_at)
+                        >= _MISSING_THREAD_GRACE_SECONDS
+                        and (
+                            not launch_deadline
+                            or datetime.fromisoformat(observed_at)
+                            >= datetime.fromisoformat(launch_deadline)
+                        )
+                        and self._confirmed_no_turn(receipt.thread_id, result)
+                    ):
+                        result["state"] = "failed"
                     state, turn_ref = self._fenced_observation(
                         receipt, result, allow_launch_recovery=True
                     )
@@ -4068,8 +4087,7 @@ class T3Agent:
                 )
             if (
                 receipt is not None and result["state"] == "unknown"
-                and self._explicit_no_turn_observation(result)
-                and self._thread_has_no_turn(thread_id)
+                and self._confirmed_no_turn(thread_id, result)
             ):
                 request_id = receipt.get("request_id")
                 no_worktree = (

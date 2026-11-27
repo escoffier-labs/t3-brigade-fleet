@@ -155,7 +155,7 @@ class ConfigTests(unittest.TestCase):
             load_config(self.write_config(text))
 
     def test_rejects_ip_literal_ssh_alias(self) -> None:
-        text = VALID.replace('ssh_alias = "linux-worker"', 'ssh_alias = "100.64.0.9"')
+        text = VALID.replace('ssh_alias = "linux-worker"', 'ssh_alias = "192.0.2.9"')
         with self.assertRaisesRegex(ConfigError, "IP literals"):
             load_config(self.write_config(text))
 
