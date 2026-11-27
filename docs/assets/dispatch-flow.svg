@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 452" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="452" viewBox="0 0 560 452" role="img" aria-labelledby="title desc">
   <title id="title">T3 Brigade Fleet request flow</title>
   <desc id="desc">The dispatch skill guides the controller. A local process or SSH carries requests and results to and from the target agent. The agent calls local T3 Code and observes or reconciles target receipts.</desc>
   <style>
@@ -36,7 +36,7 @@
   <text class="note" x="280" y="140" text-anchor="middle">Checks policy and capacity</text>
 
   <rect class="target" x="17" y="212" width="526" height="226" rx="8"/>
-  <text class="note" x="33" y="239">Allowlisted target</text>
+  <text class="note" x="518" y="239" text-anchor="end">Allowlisted target</text>
   <rect class="node" x="43" y="251" width="229" height="66" rx="8"/>
   <text class="label" x="157" y="278" text-anchor="middle">t3-fleet-agent</text>
   <text class="note" x="157" y="303" text-anchor="middle">Dispatch and recovery</text>

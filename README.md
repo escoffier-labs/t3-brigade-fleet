@@ -13,11 +13,10 @@ dependencies. For evaluation, install from the public repository:
 pipx install git+https://github.com/escoffier-labs/t3-brigade-fleet.git
 ```
 
-| Command | Role |
-| --- | --- |
-| `t3-fleet` | Controller CLI for dispatch, status, and recovery |
-| `t3-fleet-agent` | Target agent that talks to its local T3 Code server |
-| `t3-lane` | [Local lane client](docs/lane-client.md) for inspecting and operating a T3 Code thread |
+- `t3-fleet` is the controller CLI for dispatch, status, and recovery.
+- `t3-fleet-agent` talks to T3 Code on the target.
+- `t3-lane` is the [local lane client](docs/lane-client.md) for inspecting and
+  operating a T3 Code thread.
 
 For deployment, use a reviewed commit and an operator-owned pin. The
 [pinned runtime builder](scripts/build-public-runtime.py) builds and verifies a
