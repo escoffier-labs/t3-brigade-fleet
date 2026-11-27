@@ -826,12 +826,48 @@ class T3Agent:
                    for key in ("nodes", "subagents") for node in detail.get(key, []))
         )
 
-    @staticmethod
-    def _explicit_no_turn_observation(result: dict[str, Any]) -> bool:
-        return bool(result.get("_explicit_no_turn") or (
-            result.get("run_status") == "idle"
-            and result.get("latest_run_id") is None and result.get("active_run_id") is None
-        ))
+    def _confirmed_no_turn(self, thread_id: str, result: dict[str, Any]) -> bool:
+        return (
+            bool(result.get("_explicit_no_turn") or (
+                result.get("run_status") == "idle"
+                and result.get("latest_run_id") is None
+                and result.get("active_run_id") is None
+            ))
+            and self._thread_has_no_turn(thread_id)
+        )
+
+    def _abandoned_no_turn(
+        self, receipt: TargetReceipt, result: dict[str, Any], observed_at: str,
+        *, minimum_age: float = 0,
+    ) -> bool:
+        """Use the same lease-release evidence for both locked reconciliation paths."""
+        thread_id = receipt.thread_id
+        lifecycle = receipt.lifecycle or {}
+        if (
+            result["state"] != "unknown" or not thread_id
+            or lifecycle.get("reserved_followup") or lifecycle.get("waiting_for_previous_turn")
+        ):
+            return False
+        try:
+            age = self._age_seconds(receipt.created_at, observed_at)
+            if age < minimum_age:
+                return False
+            deadline = lifecycle.get("launch_deadline") if lifecycle.get("launching") else None
+            if deadline and (
+                datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+                < datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+            ):
+                return False
+        except (TypeError, ValueError, ValidationError):
+            return False
+        stale = age >= _STALE_NO_TURN_SECONDS
+        if lifecycle.get("launching") and not lifecycle.get("dispatch_finished") and not stale:
+            return False
+        missing_worktree = not Path(self._worktree_path(receipt.request_id)).exists()
+        return (
+            (missing_worktree or (stale and result.get("run_status") == "idle"))
+            and self._confirmed_no_turn(thread_id, result)
+        )
 
     def _thread_has_no_turn(self, thread_id: str) -> bool:
         detail = self._thread_detail(self.t3.thread_snapshot(thread_id))
@@ -2853,23 +2889,12 @@ class T3Agent:
                 raise
             age = self._age_seconds(receipt.created_at, self._now())
             result = {"state": "failed" if age >= _MISSING_THREAD_GRACE_SECONDS else "unknown"}
-        if (
-            result["state"] == "unknown"
-            and (
-                not Path(self._worktree_path(request_id)).exists()
-                or (
-                    result.get("run_status") == "idle"
-                    and self._age_seconds(receipt.created_at, self._now()) >= _STALE_NO_TURN_SECONDS
-                )
-            )
-            and self._explicit_no_turn_observation(result)
-            and self._thread_has_no_turn(receipt.thread_id)
-        ):
-            result["state"] = "failed"
         try:
             # Only the mutating reconciler and observer recover crashed launch
             # epochs. A live dispatcher holds this lock until confirmation.
             with self._request_lock(request_id, timeout=0):
+                if self._abandoned_no_turn(receipt, result, self._now()):
+                    result["state"] = "failed"
                 state, turn_ref = self._fenced_observation(
                     receipt, result, allow_launch_recovery=True
                 )
@@ -3820,6 +3845,10 @@ class T3Agent:
                         if receipt.thread_id
                         else {"state": "unknown"}
                     )
+                    if self._abandoned_no_turn(
+                        receipt, result, observed_at, minimum_age=_MISSING_THREAD_GRACE_SECONDS
+                    ):
+                        result["state"] = "failed"
                     state, turn_ref = self._fenced_observation(
                         receipt, result, allow_launch_recovery=True
                     )
@@ -4068,8 +4097,7 @@ class T3Agent:
                 )
             if (
                 receipt is not None and result["state"] == "unknown"
-                and self._explicit_no_turn_observation(result)
-                and self._thread_has_no_turn(thread_id)
+                and self._confirmed_no_turn(thread_id, result)
             ):
                 request_id = receipt.get("request_id")
                 no_worktree = (
