@@ -1,5 +1,9 @@
 # Attached app operations
 
+Before using tool names below, read [tool compatibility](tool-compatibility.md).
+T3 v0.1.3 consolidates several tools. Use the attached catalog and the matching
+argument schema. Earlier names in this reference apply only to older catalogs.
+
 ## Projects, configuration, and environment
 
 Start with `t3_project_list` and `t3_project_read` to identify the registered
@@ -9,10 +13,20 @@ thread, queue, question, and scheduler operations accept explicit scope. See
 the live schema for pagination. Project/preview pages can shift with the
 current snapshot.
 
-`t3_thread_configuration` reads a scoped thread's selection/modes.
-`t3_thread_configure` changes only the calling thread's provider/model/options,
-using the live catalog. It does not change permission modes or other threads.
+On builds that consolidate thread configuration, omit `modelSelection` to
+read or supply it to set the provider, model, and options using the live catalog.
+Supply `threadId` to select the target when the server accepts it. Otherwise
+the calling thread is the target. Permission modes stay unchanged. On older
+builds, use `t3_thread_configuration` for scoped reads and check the write
+scope in the live configuration tool schema.
 `t3_project_update` changes project settings and preserves omitted fields.
+On T3 0.1.6, project updates can advertise `pinned` and `archived`. Use
+`archived: true` to hide a finished project from pickers while preserving its
+threads and files, and `archived: false` to restore it. `pinned` controls its
+position in project pickers. Check the selected server's live schema first.
+Older servers can drop these fields. Verify the returned `archivedAt` or
+`pinnedAt` state. Do not substitute `t3_project_delete` for archival.
+
 Project create/update/delete/clone and environment writes are operator actions.
 `t3_environment_read` reports server identity/preferences, while
 `t3_environment_preferences_update` writes environment-wide settings and
@@ -64,6 +78,12 @@ read more within its live result limit, but JavaScript may mutate page state.
 Apply the task's authorization to navigation, clicks, uploads, evaluation, and
 form submission. Do not infer that a form is authorized from a visible button.
 
+Nightly 20261110.4465 supports top-level `await` in `preview_evaluate`
+([upstream change](https://github.com/pingdotgg/t3code/pull/31925)).
+On older builds, wrap asynchronous evaluation in an async function and invoke
+it. Evaluation can still change page state. Await support grants no additional
+authorization.
+
 For a screenshot artifact use `preview_snapshot` with `save: true` and retain
 `screenshotPath`. Embed it as `![description](<returned-screenshot-path>)` in a
 reply when useful. An image-only tool result is not a saved artifact.
@@ -77,6 +97,14 @@ transfer succeeds. Close the thread-owned tab with `t3_preview_close` when appro
 
 `html_preview` and `html_render` render agent HTML in a thread. Use the live
 schema for their inputs and outputs. They require a T3 thread.
+
+On nightly 20261108.4367 and newer, both tools accept an absolute `.html`
+file path in `path` as an alternative to inline `html`. Pass exactly one.
+Use inline `html` in supervised threads. When the active permissions allow
+local file input, pass the path to `html_preview`, inspect the result, and
+pass the same path to `html_render`. Keep the file unchanged between
+preview and render. Older servers may also require inline HTML.
+See [the upstream change](https://github.com/pingdotgg/t3code/pull/32833).
 
 ## Attachments: upload, then send
 

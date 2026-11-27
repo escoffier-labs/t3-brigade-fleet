@@ -1,5 +1,9 @@
 # Attached T3 orchestration and readiness
 
+Before using tool names below, read [tool compatibility](tool-compatibility.md).
+T3 v0.1.3 consolidates several tools. Use the attached catalog and the matching
+argument schema. Earlier names in this reference apply only to older catalogs.
+
 ## Discover and choose a route
 
 Call `orchestrator_capabilities` for the live provider instances, models,
@@ -34,7 +38,10 @@ If neither route is exposed, report the blocker. Do not guess flags, private
 endpoints, or credentials. This documented shape is not live execution proof.
 
 Prefer native subagents for same-provider work only when the native tool
-supports the selected live model. Use native handles and lifecycle tools.
+supports the selected live model and the child runs synchronously. Keep Claude
+`Agent` calls at `run_in_background: false`. Background agents use
+`delegate_task`, including same-provider models. Use native handles and
+lifecycle tools only for native children.
 Choose `delegate_task` for a selected model native tools cannot run, a
 cross-provider child, or explicitly T3-owned children. `create_threads` and
 `t3_thread_launch` create ordinary top-level conversations, not child tasks.
@@ -80,6 +87,13 @@ Each review round needs a new `delegate_task` with the original brief, prior
 findings, responses, and unresolved objections. Give each round a distinct
 `clientRequestId`, stable across retries of that round, and retain its `taskId`.
 Sending to `childThreadId` with `t3_thread_send` does not reopen a completed task.
+
+From nightly 20261111.4515, a delegated follow-up remains pending while its
+child runs a continuation it queued on its own thread. Read the final task
+result rather than treating the turn that queued that continuation as the
+completed follow-up. Removed or held continuations are skipped when an earlier
+run started. A pending continuation does not hide a run still executing. See
+the [upstream change](https://github.com/pingdotgg/t3code/pull/32504).
 
 Read `task_status` mid-turn when its result is needed. Interpret the whole
 result rather than `status` alone:
@@ -139,8 +153,12 @@ new, or top-level threads or sessions. Independent work or a PR stack alone
 does not authorize a new conversation. Once a separate session is authorized,
 choose its worktree for independent implementation or a PR stack. Use
 `t3_thread_launch` for one thread and bind its workspace before the agent starts.
-The task goes in `message`. Omitted project/model/modes inherit, but omitted
-`workspaceStrategy` selects the project root, not the caller's worktree.
+The task goes in `message`. Omitted project/model/modes inherit. For callers
+outside a T3 thread, T3 0.1.11 nightlies from 20261117.4851 follow the project's
+effective worktree default when `workspaceStrategy` is omitted. This change
+does not alter in-thread launches or replays. Pass an explicit strategy when
+the task needs a specific checkout, base, or project root. Earlier builds can
+select the project root when the strategy is omitted.
 The new thread's runtime and interaction
 modes are capped at the caller's. A caller outside a T3 thread must pass
 `projectId` or top-level `scratch: true`. `scratch` cannot be combined with
@@ -166,8 +184,13 @@ Do not ask a launched agent to create its own worktree through shell commands.
 and checkout. Each entry may override catalog-backed selection/modes, but there
 is no per-thread workspace override. Use its stable `clientRequestId` on retry.
 Retain each returned `threadId` and `runId`. A launch may still be preparing.
-`t3_thread_launch` has no retry key: inspect `t3_thread_list` after an error or
-lost response before retrying, rather than creating duplicate work.
+On builds that advertise `t3_thread_launch.clientRequestId`, use one stable key
+for a logical launch and reuse it after an error or lost response. The keyed
+retry returns the accepted thread. A new launch needs a new key. This is included
+in nightly 20261027.3796 ([upstream change](https://github.com/pingdotgg/t3code/pull/16654)).
+Older catalogs have no launch key: inspect `t3_thread_list` after an error or
+lost response before retrying. Omitting the key on newer builds also creates
+a new launch, so it does not protect a retry from duplicate work.
 
 `t3_worktree_handoff` moves the current thread into a new worktree. Check its
 binding first. It detaches the live provider session and ends the current turn,
@@ -197,9 +220,12 @@ is bookkeeping and grants no authority to open, publish, push, or merge it.
 Use `watch_pull_request` instead of watcher agents. Unsettle the thread before
 starting a new watch. T3 checks every two minutes and wakes the thread on a
 failed check, required checks passing, another
-person's comment or review, or a merge conflict. Only comments after the watch
+person's comment or review, or a merge conflict. T3 0.1.11 nightlies from
+20261119.4928 also wake the agent when a watched PR merges. Verify the merged
+state and commit before reporting completion. Only comments after the watch
 call wake it. Handle existing comments first, then end your turn. A wake is
-news, not a merge decision. The thread stays Working while watched.
+news, not a merge decision. A wake leaves the PR linked and watched. End the
+turn again when only waiting for the next event.
 Call `unwatch_pull_request` before handing back. A subagent
 cannot watch. Watches also end on merge/close, settle/archive, eight consecutive
 read failures, user Stop, or `task_cancel`.
@@ -208,14 +234,28 @@ read failures, user Stop, or `task_cancel`.
 
 Source: from v0.1.0 tool access declarations. The OAuth flow was not exercised.
 
-Use the environment's `/mcp` URL from Settings, Connections, Copy MCP URL and
-sign in with OAuth. Approval uses a pairing code (`t3 auth pairing create` on
+Use the environment's `/mcp` URL and sign in with OAuth. In v0.1.4, access
+management and T3 Connect are under Settings, Sharing & access. Older builds
+use Connections ([upstream change](https://github.com/pingdotgg/t3code/pull/26571)).
+On builds that advertise linked environments, look under Settings, Environments.
+On older builds, approval uses a pairing code (`t3 auth pairing create` on
 the host) or a browser session with `access:write`. Read only is the default
 MCP ceiling.
-Supervised through Full access permits writes within the approved ceiling.
-Sign-in lasts 30 days and can be revoked under Settings, Connections. Hosted
+Write-capable modes permit actions within the approved ceiling.
+Sign-in lasts 30 days and can be revoked on the access-management page. Hosted
 clients need a reachable T3 Connect address. A Tailscale address works only
 inside the tailnet. Clients without OAuth support cannot connect.
+
+Nightly 20261110.4465 adds hosted consent for outside-agent sign-in on a
+linked environment's T3 Connect tunnel address. With `mcpHostedApproval`,
+the setup flow opens the hosted consent page and the user chooses the access
+level there, without copying a sign-in code. Nightly builds use
+`nightly.app.t3.codes` and stable builds use `app.t3.codes` unless configured
+otherwise. Older servers, peer-link sign-ins, and other origins retain the
+environment approval page. Follow the actual page and advertised capability
+instead of requiring a pairing code for every connection. This changes the
+sign-in path, not task authorization or the granted access ceiling.
+See [the upstream change](https://github.com/pingdotgg/t3code/pull/33632).
 
 On nightly 20261017.3238, new standard pairing grants also include
 `access:read`, `access:write`, and `relay:write`
@@ -229,6 +269,8 @@ These environment scopes are separate from the outside client's MCP ceiling.
 | Reads | `orchestrator_capabilities`, `t3_thread_list`, `t3_thread_read`, `t3_thread_search`, `t3_thread_wait`, `t3_queue_list`, `t3_queue_read`, `t3_pending_request_list`, `t3_pending_request_read`, `t3_thread_configuration`, `t3_thread_transfers`, `t3_project_list`, `t3_project_read`, `t3_worktree_list`, `t3_environment_read`, `list_scheduled_tasks`, `list_thread_pull_requests` |
 | Writes within the client's ceiling | `t3_thread_launch`, `t3_thread_send`, `t3_thread_interrupt`, `t3_thread_update`, `t3_thread_fork`, `t3_thread_merge_back`, `t3_queue_edit`, `t3_queue_cancel`, `t3_queue_reorder`, `t3_queue_promote_to_steer`, `t3_pending_request_respond`, `link_pull_request`, `unlink_pull_request`, `watch_pull_request`, `unwatch_pull_request`, `schedule_task`, `update_scheduled_task`, `delete_scheduled_task`, attachment upload tools |
 | Unavailable without a live T3 thread | `delegate_task`, `task_status`, `task_cancel`, `create_threads`, `request_secret`, `preview_*`, `device_*`, `t3_worktree_handoff`, `t3_worktree_status`, `html_*` |
+
+On consolidated builds, use the [action and access matrix](tool-compatibility.md#access-by-action).
 
 Delegation also requires an active parent run owned by the credential's provider
 session. Outside clients use `t3_thread_launch` with explicit `projectId` or
@@ -249,8 +291,10 @@ See [supervision.md](supervision.md) for webhook placeholders and delivery age.
 
 ## Scoped readiness and compatibility
 
-These tools act on the attached environment. Cross-host work uses the local
-`t3-fleet` client and [contract.md](contract.md). Native handles, app `taskId`,
+Without an explicit remote target, these tools act on the attached environment.
+For this fleet, cross-host work still uses the configured local `t3-fleet` client
+and [contract.md](contract.md). The upstream linked-environment capability below
+does not replace that route or its admission checks. Native handles, app `taskId`,
 thread/run pairs, qualified fleet request IDs, and Brigade delegation IDs are
 separate identities. Adopt a parent's Brigade receipt with
 `submit --delegation-id` rather than allocating a second decision/reservation.
@@ -274,3 +318,68 @@ selected seat/model from the Hub or live catalog, execution handle, and fresh
 terminal evidence. Use the correct lifecycle surface and inspect the result.
 Independently passed remote canaries do not prove new app operations in this
 skill. Use `approval-required` for fleet canaries and do not widen app modes.
+
+## Linked-environment contracts on newer builds
+
+Nightly 20261027.3796 adds linked environments as a Labs beta. Discover support
+and the target environment's capabilities before constructing calls. This
+section describes upstream contracts, not authorization to pair or use a host.
+
+- Many thread, project, queue, schedule, and PR tools accept `environmentId`.
+  Caller-bound preview, device, secret, and HTML tools do not forward this way.
+- `delegate_task` uses `target.environmentId` and optional `target.projectId`.
+  If the project is omitted, the target must have exactly one matching repository.
+  Retain the local `taskId` for `task_status` and `task_cancel`. A remote task has
+  `childThreadId: null` and `remoteChild: {environmentId, threadId, label}`.
+  Use those remote identifiers when an authorized operation needs the child
+  thread. Do not pass a null child ID to local question or thread tools.
+- `t3_thread_wait` can advertise `untilDelegatedWorkSettled: true`. Its
+  `resultRun` then identifies the final result run after delegated and background
+  work settles. A turn ending alone does not prove the whole task is finished.
+- Linked calls stay within the caller's modes and the link's access ceiling.
+  OAuth clients can use `T3-Mode-Limit` to narrow their ceiling.
+  A restricted link fences writes to that link's own threads,
+  restricts environment changes and schedules, and skips project setup scripts.
+  An unrestricted link lacks those fences. Verify operating-system isolation
+  and local setup separately before launching remote work.
+- `t3_environment_link` returns a pending approval card immediately. The user
+  picks the machine and access, and the outcome arrives as a thread message.
+  Do not guess addresses, collect pairing secrets in chat, or treat `pending`
+  as approval. A new link remains a separate authorization boundary.
+
+Sources: [remote delegation](https://github.com/pingdotgg/t3code/pull/16719),
+[forwarding](https://github.com/pingdotgg/t3code/pull/16684),
+[link access](https://github.com/pingdotgg/t3code/pull/16695), and
+[link approval cards](https://github.com/pingdotgg/t3code/pull/17129).
+
+## Runtime changes in T3 0.1.11
+
+On nightly 20261120.4979 and stable 0.1.11, delegated results can reach a
+running Claude turn before it ends. Read the delivered result and retain its
+`taskId`. An active parent turn alone is no reason to query the child again.
+
+Linked environments renew as they are used on nightly 20261120.4969 and
+stable 0.1.11. Check the live link state before requesting a new pairing.
+This renewal applies to environment links. Verify an outside OAuth client's
+own sign-in and access ceiling separately.
+
+Sources: [result delivery](https://github.com/pingdotgg/t3code/releases/tag/v0.1.11-nightly.20261120.4979)
+and [link renewal](https://github.com/pingdotgg/t3code/releases/tag/v0.1.11-nightly.20261120.4969).
+
+## Runtime changes in T3 0.1.12 nightlies
+
+Nightly 20261121.5038 can link a machine through an environment that already
+links to it. Inspect the live linked-environment discovery before requesting
+a new address or pairing code. Keep the returned environment identity when
+selecting the target.
+
+Linked thread reads now default to the newest message page. Follow the
+returned pagination for earlier messages when the task needs its history.
+A recent page alone cannot establish that a review or finding is absent.
+
+Projects can contain several repositories on this nightly. Read the selected
+project and repository scope before starting work, and verify the actual
+checkout used by the child. A project identity alone does not identify its
+repository or worktree.
+
+Source: [nightly 20261121.5038](https://github.com/pingdotgg/t3code/releases/tag/v0.1.12-nightly.20261121.5038).
