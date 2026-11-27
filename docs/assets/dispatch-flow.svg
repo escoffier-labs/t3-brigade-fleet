@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 452" role="img" aria-labelledby="title desc">
+  <title id="title">T3 Brigade Fleet request flow</title>
+  <desc id="desc">The dispatch skill guides the controller. A local process or SSH carries requests and results to and from the target agent. The agent calls local T3 Code and observes or reconciles target receipts.</desc>
+  <style>
+    svg { color-scheme: light dark; }
+    .surface { fill: #f6f8fa; stroke: #818b98; }
+    .target { fill: #f6f8fa; stroke: #818b98; }
+    .node { fill: #fdfefe; stroke: #818b98; }
+    .entry { fill: #ddf4ff; stroke: #0969da; }
+    .label { fill: #1f2328; font: 600 22px system-ui, sans-serif; }
+    .note { fill: #424a53; font: 19px system-ui, sans-serif; }
+    .route { fill: none; stroke: #0969da; stroke-width: 2; }
+    .arrow { fill: #0969da; }
+    @media (prefers-color-scheme: dark) {
+      .surface, .target { fill: #161b22; stroke: #768390; }
+      .node { fill: #0d1117; stroke: #768390; }
+      .entry { fill: #102846; stroke: #58a6ff; }
+      .label { fill: #f0f6fc; }
+      .note { fill: #c2ccd6; }
+      .route { stroke: #58a6ff; }
+      .arrow { fill: #58a6ff; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path class="arrow" d="M0 0L10 5L0 10Z"/>
+    </marker>
+  </defs>
+  <rect class="surface" x="117" y="9" width="326" height="47" rx="8"/>
+  <text class="label" x="280" y="40" text-anchor="middle">Shared dispatch skill</text>
+  <path class="route" d="M280 56V87" stroke-dasharray="4 4" marker-end="url(#arrow)"/>
+  <text class="note" x="298" y="79">Guides CLI use</text>
+
+  <rect class="entry" x="117" y="88" width="326" height="66" rx="8"/>
+  <text class="label" x="280" y="115" text-anchor="middle">t3-fleet controller</text>
+  <text class="note" x="280" y="140" text-anchor="middle">Checks policy and capacity</text>
+
+  <rect class="target" x="17" y="212" width="526" height="226" rx="8"/>
+  <text class="note" x="33" y="239">Allowlisted target</text>
+  <rect class="node" x="43" y="251" width="229" height="66" rx="8"/>
+  <text class="label" x="157" y="278" text-anchor="middle">t3-fleet-agent</text>
+  <text class="note" x="157" y="303" text-anchor="middle">Dispatch and recovery</text>
+  <rect class="node" x="344" y="251" width="174" height="66" rx="8"/>
+  <text class="label" x="431" y="278" text-anchor="middle">Local T3 Code</text>
+  <text class="note" x="431" y="303" text-anchor="middle">Runs the session</text>
+  <path class="route" d="M272 284H344" marker-end="url(#arrow)"/>
+  <path class="route" d="M280 155V181H157V250" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <text class="note" x="298" y="187">Local process or SSH</text>
+
+  <path class="route" d="M157 317V366" marker-end="url(#arrow)"/>
+  <text class="note" x="176" y="348">Observe or reconcile</text>
+  <rect class="node" x="43" y="366" width="229" height="56" rx="8"/>
+  <text class="label" x="157" y="400" text-anchor="middle">Target receipt</text>
+</svg>
