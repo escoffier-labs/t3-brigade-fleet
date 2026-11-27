@@ -91,16 +91,16 @@ class ProtocolV2Tests(unittest.TestCase):
         return worktree
 
     def test_observer_fails_aged_idle_no_turn_and_stops_heartbeating(self):
-        self._seed_idle_no_turn_with_worktree()
+        worktree = self._seed_idle_no_turn_with_worktree()
         events = []
         with patch(
             "t3_fleet.agent.report_event",
             side_effect=lambda event: events.append(event) or "delivered",
         ):
             self.agent.handle({"action": "observe"})
-            self.agent._now = lambda: "2026-07-28T01:05:00Z"
+            self.agent._now = lambda: "2026-07-29T01:00:00Z"
             result = self.agent.handle({"action": "observe"})
-            self.agent._now = lambda: "2026-07-28T01:10:00Z"
+            self.agent._now = lambda: "2026-07-29T01:05:00Z"
             later = self.agent.handle({"action": "observe"})
 
         self.assertEqual(result["results"][0]["state"], "failed")
@@ -111,28 +111,35 @@ class ProtocolV2Tests(unittest.TestCase):
         self.assertEqual(receipt.state, "failed")
         self.assertEqual(store.active_count(), 0)
         self.assertEqual(later["examined"], 0)
+        self.assertEqual((worktree / "retained.txt").read_text(encoding="utf-8"), "retained work")
         self.assertEqual(
             [event["state"] for event in events],
             ["external.unknown", "external.failed"],
         )
 
-    def test_observer_preserves_young_idle_no_turn(self):
+    def test_observe_and_reconcile_preserve_recent_idle_worktree(self):
         self._seed_idle_no_turn_with_worktree()
-        self.agent._now = lambda: "2026-07-28T01:00:29Z"
+        self.agent._now = lambda: "2026-07-28T01:05:00Z"
 
         with patch("t3_fleet.agent.report_event", return_value="delivered"):
             result = self.agent.handle({"action": "observe"})
 
         self.assertEqual(result["results"][0]["state"], "unknown")
+        reconciled = self.agent.handle({"action": "reconcile", "request_id": "req-12345678"})
+        self.assertEqual(reconciled["state"], "unknown")
         self.assertEqual(self.agent._target_store().active_count(), 1)
 
     def test_observer_respects_launch_deadline_and_request_lock(self):
-        self._seed_idle_no_turn_with_worktree()
+        worktree = self._seed_idle_no_turn_with_worktree()
+        (worktree / "retained.txt").unlink()
+        worktree.rmdir()
         store = self.agent._target_store()
         request_id = "req-12345678"
         with patch.object(store, "_now", return_value="2026-07-28T01:05:00Z"):
+            store.begin_turn(request_id)
             store.reconcile(
-                request_id, state="unknown", thread_id="thread-1", dispatch_finished=True
+                request_id, state="unknown", thread_id="thread-1",
+                launch_grace_started_at=store._now(), dispatch_finished=True,
             )
 
         with patch("t3_fleet.agent.report_event", return_value="delivered"):
@@ -149,6 +156,29 @@ class ProtocolV2Tests(unittest.TestCase):
 
             result = self.agent.handle({"action": "observe"})
             self.assertEqual(result["results"][0]["state"], "failed")
+
+    def test_observe_and_reconcile_preserve_unacknowledged_launch(self):
+        worktree = self._seed_idle_no_turn_with_worktree()
+        (worktree / "retained.txt").unlink()
+        worktree.rmdir()
+        request_id = "req-12345678"
+        store = self.agent._target_store()
+        with patch.object(store, "_now", return_value="2026-07-28T01:00:00Z"):
+            store.begin_turn(request_id)
+            receipt = store.reconcile(
+                request_id, state="unknown", thread_id="thread-1",
+                launch_grace_started_at=store._now(),
+            )
+        self.assertTrue(receipt.lifecycle["launching"])
+        self.assertFalse(receipt.lifecycle["dispatch_finished"])
+        self.assertFalse(receipt.lifecycle["waiting_for_previous_turn"])
+        self.agent._now = lambda: "2026-07-28T01:05:00Z"
+        with patch("t3_fleet.agent.report_event", return_value="delivered"):
+            observed = self.agent.handle({"action": "observe"})
+            reconciled = self.agent.handle({"action": "reconcile", "request_id": request_id})
+        self.assertEqual(observed["results"][0]["state"], "unknown")
+        self.assertEqual(reconciled["state"], "unknown")
+        self.assertEqual(store.active_count(), 1)
 
     def test_reconcile_old_idle_no_turn_fails_without_touching_worktree(self):
         worktree = self._seed_idle_no_turn_with_worktree()

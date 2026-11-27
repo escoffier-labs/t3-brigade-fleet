@@ -8,6 +8,10 @@ This project is pre-1.0. Before 1.0, minor versions may include breaking changes
 
 ### Fixed
 
+- Settle abandoned zero-turn dispatches during automatic observation using the
+  same evidence as manual reconciliation. A recent retained worktree or an
+  unacknowledged launch can keep the reservation active while the outcome is
+  uncertain.
 - Raise the `/api/orchestration/shell` response cap from 16 MiB to 64 MiB.
   The shell snapshot grows with thread history, and a host with ~6,700
   threads returned 19 MB. `doctor` then reported the host `blocked_offline`,
