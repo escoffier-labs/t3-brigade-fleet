@@ -42,6 +42,185 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Copy setup-python runtime into protected job fixture
+        run: |
+          python - <<'PY'
+          import ast, importlib.util, json, os, platform, shutil, stat, subprocess, sys, sysconfig, tempfile
+          from pathlib import Path
+
+          def refuse(category, path, evidence):
+              raise SystemExit(f"toolchain fixture refused: {category}: {path}: {evidence}")
+
+          cache_value = os.environ.get("RUNNER_TOOL_CACHE")
+          if os.environ.get("GITHUB_ACTIONS") != "true" or not cache_value:
+              refuse("environment", "GitHub Actions", "missing runner context")
+          uid = os.geteuid()
+          cache, prefix, executable = Path(cache_value), Path(sys.base_prefix), Path(sys.executable)
+          architecture = {"amd64": "x64", "x86_64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine().lower())
+          try:
+              executable = executable.resolve(strict=True)
+              relative_prefix = prefix.relative_to(cache)
+              relative_executable = executable.relative_to(prefix)
+              valid_layout = (
+                  cache == cache.resolve(strict=True) and stat.S_ISDIR(cache.lstat().st_mode)
+                  and prefix == prefix.resolve(strict=True) and stat.S_ISDIR(prefix.lstat().st_mode)
+                  and Path(sys.prefix).resolve(strict=True) == prefix
+                  and relative_prefix.parts == ("Python", platform.python_version(), architecture)
+                  and executable.parent == prefix / "bin" and stat.S_ISREG(executable.lstat().st_mode)
+              )
+          except (OSError, RuntimeError, ValueError) as error:
+              refuse("layout", "toolchain", type(error).__name__)
+          if architecture is None or not valid_layout:
+              refuse("layout", prefix, "not the exact selected setup-python prefix")
+
+          tmp = Path("/tmp")
+          tmp_info = tmp.lstat()
+          if tmp.resolve(strict=True) != tmp or tmp_info.st_uid != 0 or not stat.S_ISDIR(tmp_info.st_mode) or not tmp_info.st_mode & stat.S_ISVTX:
+              refuse("temporary-root", tmp, "must be the canonical root-owned sticky directory")
+          fixture_root = Path(tempfile.mkdtemp(prefix="t3-fleet-python-", dir=tmp))
+          copy_prefix = fixture_root / "python"
+          succeeded = False
+
+          def cleanup():
+              info = fixture_root.lstat()
+              if fixture_root.parent != tmp or not fixture_root.name.startswith("t3-fleet-python-") or info.st_uid != uid or not stat.S_ISDIR(info.st_mode):
+                  refuse("cleanup", fixture_root, "refusing an unowned or unexpected path")
+              shutil.rmtree(fixture_root)
+
+          try:
+              shutil.copytree(prefix, copy_prefix, symlinks=False, copy_function=shutil.copy2)
+              objects = [copy_prefix]
+              for directory, names, files in os.walk(copy_prefix):
+                  objects.extend(Path(directory) / name for name in names + files)
+              for path in objects:
+                  info = path.lstat()
+                  kind = stat.S_IFMT(info.st_mode)
+                  if kind not in {stat.S_IFDIR, stat.S_IFREG} or info.st_uid != uid:
+                      refuse("copied-tree", path, "unexpected type or owner")
+                  if kind == stat.S_IFREG and info.st_nlink != 1:
+                      refuse("copied-tree", path, f"linked file nlink={info.st_nlink}")
+                  protected_mode = stat.S_IMODE(info.st_mode) & ~0o022
+                  os.chmod(path, protected_mode, follow_symlinks=False)
+                  if stat.S_IMODE(path.lstat().st_mode) != protected_mode:
+                      refuse("copied-tree", path, "mode verification failed")
+
+              data_name = sysconfig._get_sysconfigdata_name()
+              data_spec = importlib.util.find_spec(data_name)
+              data_origin = getattr(data_spec, "origin", None)
+              if not isinstance(data_name, str) or not data_origin:
+                  refuse("sysconfigdata", prefix, "selected data module is unavailable")
+              try:
+                  source_data_file = Path(data_origin).resolve(strict=True)
+                  data_relative = source_data_file.relative_to(prefix)
+                  copied_data_file = (copy_prefix / data_relative).resolve(strict=True)
+                  copied_data_file.relative_to(copy_prefix)
+              except (OSError, RuntimeError, ValueError) as error:
+                  refuse("sysconfigdata", data_origin, type(error).__name__)
+              if (source_data_file.name != f"{data_name}.py"
+                      or not stat.S_ISREG(source_data_file.lstat().st_mode)
+                      or not stat.S_ISREG(copied_data_file.lstat().st_mode)):
+                  refuse("sysconfigdata", source_data_file, "selected data module is not a source file")
+
+              def read_build_time_vars(path):
+                  try:
+                      tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                      statement, = tree.body
+                      if (not isinstance(statement, ast.Assign) or len(statement.targets) != 1
+                              or not isinstance(statement.targets[0], ast.Name)
+                              or statement.targets[0].id != "build_time_vars"):
+                          raise ValueError("unexpected module shape")
+                      values = ast.literal_eval(statement.value)
+                      if not isinstance(values, dict) or not all(isinstance(key, str) for key in values):
+                          raise ValueError("unexpected build_time_vars value")
+                      return values
+                  except (OSError, SyntaxError, TypeError, ValueError) as error:
+                      refuse("sysconfigdata", path, type(error).__name__)
+
+              source_dynload = prefix / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "lib-dynload"
+              copied_dynload = copy_prefix / source_dynload.relative_to(prefix)
+              try:
+                  source_dynload = source_dynload.resolve(strict=True)
+                  copied_dynload = copied_dynload.resolve(strict=True)
+              except (OSError, RuntimeError) as error:
+                  refuse("sysconfigdata", copied_dynload, type(error).__name__)
+              if not stat.S_ISDIR(source_dynload.lstat().st_mode) or not stat.S_ISDIR(copied_dynload.lstat().st_mode):
+                  refuse("sysconfigdata", copied_dynload, "lib-dynload is not a directory")
+
+              original_vars = read_build_time_vars(copied_data_file)
+              if original_vars.get("DESTSHARED") != str(source_dynload):
+                  refuse("sysconfigdata", copied_data_file, "unexpected original DESTSHARED")
+              updated_vars = dict(original_vars)
+              updated_vars["DESTSHARED"] = str(copied_dynload)
+              try:
+                  copied_data_file.write_text(
+                      "# system configuration generated and used by the sysconfig module\n"
+                      f"build_time_vars = {updated_vars!r}\n",
+                      encoding="utf-8",
+                  )
+              except OSError as error:
+                  refuse("sysconfigdata", copied_data_file, type(error).__name__)
+              written_vars = read_build_time_vars(copied_data_file)
+              if (set(written_vars) != set(original_vars)
+                      or written_vars.get("DESTSHARED") != str(copied_dynload)
+                      or any(written_vars[key] != value for key, value in original_vars.items()
+                             if key != "DESTSHARED")):
+                  refuse("sysconfigdata", copied_data_file, "rewrite changed unexpected build variables")
+              try:
+                  copied_cache = Path(importlib.util.cache_from_source(str(copied_data_file)))
+                  copied_cache.relative_to(copy_prefix)
+              except (NotImplementedError, ValueError) as error:
+                  refuse("sysconfigdata", copied_data_file, type(error).__name__)
+              if copied_cache.exists():
+                  cache_info = copied_cache.lstat()
+                  if (not stat.S_ISREG(cache_info.st_mode) or cache_info.st_uid != uid
+                          or cache_info.st_nlink != 1):
+                      refuse("sysconfigdata", copied_cache, "unexpected bytecode cache")
+                  try:
+                      copied_cache.unlink()
+                  except OSError as error:
+                      refuse("sysconfigdata", copied_cache, type(error).__name__)
+
+              copied_executable = copy_prefix / relative_executable
+              probe_environment = dict(os.environ)
+              probe_environment.update(PATH=f"{copy_prefix / 'bin'}:{probe_environment.get('PATH', '')}", LD_LIBRARY_PATH=str(copy_prefix / "lib"))
+              try:
+                  output = subprocess.check_output(
+                      [copied_executable, "-I", "-S", "-B", "-c", "import importlib.util,json,sys,sysconfig; name=sysconfig._get_sysconfigdata_name(); spec=importlib.util.find_spec(name); print(json.dumps({'base_prefix':sys.base_prefix,'prefix':sys.prefix,'stdlib':sysconfig.get_path('stdlib'),'destshared':sysconfig.get_config_var('DESTSHARED'),'sys_path':sys.path,'data_file':spec.origin if spec else None}))"],
+                      text=True, env=probe_environment,
+                  )
+                  details = json.loads(output)
+                  bases = {Path(details[key]).resolve(strict=True) for key in ("base_prefix", "prefix")}
+                  stdlib = Path(details["stdlib"]).resolve(strict=True)
+                  destshared = Path(details["destshared"]).resolve(strict=True)
+                  selected_data_file = Path(details["data_file"]).resolve(strict=True)
+                  runtime_paths = [Path(value).resolve(strict=False) for value in details["sys_path"]]
+                  for path in runtime_paths:
+                      path.relative_to(copy_prefix)
+              except (OSError, RuntimeError, TypeError, ValueError, KeyError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+                  refuse("relocation", copied_executable, type(error).__name__)
+              copied_stdlib = copy_prefix / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+              if (bases != {copy_prefix} or stdlib != copied_stdlib
+                      or destshared != copied_dynload or runtime_paths.count(copied_dynload) != 1
+                      or selected_data_file != copied_data_file):
+                  refuse("relocation", copied_executable, "copied interpreter retained a source runtime path")
+
+              environment = [
+                  ("T3_FLEET_PYTHON_FIXTURE_ROOT", fixture_root), ("T3_FLEET_PYTHON_PREFIX", copy_prefix),
+                  ("pythonLocation", copy_prefix), ("PKG_CONFIG_PATH", copy_prefix / "lib" / "pkgconfig"),
+                  ("Python_ROOT_DIR", copy_prefix), ("Python2_ROOT_DIR", copy_prefix),
+                  ("Python3_ROOT_DIR", copy_prefix), ("LD_LIBRARY_PATH", copy_prefix / "lib"),
+              ]
+              with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
+                  output.write("".join(f"{key}={value}\n" for key, value in environment))
+              with Path(os.environ["GITHUB_PATH"]).open("a", encoding="utf-8") as output:
+                  output.write(f"{copy_prefix / 'bin'}\n")
+              succeeded = True
+          finally:
+              if not succeeded:
+                  cleanup()
+          print(f"Prepared protected setup-python copy under {copy_prefix}")
+          PY
+
       - name: Install project
         run: python -m pip install .
 
@@ -67,6 +246,25 @@ jobs:
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/t3-wheel/bin/python" -I -m t3_fleet --help
           "$RUNNER_TEMP/t3-wheel/bin/python" -I -c 'import t3_fleet.agent, t3_fleet.cli, t3_fleet.policy, t3_fleet.outbox, t3_fleet.reporting, t3_fleet.t3_rpc, t3_fleet.timer'
+
+      - name: Remove protected Python fixture
+        if: always()
+        run: |
+          python - <<'PY'
+          import os, shutil, stat
+          from pathlib import Path
+
+          value = os.environ.get("T3_FLEET_PYTHON_FIXTURE_ROOT")
+          if value:
+              root = Path(value)
+              info = root.lstat()
+              if root.parent != Path("/tmp") or not root.name.startswith("t3-fleet-python-") or info.st_uid != os.geteuid() or not stat.S_ISDIR(info.st_mode):
+                  raise SystemExit(f"refusing unexpected fixture cleanup path: {root}")
+              shutil.rmtree(root)
+              if root.exists():
+                  raise SystemExit(f"fixture cleanup incomplete: {root}")
+              print(f"Removed protected Python fixture {root}")
+          PY
 
   test-windows:
     name: Test Windows launcher (Python 3.13)

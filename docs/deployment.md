@@ -110,3 +110,51 @@ refuses conflicting live leases by default. A forced rollback can discard lease
 records and needs a separate operator decision. Preserve unknown requests and
 retained worktrees for recovery. Installing version 0.2.0 does not migrate a
 live deployment or cut a package release.
+
+### Pinned runtime artifacts
+
+An approved pin is an operator-owned JSON file outside the source checkout.
+Schema 1 records the public repository URL, full Git commit and tree IDs, and
+the package name, version, Python requirement, dependencies, and console scripts.
+Review those fields against the public commit before approving a pin. Store
+pins, target configuration, and recovery records in protected operator storage.
+
+Build the wheel and integrity manifest outside the checkout. The verifier
+supports the metadata emitted by setuptools 68.1.2 and wheel 0.42.0. Use an
+isolated build environment with that tooling. An existing local
+checkout at the approved commit can supply the Git objects without a network
+fetch.
+
+```sh
+python3 scripts/build-public-runtime.py \
+  --pin /path/to/private/pin.json \
+  --source /path/to/public/checkout \
+  --output-dir /path/to/artifacts
+```
+
+Pass the same arguments with `--verify-only` to verify an existing artifact.
+The builder checks package content against its pinned Git objects. The
+manifest records integrity under the reviewed pin.
+
+Use `python3 scripts/install-public-runtime.py --help` to identify the required
+paths for the target's existing installation layout. Run the installer with
+the selected `--python` interpreter and its `-I -S -B` flags. Run `plan` first
+with the approved pin and the target's actual paths. For an existing deployment
+moving to a new pin, use `upgrade` with a new protected backup path and omit
+`--apply` to review the transaction. Verify quiescence separately before
+applying a plan. Keep state outside the artifact directory and retain the
+predecessor artifacts, source objects, and transaction records for rollback.
+
+The installer supports existing dedicated virtual environments, POSIX source
+wrappers, and Windows user-site layouts. This adapter manages the controller
+and agent launchers. Virtual environments and Windows user-site transactions
+require the existing two-command console-script inventory. For a wheel that also
+declares `t3-lane`, prepare and verify a separate install before switching the
+operator's launcher paths. In-place pin upgrades currently support the POSIX
+source-wrapper layout. Migrated wrappers load from the
+approved source root in an isolated interpreter with site processing disabled. Follow the saved transaction to roll back one
+verified edge at a time. A schema-2 record with legacy launchers needs an
+explicit upgrade to a new reviewed pin. Finalize any outstanding cleanup before
+starting a new transaction. A new upgrade validates up to 16 preceding upgrade
+records. Keep the preceding artifacts, records, and backups available while
+any later transaction depends on them.
