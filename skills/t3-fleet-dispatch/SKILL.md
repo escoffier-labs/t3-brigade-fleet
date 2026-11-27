@@ -6,6 +6,10 @@ description: Route T3 child tasks or separate sessions, and dispatch, monitor, c
 
 # T3 Fleet Dispatch
 
+Before using tool names below, read [tool compatibility](references/tool-compatibility.md).
+T3 v0.1.3 consolidates several tools. Use the attached catalog and the matching
+argument schema. Earlier names in this reference apply only to older catalogs.
+
 Use attached T3 app tools for local orchestration and app operations. For
 cross-host fleet dispatch, use the local `t3-fleet` client only. It uses
 this controller's private configuration to select the permitted connection.
@@ -29,7 +33,8 @@ options. Respect its child eligibility, constraints, features, and batch limit.
 
 | Work requested | Route and handle |
 | --- | --- |
-| Same-provider child with a model the native tool supports | Native subagent and native lifecycle handle |
+| Synchronous same-provider child with a model the native tool supports | Native subagent and native lifecycle handle |
+| Background agent, including a supported same-provider model | `delegate_task`, then the T3 task lifecycle |
 | Model unsupported by native tools, cross-provider child, or explicitly T3-owned child | `delegate_task`, then `task_status` / `task_cancel` using `taskId` |
 | Explicitly requested separate/new top-level session | `t3_thread_launch` with workspace binding, retain `threadId` and `runId` |
 | Requested batch of top-level sessions sharing this checkout | `create_threads`, retain each thread/run pair |
